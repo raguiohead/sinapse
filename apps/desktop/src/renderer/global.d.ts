@@ -1,3 +1,4 @@
+import type { DaemonEvent } from "@sinapse/core";
 import type {
   DaemonInfo,
   WorkerAskPayload,
@@ -6,19 +7,20 @@ import type {
 
 export interface SinapseBridge {
   brain: {
-    onData: (cb: (data: string) => void) => void;
+    onData: (cb: (data: string) => void) => () => void;
     write: (data: string) => void;
     resize: (cols: number, rows: number) => void;
   };
   daemon: {
-    onInfo: (cb: (info: DaemonInfo) => void) => void;
+    onInfo: (cb: (info: DaemonInfo) => void) => () => void;
+    onEvent: (cb: (e: DaemonEvent) => void) => () => void;
+    onStatus: (cb: (s: { connected: boolean }) => void) => () => void;
   };
   workers: {
     list: () => Promise<any[]>;
     spawn: (payload: WorkerSpawnPayload) => Promise<any>;
-    ask: (payload: WorkerAskPayload) => Promise<void>;
-    onEvents: (cb: (event: any) => void) => void;
-    stop: (name: string) => Promise<void>;
+    ask: (payload: WorkerAskPayload) => Promise<{ turnId: string }>;
+    stop: (name: string) => Promise<any>;
   };
 }
 

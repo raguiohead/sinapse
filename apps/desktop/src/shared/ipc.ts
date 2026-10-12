@@ -3,7 +3,8 @@ export const IPC = {
   BRAIN_RESIZE: "brain:resize",
   BRAIN_INPUT: "brain:input",
   DAEMON_INFO: "daemon:info",
-  WORKER_EVENTS: "worker:events",
+  DAEMON_EVENT: "daemon:event",
+  DAEMON_STATUS: "daemon:status",
   WORKER_ASK: "worker:ask",
   WORKER_SPAWN: "worker:spawn",
   WORKER_LIST: "worker:list",
@@ -23,7 +24,8 @@ export interface WorkerAskPayload {
 export interface WorkerSpawnPayload {
   name: string;
   provider: "claude" | "agy";
-  cwd: string;
+  cwd?: string;
   role: string;
   autonomy: "read" | "edit" | "full";
 }
+

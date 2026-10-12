@@ -1,4 +1,5 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
+import type { DaemonEvent } from "@sinapse/core";
 import {
   IPC,
   type DaemonInfo,
@@ -8,8 +9,12 @@ import {
 
 const api = {
   brain: {
-    onData: (cb: (data: string) => void): void => {
-      ipcRenderer.on(IPC.BRAIN_DATA, (_event, data: string) => cb(data));
+    onData: (cb: (data: string) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, data: string) => cb(data);
+      ipcRenderer.on(IPC.BRAIN_DATA, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.BRAIN_DATA, listener);
+      };
     },
     write: (data: string): void => {
       ipcRenderer.send(IPC.BRAIN_INPUT, data);
@@ -19,8 +24,26 @@ const api = {
     },
   },
   daemon: {
-    onInfo: (cb: (info: DaemonInfo) => void): void => {
-      ipcRenderer.on(IPC.DAEMON_INFO, (_event, info: DaemonInfo) => cb(info));
+    onInfo: (cb: (info: DaemonInfo) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, info: DaemonInfo) => cb(info);
+      ipcRenderer.on(IPC.DAEMON_INFO, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.DAEMON_INFO, listener);
+      };
+    },
+    onEvent: (cb: (e: DaemonEvent) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, e: DaemonEvent) => cb(e);
+      ipcRenderer.on(IPC.DAEMON_EVENT, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.DAEMON_EVENT, listener);
+      };
+    },
+    onStatus: (cb: (s: { connected: boolean }) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, s: { connected: boolean }) => cb(s);
+      ipcRenderer.on(IPC.DAEMON_STATUS, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.DAEMON_STATUS, listener);
+      };
     },
   },
   workers: {
@@ -30,13 +53,10 @@ const api = {
     spawn: (payload: WorkerSpawnPayload): Promise<any> => {
       return ipcRenderer.invoke(IPC.WORKER_SPAWN, payload);
     },
-    ask: (payload: WorkerAskPayload): Promise<void> => {
+    ask: (payload: WorkerAskPayload): Promise<{ turnId: string }> => {
       return ipcRenderer.invoke(IPC.WORKER_ASK, payload);
     },
-    onEvents: (cb: (event: any) => void): void => {
-      ipcRenderer.on(IPC.WORKER_EVENTS, (_event, event: any) => cb(event));
-    },
-    stop: (name: string): Promise<void> => {
+    stop: (name: string): Promise<any> => {
       return ipcRenderer.invoke(IPC.WORKER_STOP, name);
     },
   },

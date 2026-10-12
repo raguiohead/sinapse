@@ -1,111 +1,115 @@
 import { useState, useEffect, useRef, type FormEvent } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-
-export type WorkerStatus = "idle" | "thinking" | "done" | "error" | "interrupted";
+import type { AgentStatus, Provider } from "@sinapse/core";
 
 export interface WorkerNodeData {
   name: string;
-  provider: "claude" | "agy";
+  provider: Provider;
   role?: string;
-  status?: WorkerStatus;
+  status?: AgentStatus;
+  log?: string;
+  lastPrompt?: string;
+}
+
+function getProviderColor(p: string): string {
+  if (p === "agy") return "var(--agy)";
+  if (p === "claude") return "var(--claude)";
+  return "var(--accent-b)";
+}
+
+function getProviderInitial(p: string): string {
+  if (p === "agy") return "G";
+  if (p === "claude") return "C";
+  return p.charAt(0).toUpperCase();
+}
+
+function getStatusLabel(s: AgentStatus): string {
+  switch (s) {
+    case "thinking":
+      return "pensando";
+    case "done":
+      return "concluído";
+    case "error":
+      return "erro";
+    case "interrupted":
+      return "interrompido";
+    case "idle":
+    default:
+      return "ocioso";
+  }
+}
+
+function getStatusColor(s: AgentStatus): string {
+  switch (s) {
+    case "thinking":
+      return "var(--thinking)";
+    case "done":
+      return "var(--done)";
+    case "error":
+      return "var(--error)";
+    case "interrupted":
+      return "var(--interrupted)";
+    case "idle":
+    default:
+      return "var(--idle)";
+  }
 }
 
 export function WorkerNode({ data }: NodeProps) {
   const nodeData = (data ?? {}) as unknown as WorkerNodeData;
   const workerName = nodeData.name || "worker";
   const provider = nodeData.provider || "claude";
-  const role = nodeData.role || "Worker agent";
+  const role = nodeData.role || "Agente worker";
+  const status: AgentStatus = nodeData.status || "idle";
+  const log = nodeData.log || "";
 
-  const [status, setStatus] = useState<WorkerStatus>(nodeData.status || "idle");
-  const [prompt, setPrompt] = useState("");
-  const [output, setOutput] = useState("");
-  const [isAsking, setIsAsking] = useState(false);
-
+  const [inputPrompt, setInputPrompt] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const outputRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    window.sinapse?.workers?.onEvents((event: any) => {
-      if (event?.agent && event.agent !== workerName) {
-        return;
-      }
-
-      if (event?.type === "text") {
-        setStatus("thinking");
-        setOutput((prev) => prev + event.data);
-      } else if (event?.type === "thinking") {
-        setStatus("thinking");
-        setOutput((prev) => prev + `[thinking] ${event.data}\n`);
-      } else if (event?.type === "tool_use") {
-        setOutput((prev) => prev + `\n[tool: ${event.data}]\n`);
-      } else if (event?.type === "tool_result") {
-        setOutput((prev) => prev + `[result: ${event.data}]\n`);
-      } else if (event?.type === "error") {
-        setStatus("error");
-        setOutput((prev) => prev + `\n[error: ${event.data}]\n`);
-      } else if (event?.type === "done") {
-        setStatus("done");
-      }
-    });
-  }, [workerName]);
+  const isThinking = status === "thinking";
+  const providerColor = getProviderColor(provider);
+  const statusColor = getStatusColor(status);
+  const statusLabel = getStatusLabel(status);
 
   useEffect(() => {
     if (outputRef.current) {
       outputRef.current.scrollTop = outputRef.current.scrollHeight;
     }
-  }, [output]);
+  }, [log]);
 
   const handleAsk = async (e: FormEvent) => {
     e.preventDefault();
-    const query = prompt.trim();
-    if (!query || isAsking) return;
+    const query = inputPrompt.trim();
+    if (!query || isThinking || isSubmitting) return;
 
-    setPrompt("");
-    setIsAsking(true);
-    setStatus("thinking");
-    setOutput((prev) => (prev ? prev + `\n> ${query}\n` : `> ${query}\n`));
-
+    setIsSubmitting(true);
+    setInputPrompt("");
     try {
       await window.sinapse?.workers?.ask({
         name: workerName,
         prompt: query,
       });
-      setStatus((current) => (current === "thinking" ? "done" : current));
     } catch (err: any) {
-      setStatus("error");
-      setOutput((prev) => prev + `\n[error: ${err?.message || String(err)}]\n`);
+      console.error("Erro ao enviar prompt ao worker:", err);
     } finally {
-      setIsAsking(false);
+      setIsSubmitting(false);
     }
   };
 
   const handleStop = async () => {
     try {
       await window.sinapse?.workers?.stop(workerName);
-      setStatus("interrupted");
-      setIsAsking(false);
     } catch (err) {
-      console.error("Failed to stop worker:", err);
-    }
-  };
-
-  const getStatusColor = (s: WorkerStatus): string => {
-    switch (s) {
-      case "thinking":
-        return "#f59e0b";
-      case "done":
-        return "#10b981";
-      case "error":
-        return "#ef4444";
-      case "interrupted":
-        return "#f97316";
-      case "idle":
-      default:
-        return "#71717a";
+      console.error("Erro ao interromper worker:", err);
     }
   };
 
   return (
-    <div className="worker-node-card">
+    <div
+      className="worker-node-card"
+      style={{ borderLeft: `2px solid ${providerColor}` }}
+    >
       <Handle
         type="target"
         position={Position.Left}
@@ -114,55 +118,79 @@ export function WorkerNode({ data }: NodeProps) {
       />
 
       <div className="worker-node-header">
-        <div className="worker-node-title-group">
-          <span className="worker-node-name">{workerName}</span>
-          <span className={`worker-provider-badge badge-${provider}`}>{provider}</span>
+        {/* Circular avatar with provider initial and animated status ring */}
+        <div className="worker-avatar-container">
+          <div
+            className={`worker-avatar-ring ${isThinking ? "ring-thinking" : ""}`}
+            style={{
+              backgroundColor: isThinking ? undefined : statusColor,
+            }}
+          />
+          <div
+            className="worker-avatar-core"
+            style={{ color: providerColor }}
+          >
+            {getProviderInitial(provider)}
+          </div>
         </div>
 
-        <div className="worker-status-group">
-          <span
-            className={`status-indicator-dot ${status === "thinking" ? "status-pulse" : ""}`}
-            style={{ backgroundColor: getStatusColor(status) }}
-          />
-          <span className="worker-status-text">{status}</span>
+        <div className="worker-node-identity">
+          <div className="worker-title-line">
+            <span className="worker-node-name">{workerName}</span>
+            <span
+              className={`worker-provider-badge badge-${provider}`}
+              style={{ borderColor: providerColor, color: providerColor }}
+            >
+              {provider}
+            </span>
+          </div>
+          <div className="worker-status-line">
+            <span
+              className="status-dot"
+              style={{ backgroundColor: statusColor }}
+            />
+            <span className="worker-status-label">{statusLabel}</span>
+          </div>
         </div>
       </div>
 
-      <div className="worker-node-role">{role}</div>
+      <div className="worker-node-role" title={role}>
+        {role}
+      </div>
 
       <div className="worker-output-area nodrag nowheel" ref={outputRef}>
-        {output ? (
-          <pre className="worker-output-text">{output}</pre>
+        {log ? (
+          <pre className="worker-output-text">{log}</pre>
         ) : (
-          <span className="worker-output-placeholder">No activity yet. Send a prompt to start.</span>
+          <span className="worker-output-placeholder">Sem atividade ainda.</span>
         )}
       </div>
 
       <form onSubmit={handleAsk} className="worker-input-form nodrag">
         <input
           type="text"
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Ask worker..."
-          disabled={isAsking}
+          value={inputPrompt}
+          onChange={(e) => setInputPrompt(e.target.value)}
+          placeholder="Perguntar ao worker..."
+          disabled={isThinking}
           className="worker-prompt-input"
         />
-        {isAsking ? (
+        {isThinking ? (
           <button
             type="button"
             onClick={handleStop}
             className="worker-btn worker-btn-stop"
-            title="Stop worker"
+            title="Interromper worker"
           >
-            Stop
+            Parar
           </button>
         ) : (
           <button
             type="submit"
-            disabled={!prompt.trim()}
+            disabled={!inputPrompt.trim() || isSubmitting}
             className="worker-btn worker-btn-ask"
           >
-            Ask
+            Perguntar
           </button>
         )}
       </form>

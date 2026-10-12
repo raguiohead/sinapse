@@ -304,6 +304,7 @@ async function main() {
             console.log(line);
           }
         }
+        process.stdout.write("\n");
       }
       break;
     }

@@ -48,6 +48,20 @@ export interface Adapter {
   stop(pid: number): Promise<void>;
 }
 
+export type DaemonEvent =
+  | { kind: "agent_spawned"; agent: AgentState }
+  | { kind: "turn_started"; agentId: string; agentName: string; turnId: string; prompt: string }
+  | { kind: "turn_event"; agentId: string; agentName: string; turnId: string; event: TurnEvent }
+  | {
+      kind: "turn_finished";
+      agentId: string;
+      agentName: string;
+      turnId: string;
+      status: AgentStatus;
+      text?: string;
+      error?: string;
+    };
+
 export interface DaemonState {
   agents: Record<string, AgentState>;
   port: number;

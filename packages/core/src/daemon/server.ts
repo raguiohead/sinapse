@@ -7,6 +7,7 @@ import type { AddressInfo } from "node:net";
 import type {
   AgentConfig,
   AgentState,
+  DaemonEvent,
   DaemonState,
   Provider,
   TurnEvent,
@@ -34,6 +35,11 @@ const state: DaemonState = {
 
 const activeTurns = new Map<string, ActiveTurnSession>();
 const agentRecentEvents = new Map<string, TurnEvent[]>();
+const subscribers = new Set<(event: DaemonEvent) => void>();
+
+function broadcast(event: DaemonEvent): void {
+  for (const send of subscribers) send(event);
+}
 
 async function loadSavedState(): Promise<{ agents: Record<string, AgentState>; token?: string }> {
   try {
@@ -124,6 +130,7 @@ async function executeTurn(
       if (onEvent) {
         onEvent(event);
       }
+      broadcast({ kind: "turn_event", agentId: agent.id, agentName: agent.name, turnId, event });
       iter = await gen.next();
     }
 
@@ -154,6 +161,15 @@ async function executeTurn(
     agent.currentTurnId = undefined;
     agentRecentEvents.set(agent.id, [...session.events]);
     activeTurns.delete(agent.id);
+    broadcast({
+      kind: "turn_finished",
+      agentId: agent.id,
+      agentName: agent.name,
+      turnId,
+      status: session.stopped ? "interrupted" : agent.status,
+      text: turnResult?.text,
+      error: agent.lastError,
+    });
     await saveState();
   }
 }
@@ -195,6 +211,27 @@ export async function start(): Promise<{ port: number; token: string }> {
 
   fastify.get("/health", async () => {
     return { ok: true };
+  });
+
+  fastify.get("/events", (request, reply) => {
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+    reply.raw.write(": connected\n\n");
+
+    const send = (event: DaemonEvent) => {
+      reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+    subscribers.add(send);
+
+    const heartbeat = setInterval(() => reply.raw.write(": ping\n\n"), 15000);
+    request.raw.on("close", () => {
+      clearInterval(heartbeat);
+      subscribers.delete(send);
+    });
   });
 
   fastify.get("/agents", async () => {
@@ -240,6 +277,7 @@ export async function start(): Promise<{ port: number; token: string }> {
 
     state.agents[agentId] = newAgent;
     await saveState();
+    broadcast({ kind: "agent_spawned", agent: newAgent });
 
     return reply.status(201).send(newAgent);
   });
@@ -281,6 +319,13 @@ export async function start(): Promise<{ port: number; token: string }> {
       stopped: false,
     };
     activeTurns.set(agent.id, session);
+    broadcast({
+      kind: "turn_started",
+      agentId: agent.id,
+      agentName: agent.name,
+      turnId,
+      prompt: body.prompt,
+    });
 
     if (body.async) {
       // Async: respond with turnId immediately, run in background

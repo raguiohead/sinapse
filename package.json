@@ -7,9 +7,9 @@
     "apps/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces",
-    "test": "npm run test --workspaces",
-    "dev": "npm run dev --workspace=packages/core"
+    "build": "npm run build -w @sinapse/core && npm run build -w @sinapse/cli && npm run build -w @sinapse/desktop",
+    "start": "npm run build && npm exec -w @sinapse/desktop -- electron . --no-sandbox",
+    "daemon": "node packages/cli/dist/main.js start"
   },
   "allowScripts": {
     "esbuild@0.25.12": true,

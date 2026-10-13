@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import type { AddressInfo } from "node:net";
+import { pathToFileURL } from "node:url";
 import type {
   AgentConfig,
   AgentState,
@@ -59,9 +60,15 @@ async function loadSavedState(): Promise<{ agents: Record<string, AgentState>; t
   }
 }
 
+// Both files hold the daemon token, so keep them owner-only (chmod also fixes files created before this).
+async function writePrivate(file: string, content: string): Promise<void> {
+  await fs.mkdir(SINAPSE_DIR, { recursive: true, mode: 0o700 });
+  await fs.writeFile(file, content, { mode: 0o600 });
+  await fs.chmod(file, 0o600);
+}
+
 async function saveState(): Promise<void> {
-  await fs.mkdir(SINAPSE_DIR, { recursive: true });
-  await fs.writeFile(
+  await writePrivate(
     STATE_FILE,
     JSON.stringify(
       {
@@ -76,11 +83,7 @@ async function saveState(): Promise<void> {
 }
 
 async function writeDaemonFile(port: number, token: string): Promise<void> {
-  await fs.mkdir(SINAPSE_DIR, { recursive: true });
-  await fs.writeFile(
-    DAEMON_FILE,
-    JSON.stringify({ port, token, pid: process.pid }, null, 2)
-  );
+  await writePrivate(DAEMON_FILE, JSON.stringify({ port, token, pid: process.pid }, null, 2));
 }
 
 function findAgent(idOrName: string): AgentState | undefined {
@@ -419,7 +422,7 @@ export async function start(): Promise<{ port: number; token: string }> {
   return { port: state.port, token: state.token };
 }
 
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   start()
     .then(({ port }) => {
       console.log(`sinapsed running on port ${port}`);

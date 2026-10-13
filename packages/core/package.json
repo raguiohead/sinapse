@@ -6,8 +6,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/daemon/server.ts",
-    "test": "vitest run"
+    "dev": "tsx watch src/daemon/server.ts"
   },
   "dependencies": {
     "fastify": "^5.2.0",
@@ -16,7 +15,6 @@
   "devDependencies": {
     "typescript": "^5.7.0",
     "tsx": "^4.19.0",
-    "vitest": "^3.1.0",
     "@types/node": "^22.0.0"
   }
 }

@@ -55,8 +55,8 @@ async function ensureDaemon(): Promise<DaemonInfo> {
   const scriptPath = process.argv[1];
   const isTsx = scriptPath?.endsWith(".ts");
   const child = isTsx && !process.execPath.includes("tsx")
-    ? spawn("npx", ["tsx", scriptPath, "start"], { detached: true, stdio: "ignore" })
-    : spawn(process.execPath, [scriptPath, "start"], { detached: true, stdio: "ignore" });
+    ? spawn("npx", ["tsx", scriptPath, "start"], { detached: true, stdio: "ignore", windowsHide: true })
+    : spawn(process.execPath, [scriptPath, "start"], { detached: true, stdio: "ignore", windowsHide: true });
   child.unref();
 
   const maxAttempts = 50;

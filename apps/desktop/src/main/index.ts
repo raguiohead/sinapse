@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import fs from "node:fs";
+import os from "node:os";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type { IPty } from "node-pty";
@@ -182,24 +183,22 @@ function createWindow(): BrowserWindow {
 function spawnClaudePTY(): void {
   if (!daemonInfo) return;
 
+  const home = os.homedir();
   const cliBinPath = path.resolve(app.getAppPath(), "../../node_modules/.bin");
-  const userPath = process.env.PATH || "";
-  const extraPaths = [
-    path.join(process.env.HOME || "", ".local", "bin"),
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-  ];
-  const combinedPath = Array.from(new Set([cliBinPath, ...userPath.split(":"), ...extraPaths]))
+  const localBin = path.join(home, ".local", "bin");
+  const userPath = (process.env.PATH || "").split(path.delimiter);
+  const extraPaths =
+    process.platform !== "win32" ? ["/usr/local/bin", "/usr/bin", "/bin"] : [];
+  const combinedPath = Array.from(new Set([cliBinPath, localBin, ...userPath, ...extraPaths]))
     .filter(Boolean)
-    .join(":");
+    .join(path.delimiter);
 
   try {
     ptyProcess = pty.spawn("claude", [], {
       name: "xterm-256color",
       cols: 80,
       rows: 24,
-      cwd: process.env.HOME || process.cwd(),
+      cwd: os.homedir(),
       env: {
         ...process.env,
         PATH: combinedPath,

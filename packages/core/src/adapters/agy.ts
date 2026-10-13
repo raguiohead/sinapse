@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import type { Adapter, AdapterRunOptions, Provider, TurnEvent, TurnResult } from "../types.js";
+import { killTree } from "../process.js";
 
 export class AgyAdapter implements Adapter {
   readonly provider: Provider = "agy";
@@ -25,13 +26,14 @@ export class AgyAdapter implements Adapter {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
+      windowsHide: true,
     });
 
     this.activeProcesses.add(child);
 
     let timeoutTimer: NodeJS.Timeout | null = setTimeout(() => {
-      if (!child.killed) {
-        child.kill("SIGTERM");
+      if (child.exitCode === null && child.signalCode === null && child.pid) {
+        killTree(child.pid);
       }
     }, timeoutMs);
 
@@ -114,9 +116,9 @@ export class AgyAdapter implements Adapter {
         timeoutTimer = null;
       }
       this.activeProcesses.delete(child);
-      if (!child.killed) {
+      if (child.exitCode === null && child.signalCode === null && child.pid) {
         try {
-          child.kill("SIGTERM");
+          killTree(child.pid);
         } catch {
           // Process might have already exited
         }
@@ -144,21 +146,13 @@ export class AgyAdapter implements Adapter {
 
   async stop(pid?: number): Promise<void> {
     if (pid !== undefined && pid !== 0) {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch (err: any) {
-        if (err.code !== "ESRCH") throw err;
-      }
+      killTree(pid);
       return;
     }
 
     for (const child of this.activeProcesses) {
-      try {
-        if (child.pid) {
-          process.kill(child.pid, "SIGTERM");
-        }
-      } catch (err: any) {
-        if (err.code !== "ESRCH") throw err;
+      if (child.pid) {
+        killTree(child.pid);
       }
     }
   }

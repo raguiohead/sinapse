@@ -4,4 +4,5 @@ export { AgyAdapter } from "./adapters/agy.js";
 export { start as startDaemon } from "./daemon/server.js";
 export { killTree } from "./process.js";
 export { estimateContextWindow } from "./context.js";
+export { sinapseDir } from "./paths.js";
 

@@ -3,12 +3,11 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import fs from "node:fs/promises";
 import path from "node:path";
-import os from "node:os";
 import { Readable } from "node:stream";
 import type { AgentState, Autonomy, Provider, TurnEvent } from "@sinapse/core";
-import { startDaemon as start } from "@sinapse/core";
+import { startDaemon as start, sinapseDir } from "@sinapse/core";
 
-const SINAPSE_DIR = path.join(os.homedir(), ".sinapse");
+const SINAPSE_DIR = sinapseDir();
 const DAEMON_FILE = path.join(SINAPSE_DIR, "daemon.json");
 
 interface DaemonInfo {

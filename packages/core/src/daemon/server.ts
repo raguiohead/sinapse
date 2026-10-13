@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
+import { sinapseDir } from "../paths.js";
 import type {
   AgentConfig,
   AgentState,
@@ -17,7 +18,7 @@ import type {
 import { ClaudeAdapter } from "../adapters/claude.js";
 import { AgyAdapter } from "../adapters/agy.js";
 
-const SINAPSE_DIR = path.join(os.homedir(), ".sinapse");
+const SINAPSE_DIR = sinapseDir();
 const STATE_FILE = path.join(SINAPSE_DIR, "state.json");
 const DAEMON_FILE = path.join(SINAPSE_DIR, "daemon.json");
 

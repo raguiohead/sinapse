@@ -1,8 +1,11 @@
-import { useEffect, useRef } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import type { ContextUsage } from "@sinapse/core";
+import { ModelSelect } from "../components/ModelSelect";
+import { ContextMeter } from "../components/ContextMeter";
 
 export interface BrainNodeData {
   label?: string;
@@ -13,10 +16,37 @@ export function BrainNode({ data }: NodeProps) {
   const nodeData = (data ?? {}) as BrainNodeData;
   const anyThinking = Boolean(nodeData.anyThinking);
 
+  const [brainModel, setBrainModel] = useState<string | null>(null);
+  const [brainUsage, setBrainUsage] = useState<ContextUsage | undefined>(undefined);
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
 
+  // Initial fetch and subscriptions for brain model and context usage
+  useEffect(() => {
+    window.sinapse?.brain?.getInfo().then((info) => {
+      if (info) {
+        setBrainModel(info.model ?? null);
+        setBrainUsage(info.usage);
+      }
+    });
+
+    const unsubUsage = window.sinapse?.brain?.onUsage((usage) => {
+      setBrainUsage(usage);
+    });
+
+    const unsubInfoChanged = window.sinapse?.brain?.onInfoChanged((info) => {
+      setBrainModel(info.model ?? null);
+    });
+
+    return () => {
+      if (unsubUsage) unsubUsage();
+      if (unsubInfoChanged) unsubInfoChanged();
+    };
+  }, []);
+
+  // Terminal lifecycle
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -85,44 +115,72 @@ export function BrainNode({ data }: NodeProps) {
     };
   }, []);
 
+  const handleModelChange = async (newModel: string | null) => {
+    const modelLabel = newModel || "padrão";
+    const confirmed = window.confirm(
+      `Reiniciar o cérebro com o modelo ${modelLabel}? A conversa continua.`
+    );
+    if (!confirmed) return;
+
+    try {
+      await window.sinapse?.brain?.setModel(newModel);
+    } catch (err) {
+      console.error("Erro ao alterar modelo do cérebro:", err);
+    }
+  };
+
   return (
     <div className={`brain-node-card ${anyThinking ? "brain-breathing" : ""}`}>
       <div className="brain-node-header">
-        <div className="brain-node-title">
-          <svg
-            width="18"
-            height="18"
-            viewBox="0 0 24 24"
-            fill="none"
-            className="brain-header-glyph"
-            aria-hidden="true"
-          >
-            <path
-              d="M 5 8 C 11 8, 13 16, 19 16"
-              stroke="url(#brain-glyph-grad)"
-              strokeWidth="2.4"
-              strokeLinecap="round"
-            />
-            <circle cx="5" cy="8" r="3.2" style={{ fill: "var(--accent-a)" }} />
-            <circle cx="19" cy="16" r="3.2" style={{ fill: "var(--accent-b)" }} />
-            <defs>
-              <linearGradient
-                id="brain-glyph-grad"
-                x1="4"
-                y1="6"
-                x2="20"
-                y2="18"
-                gradientUnits="userSpaceOnUse"
-              >
-                <stop offset="0%" style={{ stopColor: "var(--accent-a)" }} />
-                <stop offset="100%" style={{ stopColor: "var(--accent-b)" }} />
-              </linearGradient>
-            </defs>
-          </svg>
-          <span className="brain-node-label">cérebro · claude</span>
+        <div className="brain-node-title-group">
+          <div className="brain-node-title">
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              className="brain-header-glyph"
+              aria-hidden="true"
+            >
+              <path
+                d="M 5 8 C 11 8, 13 16, 19 16"
+                stroke="url(#brain-glyph-grad)"
+                strokeWidth="2.4"
+                strokeLinecap="round"
+              />
+              <circle cx="5" cy="8" r="3.2" style={{ fill: "var(--accent-a)" }} />
+              <circle cx="19" cy="16" r="3.2" style={{ fill: "var(--accent-b)" }} />
+              <defs>
+                <linearGradient
+                  id="brain-glyph-grad"
+                  x1="4"
+                  y1="6"
+                  x2="20"
+                  y2="18"
+                  gradientUnits="userSpaceOnUse"
+                >
+                  <stop offset="0%" style={{ stopColor: "var(--accent-a)" }} />
+                  <stop offset="100%" style={{ stopColor: "var(--accent-b)" }} />
+                </linearGradient>
+              </defs>
+            </svg>
+            <span className="brain-node-label">cérebro · claude</span>
+          </div>
+          <div className="brain-node-tag">orquestrador</div>
         </div>
-        <div className="brain-node-tag">orquestrador</div>
+
+        <div className="brain-node-controls nodrag">
+          <ContextMeter usage={brainUsage} className="brain-context-meter" />
+          <ModelSelect
+            provider="claude"
+            value={brainModel}
+            resolvedModel={brainUsage?.model}
+            onChange={handleModelChange}
+            className="brain-model-select"
+          />
+        </div>
       </div>
+
       <div className="brain-terminal-wrapper nodrag nowheel" ref={containerRef} />
       <Handle
         type="source"

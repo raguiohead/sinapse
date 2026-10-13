@@ -161,13 +161,46 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`:
 
 | Comando | Descrição |
 |---|---|
-| `sinapse list` | Lista todos os workers cadastrados, provedor, status, autonomia e diretório de trabalho. |
-| `sinapse spawn <nome> --provider <p> --cwd <dir> --role "<r>" [--autonomy edit]` | Cria um novo worker (`--provider claude\|agy`, `--cwd`, `--role`, `--autonomy read\|edit\|full`). |
+| `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia e diretório de trabalho. |
+| `sinapse spawn <nome> --provider <p> --cwd <dir> --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|agy`, `--cwd`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). |
 | `sinapse ask <nome> "<prompt>"` | Envia prompt ao worker de modo síncrono, exibindo a saída em tempo real no terminal. |
 | `sinapse ask <nome> "<prompt>" --async` | Envia prompt de modo assíncrono, retornando imediatamente o `turnId` gerado. |
-| `sinapse check <nome>` | Consulta o status atual do worker, ID do turno em execução e últimos eventos registrados. |
+| `sinapse check <nome>` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução e últimos eventos registrados. |
 | `sinapse stop <nome>` | Interrompe imediatamente o turno em execução no worker selecionado. |
+| `sinapse models [claude\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude e AGY. |
+| `sinapse model <nome> <modelo\|padrao>` | Altera o modelo de um worker existente (`padrao` limpa e volta ao padrão do provedor). |
+| `sinapse note list` | Lista resumos de todas as notas salvas ordenadas por data de modificação. |
+| `sinapse note read <nome>` | Exibe o conteúdo bruto da nota especificada. |
+| `sinapse note write <nome> "<texto>"` | Cria ou sobrescreve uma nota. Use `-` no lugar do texto para ler do stdin. |
+| `sinapse note append <nome> "<texto>"` | Acrescenta ao final da nota (cria se não existir). Use `-` para ler do stdin. |
+| `sinapse note rm <nome>` | Remove permanentemente uma nota. |
 | `sinapse start` | Inicia o daemon `sinapsed` em primeiro plano (ou conecta se já estiver ativo). |
+
+### Modelos e janela de contexto
+
+Tanto no canvas quanto na CLI, é possível selecionar e alternar os modelos dos workers:
+- **Seleção no Canvas e na CLI:** utilize `--model <modelo>` no `sinapse spawn` ou consulte os modelos disponíveis via `sinapse models [claude|agy]`. Para alterar o modelo de um worker existente, utilize `sinapse model <nome> <modelo>` (ou `sinapse model <nome> padrao` para remover o modelo customizado). No canvas, o modelo pode ser escolhido na criação e modificado no card do worker.
+- **Cérebro:** o seletor no cabeçalho do terminal troca o modelo do cérebro. Ele reinicia retomando a própria sessão (`--resume` com o id dela), então a conversa continua; a escolha fica salva em `desktop.json`.
+- **Janela de contexto:**
+  - O **Claude** reporta o tamanho real de sua janela de contexto diretamente pela CLI (`contextWindow`).
+  - O **AGY** e o **cérebro** exibem uma estimativa da janela de contexto marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
+  - O uso de contexto do **cérebro** é lido a partir do transcript de sessão do Claude Code.
+
+### Notas
+
+As notas representam a memória compartilhada entre o usuário, o cérebro e os workers:
+- **Onde vivem:** arquivos Markdown salvos em `~/.sinapse/notes/<nome>.md` (ou `$SINAPSE_HOME/notes/<nome>.md`). Nomes devem ser minúsculos com hífens ou sublinhados (`^[a-z0-9][a-z0-9_-]{0,63}$`).
+- **CLI:** gerenciadas pelos subcomandos `sinapse note list`, `sinapse note read <nome>`, `sinapse note write <nome> "<texto>"|-`, `sinapse note append <nome> "<texto>"|-` e `sinapse note rm <nome>`. Em `write` e `append`, o texto é obrigatório; use `-` para ler do stdin (útil para várias linhas: `sinapse note write plano - <<'EOF'`).
+- **Comportamento no Canvas:**
+  - Apresentadas como cards com visualização e edição direta.
+  - Recebem atualizações ao vivo via eventos do daemon (`note_changed` e `note_deleted`).
+  - Renderizadas em Markdown limpo, sem execução de HTML bruto.
+
+### Ciclo de vida
+
+- **Uma instância por pasta de dados:** abrir o atalho de novo só traz a janela existente para a frente.
+- **Daemon compartilhado:** se a CLI já tiver iniciado um daemon (por exemplo, você rodou `sinapse list` com o app fechado), o app passa a usar esse daemon em vez de subir outro. Com o app fechado, a CLI inicia o próprio daemon quando precisa.
+- **Ao fechar o app:** turnos em andamento são interrompidos (status `interrupted`, a sessão do worker é preservada), e o cérebro, os workers e tudo o que eles abriram (comandos de terminal, servidores MCP) são encerrados. Isso vale também para encerramento por sinal (logout, `kill`).
 
 ### Níveis de Autonomia
 
@@ -204,8 +237,10 @@ Quando o Claude Code atua como cérebro usando o skill do Sinapse:
 
 Todos os dados de runtime do Sinapse ficam armazenados no diretório do usuário:
 
-- `~/.sinapse/state.json`: Estado persistido dos agentes cadastrados (id, nome, provedor, diretório, status, sessionId).
+- `~/.sinapse/state.json`: Estado persistido dos agentes cadastrados (id, nome, provedor, diretório, status, sessionId, modelo, uso de contexto).
 - `~/.sinapse/daemon.json`: Informações do daemon em execução (`port`, `token`, `pid`).
+- `~/.sinapse/notes/`: Diretório de notas compartilhadas em Markdown (`<nome>.md`).
+- `~/.sinapse/desktop.json`: Configurações da aplicação desktop (armazena o modelo configurado para o cérebro).
 - `~/.sinapse/desktop.log`: Log de saída do processo de build e inicialização do Electron Desktop.
 
 > [!NOTE]
@@ -240,6 +275,8 @@ sinapse/
 - **Adapter Codex:** O adapter para OpenAI Codex ainda não foi implementado.
 - **Persistência de logs:** O histórico detalhado de eventos de turnos de workers é mantido em memória e não é persistido após o encerramento do daemon.
 - **Diretório inicial do cérebro:** O terminal do cérebro inicia no diretório pessoal (`os.homedir()`). Na primeira execução, o Claude Code solicitará confirmação de confiança da pasta.
+- **Uso de contexto do cérebro:** é lido do transcript mais recente do Claude Code na pasta pessoal. Se você usar o Claude Code em `~` ao mesmo tempo, fora do Sinapse, o medidor pode mostrar aquela sessão.
+- **Processos que se desligam do pai:** alguns servidores MCP se separam do processo que os iniciou. No Linux o Sinapse os encontra por uma marca no ambiente e os encerra; no Windows depende do `taskkill /T`, que não alcança processos já desligados da árvore.
 - **Ambiente Windows não executado em homologação:** Os scripts e caminhos foram preparados para Windows 10/11, mas o desenvolvimento inicial foi conduzido no Linux.
 
 ## Solução de problemas

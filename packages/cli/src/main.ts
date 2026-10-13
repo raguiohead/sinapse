@@ -4,11 +4,67 @@ import readline from "node:readline";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
-import type { AgentState, Autonomy, Provider, TurnEvent } from "@sinapse/core";
+import type {
+  AgentState,
+  Autonomy,
+  ContextUsage,
+  ModelCatalog,
+  ModelOption,
+  Note,
+  NoteSummary,
+  Provider,
+  TurnEvent,
+} from "@sinapse/core";
 import { startDaemon as start, sinapseDir } from "@sinapse/core";
 
 const SINAPSE_DIR = sinapseDir();
 const DAEMON_FILE = path.join(SINAPSE_DIR, "daemon.json");
+
+function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const m = Math.round(tokens / 100_000) / 10;
+    return `${m}m`;
+  }
+  if (tokens >= 1000) {
+    return `${Math.round(tokens / 1000)}k`;
+  }
+  return `${tokens}`;
+}
+
+function formatContext(usage?: ContextUsage): string {
+  if (!usage || usage.usedTokens === undefined) {
+    return "-";
+  }
+  const used = formatTokens(usage.usedTokens);
+  if (!usage.windowTokens) {
+    return usage.windowEstimated ? `≈${used}` : used;
+  }
+  const win = formatTokens(usage.windowTokens);
+  const pct = Math.round((usage.usedTokens / usage.windowTokens) * 100);
+  const formatted = `${used}/${win} ${pct}%`;
+  return usage.windowEstimated ? `≈${formatted}` : formatted;
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf-8");
+}
+
+// stdin only on an explicit "-": agents run the CLI with an open, never-closing stdin, so an implicit read would hang them.
+async function noteText(positional: string[], command: "write" | "append"): Promise<string> {
+  const words = positional.slice(3);
+  if (words.length === 1 && words[0] === "-") return readStdin();
+  if (words.length === 0) {
+    console.error(
+      `Erro: falta o texto. Uso: sinapse note ${command} <nome> "<texto>"  (ou "-" para ler do stdin)`
+    );
+    process.exit(1);
+  }
+  return words.join(" ");
+}
 
 interface DaemonInfo {
   port: number;
@@ -82,25 +138,19 @@ async function apiRequest(endpoint: string, options: RequestInit = {}): Promise<
   return fetch(url, { ...options, headers });
 }
 
+// Only "-x" / "--name" are flags; text like "- [x] item" (markdown) must stay positional.
+const FLAG_PATTERN = /^--?[A-Za-z]/;
+
 function parseArgs(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
   const positional: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg.startsWith("--")) {
-      const key = arg.slice(2);
+    if (FLAG_PATTERN.test(arg)) {
+      const key = arg.replace(/^--?/, "");
       const next = argv[i + 1];
-      if (next && !next.startsWith("-")) {
-        flags[key] = next;
-        i++;
-      } else {
-        flags[key] = true;
-      }
-    } else if (arg.startsWith("-") && arg.length > 1) {
-      const key = arg.slice(1);
-      const next = argv[i + 1];
-      if (next && !next.startsWith("-")) {
+      if (next !== undefined && !FLAG_PATTERN.test(next)) {
         flags[key] = next;
         i++;
       } else {
@@ -116,14 +166,16 @@ function parseArgs(argv: string[]) {
 
 function printTable(agents: AgentState[]) {
   if (agents.length === 0) {
-    console.log("No agents found.");
+    console.log("Nenhum worker encontrado.");
     return;
   }
 
-  const headers = ["NAME", "PROVIDER", "STATUS", "AUTONOMY", "CWD"];
+  const headers = ["NAME", "PROVIDER", "MODELO", "CONTEXTO", "STATUS", "AUTONOMY", "CWD"];
   const rows = agents.map((a) => [
     a.name,
     a.provider,
+    a.usage?.model ?? a.model ?? "padrão",
+    formatContext(a.usage),
     a.status,
     a.autonomy,
     a.cwd,
@@ -167,15 +219,22 @@ async function handleResponseError(res: Response): Promise<never> {
 }
 
 function printHelp() {
-  console.log(`Sinapse - Personal Multi-Agent Orchestrator
+  console.log(`Sinapse - Orquestrador Pessoal Multiagente
 
-Usage:
-  sinapse start                                              Start daemon
-  sinapse list                                               List all agents
-  sinapse spawn <name> --provider <p> --cwd <dir> --role <r> [--autonomy edit]
-  sinapse ask <name> "<prompt>" [--async]                    Send prompt to agent
-  sinapse check <name>                                       Check agent status and events
-  sinapse stop <name>                                        Stop active agent turn
+Uso:
+  sinapse start                                              Inicia o daemon
+  sinapse list                                               Lista todos os workers
+  sinapse spawn <nome> --provider <p> --cwd <dir> --role <r> [--autonomy edit] [--model <m>]
+  sinapse ask <nome> "<prompt>" [--async]                    Envia prompt ao worker
+  sinapse check <nome>                                       Consulta status e eventos do worker
+  sinapse stop <nome>                                        Interrompe o turno ativo do worker
+  sinapse models [claude|agy]                                Lista catálogo de modelos
+  sinapse model <nome> <modelo|padrao>                       Altera o modelo de um worker
+  sinapse note list                                          Lista todas as notas
+  sinapse note read <nome>                                   Exibe o conteúdo da nota
+  sinapse note write <nome> "<texto>"|-                          Cria ou sobrescreve uma nota
+  sinapse note append <nome> "<texto>"|-                         Adiciona texto a uma nota existente
+  sinapse note rm <nome>                                     Remove uma nota
 `);
 }
 
@@ -196,7 +255,7 @@ async function main() {
         return;
       }
 
-      const { port } = await start();
+      const { port } = await start({ handleSignals: true });
       console.log(`sinapsed running on http://127.0.0.1:${port}`);
       break;
     }
@@ -214,23 +273,31 @@ async function main() {
     case "spawn": {
       const name = positional[1];
       if (!name) {
-        console.error("Error: Agent name is required. Usage: sinapse spawn <name> --provider <p> --cwd <dir> --role \"...\" [--autonomy edit]");
+        console.error("Erro: Nome do agente é obrigatório. Uso: sinapse spawn <name> --provider <p> --cwd <dir> --role \"...\" [--autonomy edit] [--model <m>]");
         process.exit(1);
       }
 
       const provider = (flags.provider || flags.p) as Provider;
       if (!provider) {
-        console.error("Error: --provider is required (e.g. claude, agy)");
+        console.error("Erro: --provider é obrigatório (ex: claude, agy)");
         process.exit(1);
       }
 
       const cwd = (flags.cwd || flags.c || process.cwd()) as string;
       const role = (flags.role || flags.r || "assistant") as string;
       const autonomy = (flags.autonomy || flags.a || "edit") as Autonomy;
+      const model = (flags.model || flags.m) as string | undefined;
 
       const res = await apiRequest("/agents", {
         method: "POST",
-        body: JSON.stringify({ name, provider, cwd, role, autonomy }),
+        body: JSON.stringify({
+          name,
+          provider,
+          cwd,
+          role,
+          autonomy,
+          ...(model ? { model } : {}),
+        }),
       });
 
       if (!res.ok) {
@@ -238,7 +305,7 @@ async function main() {
       }
 
       const created = (await res.json()) as AgentState;
-      console.log(`Agent "${created.name}" spawned (id: ${created.id}, provider: ${created.provider})`);
+      console.log(`Agent "${created.name}" spawned (id: ${created.id}, provider: ${created.provider}${created.model ? `, model: ${created.model}` : ""})`);
       break;
     }
 
@@ -246,7 +313,7 @@ async function main() {
       const name = positional[1];
       const prompt = positional[2];
       if (!name || !prompt) {
-        console.error("Error: Name and prompt are required. Usage: sinapse ask <name> \"prompt\" [--async]");
+        console.error("Erro: Nome e prompt são obrigatórios. Uso: sinapse ask <name> \"prompt\" [--async]");
         process.exit(1);
       }
 
@@ -311,7 +378,7 @@ async function main() {
     case "check": {
       const name = positional[1];
       if (!name) {
-        console.error("Error: Agent name is required. Usage: sinapse check <name>");
+        console.error("Erro: Nome do agente é obrigatório. Uso: sinapse check <name>");
         process.exit(1);
       }
 
@@ -324,12 +391,16 @@ async function main() {
         agentId: string;
         name: string;
         status: string;
+        model?: string;
+        usage?: ContextUsage;
         turnId?: string;
         events?: TurnEvent[];
         lastError?: string;
       };
 
       console.log(`Agent: ${data.name} (id: ${data.agentId})`);
+      console.log(`Modelo: ${data.usage?.model ?? data.model ?? "padrão"}`);
+      console.log(`Contexto: ${formatContext(data.usage)}`);
       console.log(`Status: ${data.status}`);
       if (data.turnId) {
         console.log(`Turn ID: ${data.turnId}`);
@@ -352,7 +423,7 @@ async function main() {
     case "stop": {
       const name = positional[1];
       if (!name) {
-        console.error("Error: Agent name is required. Usage: sinapse stop <name>");
+        console.error("Erro: Nome do agente é obrigatório. Uso: sinapse stop <name>");
         process.exit(1);
       }
 
@@ -364,6 +435,169 @@ async function main() {
       }
 
       console.log(`Agent "${name}" stopped.`);
+      break;
+    }
+
+    case "models": {
+      const provider = positional[1]?.toLowerCase();
+      const res = await apiRequest("/models");
+      if (!res.ok) {
+        await handleResponseError(res);
+      }
+      const catalog = (await res.json()) as ModelCatalog;
+
+      const printGroup = (title: string, models: ModelOption[]) => {
+        console.log(`${title}:`);
+        for (const m of models) {
+          console.log(`  ${m.id.padEnd(28)} ${m.label}`);
+        }
+      };
+
+      if (!provider) {
+        printGroup("Claude", catalog.claude || []);
+        console.log("");
+        printGroup("AGY", catalog.agy || []);
+      } else if (provider === "claude") {
+        printGroup("Claude", catalog.claude || []);
+      } else if (provider === "agy") {
+        printGroup("AGY", catalog.agy || []);
+      } else {
+        console.error(`Provedor desconhecido: "${provider}". Use "claude" ou "agy".`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "model": {
+      const name = positional[1];
+      const modelArg = positional[2];
+      if (!name || !modelArg) {
+        console.error("Uso: sinapse model <nome> <modelo|padrao>");
+        process.exit(1);
+      }
+
+      const isDefault = modelArg === "padrao" || modelArg === "padrão";
+      const res = await apiRequest(`/agents/${encodeURIComponent(name)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ model: isDefault ? null : modelArg }),
+      });
+
+      if (!res.ok) {
+        await handleResponseError(res);
+      }
+
+      const agent = (await res.json()) as AgentState;
+      console.log(`Modelo de "${agent.name}" atualizado para: ${agent.model ?? "padrão"}`);
+      break;
+    }
+
+    case "note":
+    case "notes": {
+      const subCommand = positional[1];
+      if (!subCommand || subCommand === "help") {
+        console.log(`Uso:
+  sinapse note list
+  sinapse note read <nome>
+  sinapse note write <nome> "<texto>"|-
+  sinapse note append <nome> "<texto>"|-
+  sinapse note rm <nome>`);
+        return;
+      }
+
+      switch (subCommand) {
+        case "list": {
+          const res = await apiRequest("/notes");
+          if (!res.ok) await handleResponseError(res);
+          const notes = (await res.json()) as NoteSummary[];
+          if (notes.length === 0) {
+            console.log("Nenhuma nota encontrada.");
+            return;
+          }
+          const headers = ["NOME", "TÍTULO", "ATUALIZADO"];
+          const rows = notes.map((n) => [
+            n.name,
+            n.title,
+            new Date(n.updatedAt).toLocaleString("pt-BR"),
+          ]);
+          const colWidths = headers.map((h, i) =>
+            Math.max(h.length, ...rows.map((r) => r[i]?.length || 0))
+          );
+          const formatRow = (cols: string[]) =>
+            cols.map((c, i) => c.padEnd(colWidths[i])).join("  ");
+          console.log(formatRow(headers));
+          console.log(colWidths.map((w) => "-".repeat(w)).join("  "));
+          for (const row of rows) {
+            console.log(formatRow(row));
+          }
+          break;
+        }
+
+        case "read": {
+          const name = positional[2];
+          if (!name) {
+            console.error("Erro: Nome da nota é obrigatório. Uso: sinapse note read <nome>");
+            process.exit(1);
+          }
+          const res = await apiRequest(`/notes/${encodeURIComponent(name)}`);
+          if (!res.ok) await handleResponseError(res);
+          const note = (await res.json()) as Note;
+          process.stdout.write(note.content);
+          if (!note.content.endsWith("\n")) {
+            process.stdout.write("\n");
+          }
+          break;
+        }
+
+        case "write": {
+          const name = positional[2];
+          if (!name) {
+            console.error('Erro: Nome da nota é obrigatório. Uso: sinapse note write <nome> "<texto>" (ou "-" para ler do stdin)');
+            process.exit(1);
+          }
+          const text = await noteText(positional, "write");
+          const res = await apiRequest(`/notes/${encodeURIComponent(name)}`, {
+            method: "PUT",
+            body: JSON.stringify({ content: text }),
+          });
+          if (!res.ok) await handleResponseError(res);
+          console.log(`Nota "${name}" salva.`);
+          break;
+        }
+
+        case "append": {
+          const name = positional[2];
+          if (!name) {
+            console.error('Erro: Nome da nota é obrigatório. Uso: sinapse note append <nome> "<texto>" (ou "-" para ler do stdin)');
+            process.exit(1);
+          }
+          const text = await noteText(positional, "append");
+          const res = await apiRequest(`/notes/${encodeURIComponent(name)}/append`, {
+            method: "POST",
+            body: JSON.stringify({ content: text }),
+          });
+          if (!res.ok) await handleResponseError(res);
+          console.log(`Nota "${name}" atualizada.`);
+          break;
+        }
+
+        case "rm": {
+          const name = positional[2];
+          if (!name) {
+            console.error("Erro: Nome da nota é obrigatório. Uso: sinapse note rm <nome>");
+            process.exit(1);
+          }
+          const res = await apiRequest(`/notes/${encodeURIComponent(name)}`, {
+            method: "DELETE",
+          });
+          if (!res.ok) await handleResponseError(res);
+          console.log(`Nota "${name}" removida.`);
+          break;
+        }
+
+        default:
+          console.error(`Subcomando desconhecido: "${subCommand}". Use list, read, write, append ou rm.`);
+          process.exit(1);
+      }
       break;
     }
 

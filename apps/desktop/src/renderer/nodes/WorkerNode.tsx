@@ -1,12 +1,16 @@
 import { useState, useEffect, useRef, type FormEvent } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import type { AgentStatus, Provider } from "@sinapse/core";
+import type { AgentStatus, Provider, ContextUsage } from "@sinapse/core";
+import { ModelSelect } from "../components/ModelSelect";
+import { ContextMeter } from "../components/ContextMeter";
 
 export interface WorkerNodeData {
   name: string;
   provider: Provider;
   role?: string;
   status?: AgentStatus;
+  model?: string;
+  usage?: ContextUsage;
   log?: string;
   lastPrompt?: string;
 }
@@ -65,6 +69,10 @@ export function WorkerNode({ data }: NodeProps) {
 
   const [inputPrompt, setInputPrompt] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isEditingModel, setIsEditingModel] = useState(false);
+  const [isUpdatingModel, setIsUpdatingModel] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
+
   const outputRef = useRef<HTMLDivElement | null>(null);
 
   const isThinking = status === "thinking";
@@ -72,11 +80,30 @@ export function WorkerNode({ data }: NodeProps) {
   const statusColor = getStatusColor(status);
   const statusLabel = getStatusLabel(status);
 
+  const chipLabel = nodeData.usage?.model ?? nodeData.model ?? "padrão";
+
   useEffect(() => {
     if (outputRef.current) {
       outputRef.current.scrollTop = outputRef.current.scrollHeight;
     }
   }, [log]);
+
+  const handleModelChange = async (newModel: string | null) => {
+    setIsUpdatingModel(true);
+    setModelError(null);
+    try {
+      await window.sinapse?.workers?.update({
+        name: workerName,
+        model: newModel,
+      });
+      setIsEditingModel(false);
+    } catch (err: any) {
+      console.error("Erro ao atualizar modelo do worker:", err);
+      setModelError(err?.message || "Falha ao atualizar modelo");
+    } finally {
+      setIsUpdatingModel(false);
+    }
+  };
 
   const handleAsk = async (e: FormEvent) => {
     e.preventDefault();
@@ -144,6 +171,57 @@ export function WorkerNode({ data }: NodeProps) {
               {provider}
             </span>
           </div>
+
+          {/* Model chip or ModelSelect */}
+          <div className="worker-model-row">
+            {!isEditingModel ? (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!isThinking) {
+                    setModelError(null);
+                    setIsEditingModel(true);
+                  }
+                }}
+                disabled={isThinking}
+                className="worker-model-chip"
+                title={
+                  isThinking
+                    ? "Não é possível alterar modelo enquanto pensa"
+                    : "Clique para selecionar o modelo"
+                }
+              >
+                {chipLabel}
+              </button>
+            ) : (
+              <div className="worker-model-select-inline">
+                <ModelSelect
+                  provider={provider}
+                  value={nodeData.model ?? ""}
+                  resolvedModel={nodeData.usage?.model}
+                  disabled={isThinking || isUpdatingModel}
+                  onChange={handleModelChange}
+                  className="worker-model-select"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsEditingModel(false);
+                    setModelError(null);
+                  }}
+                  className="worker-model-close-btn"
+                  title="Fechar seleção"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+          </div>
+
+          {modelError && (
+            <div className="worker-model-error">{modelError}</div>
+          )}
+
           <div className="worker-status-line">
             <span
               className="status-dot"
@@ -157,6 +235,8 @@ export function WorkerNode({ data }: NodeProps) {
       <div className="worker-node-role" title={role}>
         {role}
       </div>
+
+      <ContextMeter usage={nodeData.usage} className="worker-context-meter" />
 
       <div className="worker-output-area nodrag nowheel" ref={outputRef}>
         {log ? (

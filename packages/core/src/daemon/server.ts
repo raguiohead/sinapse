@@ -1,26 +1,215 @@
 import Fastify from "fastify";
 import { nanoid } from "nanoid";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
-import os from "node:os";
 import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
-import { sinapseDir } from "../paths.js";
+import { findCliBinDir, sinapseDir } from "../paths.js";
+import { killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
+import { randomUUID } from "node:crypto";
 import type {
   AgentConfig,
   AgentState,
+  Autonomy,
   DaemonEvent,
   DaemonState,
+  ModelCatalog,
+  ModelOption,
+  Note,
+  NoteSummary,
   Provider,
   TurnEvent,
   TurnResult,
 } from "../types.js";
 import { ClaudeAdapter } from "../adapters/claude.js";
 import { AgyAdapter } from "../adapters/agy.js";
+import { estimateContextWindow } from "../context.js";
 
 const SINAPSE_DIR = sinapseDir();
 const STATE_FILE = path.join(SINAPSE_DIR, "state.json");
 const DAEMON_FILE = path.join(SINAPSE_DIR, "daemon.json");
+const NOTES_DIR = path.join(SINAPSE_DIR, "notes");
+
+const MODEL_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$/;
+
+function validateModel(input: unknown): { valid: true; model?: string } | { valid: false } {
+  if (input === undefined || input === null) {
+    return { valid: true, model: undefined };
+  }
+  if (typeof input !== "string") {
+    return { valid: false };
+  }
+  const trimmed = input.trim();
+  if (trimmed === "") {
+    return { valid: true, model: undefined };
+  }
+  if (!MODEL_REGEX.test(trimmed)) {
+    return { valid: false };
+  }
+  return { valid: true, model: trimmed };
+}
+
+const NOTE_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+function isValidNoteName(name: string): boolean {
+  return NOTE_NAME_REGEX.test(name);
+}
+
+function extractTitle(name: string, content: string): string {
+  const lines = content.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith("# ")) {
+      const heading = line.slice(2).trim();
+      if (heading) return heading;
+    }
+  }
+  return name;
+}
+
+async function writeNoteAtomic(name: string, content: string): Promise<NoteSummary> {
+  const filePath = path.join(NOTES_DIR, `${name}.md`);
+  const tmpPath = path.join(NOTES_DIR, `${name}.md.tmp`);
+  await fs.writeFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+  await fs.rename(tmpPath, filePath);
+  const stat = await fs.stat(filePath);
+  return {
+    name,
+    title: extractTitle(name, content),
+    updatedAt: stat.mtimeMs,
+  };
+}
+
+const CLAUDE_MODELS: ModelOption[] = [
+  { id: "fable", label: "Fable (mais recente)" },
+  { id: "opus", label: "Opus" },
+  { id: "sonnet", label: "Sonnet" },
+  { id: "haiku", label: "Haiku" },
+];
+
+const FALLBACK_AGY_MODELS: ModelOption[] = [
+  { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)" },
+];
+
+let cachedAgyModels: ModelOption[] | null = null;
+let agyModelsCachedAt = 0;
+const AGY_MODELS_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+async function fetchAgyModels(): Promise<ModelOption[]> {
+  const now = Date.now();
+  if (cachedAgyModels && now - agyModelsCachedAt < AGY_MODELS_CACHE_TTL) {
+    return cachedAgyModels;
+  }
+
+  // Even `agy models` starts MCP servers that detach; tag the spawn so they can be swept afterwards.
+  const marker = randomUUID();
+  try {
+    const models = await new Promise<ModelOption[]>((resolve, reject) => {
+      const child = spawn("agy", ["models"], {
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+        env: { ...process.env, [TURN_MARKER]: marker },
+      });
+
+      let stdout = "";
+      const timer = setTimeout(() => {
+        if (child.pid) killTree(child.pid);
+        reject(new Error("Timeout fetching agy models"));
+      }, 15000);
+
+      child.stdout.setEncoding("utf-8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+      });
+
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code !== 0) {
+          reject(new Error(`agy models exited with code ${code}`));
+          return;
+        }
+
+        const lines = stdout.split(/\r?\n/);
+        const parsed: ModelOption[] = [];
+        for (const line of lines) {
+          const tabIndex = line.indexOf("\t");
+          if (tabIndex > 0) {
+            const id = line.slice(0, tabIndex).trim();
+            const label = line.slice(tabIndex + 1).trim();
+            if (id && label) {
+              parsed.push({ id, label });
+            }
+          }
+        }
+
+        if (parsed.length > 0) {
+          resolve(parsed);
+        } else {
+          reject(new Error("No models parsed from agy models"));
+        }
+      });
+    });
+
+    cachedAgyModels = models;
+    agyModelsCachedAt = now;
+    return models;
+  } catch {
+    return FALLBACK_AGY_MODELS;
+  } finally {
+    sweepEnvMarker(TURN_MARKER, marker);
+  }
+}
+
+function setupNotesWatcher(): () => void {
+  try {
+    const debounceTimers = new Map<string, NodeJS.Timeout>();
+
+    const watcher = fsSync.watch(NOTES_DIR, (_eventType, filename) => {
+      if (!filename) return;
+      const fileStr = String(filename);
+      if (fileStr.endsWith(".tmp")) return;
+      if (!fileStr.endsWith(".md")) return;
+
+      const name = fileStr.slice(0, -3);
+      if (!isValidNoteName(name)) return;
+
+      const existing = debounceTimers.get(name);
+      if (existing) clearTimeout(existing);
+
+      const timer = setTimeout(async () => {
+        debounceTimers.delete(name);
+        try {
+          const filePath = path.join(NOTES_DIR, `${name}.md`);
+          const stat = await fs.stat(filePath);
+          const content = await fs.readFile(filePath, "utf-8");
+          const summary: NoteSummary = {
+            name,
+            title: extractTitle(name, content),
+            updatedAt: stat.mtimeMs,
+          };
+          broadcast({ kind: "note_changed", note: summary });
+        } catch (err: any) {
+          if (err?.code === "ENOENT") {
+            broadcast({ kind: "note_deleted", name });
+          }
+        }
+      }, 150);
+
+      debounceTimers.set(name, timer);
+    });
+
+    watcher.on("error", () => {});
+    return () => watcher.close();
+  } catch {
+    return () => {};
+  }
+}
 
 interface ActiveTurnSession {
   turnId: string;
@@ -44,9 +233,14 @@ function broadcast(event: DaemonEvent): void {
 }
 
 async function loadSavedState(): Promise<{ agents: Record<string, AgentState>; token?: string }> {
+  await fs.mkdir(SINAPSE_DIR, { recursive: true });
+  let content: string;
   try {
-    await fs.mkdir(SINAPSE_DIR, { recursive: true });
-    const content = await fs.readFile(STATE_FILE, "utf-8");
+    content = await fs.readFile(STATE_FILE, "utf-8");
+  } catch {
+    return { agents: {} };
+  }
+  try {
     const data = JSON.parse(content);
     const agents = data.agents ?? {};
     for (const agent of Object.values(agents) as AgentState[]) {
@@ -57,18 +251,32 @@ async function loadSavedState(): Promise<{ agents: Record<string, AgentState>; t
     }
     return { agents, token: data.token };
   } catch {
+    // Never start empty over an unreadable file: the next save would erase every agent. Keep a copy instead.
+    const backup = `${STATE_FILE}.corrupt-${Date.now()}`;
+    await fs.copyFile(STATE_FILE, backup).catch(() => {});
+    console.error(`state.json ilegível; cópia salva em ${backup}`);
     return { agents: {} };
   }
 }
 
 // Both files hold the daemon token, so keep them owner-only (chmod also fixes files created before this).
+// Write to a temp file and rename: a crash or a concurrent write can never leave a half-written file.
 async function writePrivate(file: string, content: string): Promise<void> {
   await fs.mkdir(SINAPSE_DIR, { recursive: true, mode: 0o700 });
-  await fs.writeFile(file, content, { mode: 0o600 });
-  await fs.chmod(file, 0o600);
+  const tmp = `${file}.${process.pid}.tmp`;
+  await fs.writeFile(tmp, content, { mode: 0o600 });
+  await fs.chmod(tmp, 0o600);
+  await fs.rename(tmp, file);
 }
 
-async function saveState(): Promise<void> {
+// Saves run one at a time, each writing the latest state.
+let saveQueue: Promise<void> = Promise.resolve();
+function saveState(): Promise<void> {
+  saveQueue = saveQueue.catch(() => {}).then(writeState);
+  return saveQueue;
+}
+
+async function writeState(): Promise<void> {
   await writePrivate(
     STATE_FILE,
     JSON.stringify(
@@ -121,6 +329,7 @@ async function executeTurn(
       cwd: agent.cwd,
       sessionId: agent.sessionId,
       autonomy: agent.autonomy,
+      model: agent.model,
     });
 
     let iter = await gen.next();
@@ -144,6 +353,9 @@ async function executeTurn(
       agent.status = "done";
       if (turnResult?.sessionId) {
         agent.sessionId = turnResult.sessionId;
+      }
+      if (turnResult?.usage) {
+        agent.usage = turnResult.usage;
       }
       agent.lastError = undefined;
     }
@@ -173,17 +385,28 @@ async function executeTurn(
       status: session.stopped ? "interrupted" : agent.status,
       text: turnResult?.text,
       error: agent.lastError,
+      usage: turnResult?.usage,
     });
     await saveState();
   }
 }
 
-export async function start(): Promise<{ port: number; token: string }> {
+/** handleSignals: only for a standalone daemon process; an embedding app (Electron) owns its own signals and calls shutdown(). */
+export async function start(
+  options: { handleSignals?: boolean } = {}
+): Promise<{ port: number; token: string }> {
+  // Workers inherit this env; they need the `sinapse` CLI to read and write notes.
+  const cliBin = findCliBinDir();
+  const currentPath = process.env.PATH ?? "";
+  if (cliBin && !currentPath.split(path.delimiter).includes(cliBin)) {
+    process.env.PATH = cliBin + path.delimiter + currentPath;
+  }
+
   const loaded = await loadSavedState();
   state.agents = loaded.agents;
   state.token = loaded.token || nanoid();
 
-  const fastify = Fastify({ logger: false });
+  const fastify = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
 
   fastify.addContentTypeParser(
     "application/json",
@@ -261,6 +484,11 @@ export async function start(): Promise<{ port: number; token: string }> {
       return reply.status(400).send({ error: `Invalid provider: ${body.provider}` });
     }
 
+    const modelVal = validateModel(body.model);
+    if (!modelVal.valid) {
+      return reply.status(400).send({ error: "Invalid model format" });
+    }
+
     const existing = Object.values(state.agents).find((a) => a.name === body.name);
     if (existing) {
       return reply.status(409).send({
@@ -277,6 +505,7 @@ export async function start(): Promise<{ port: number; token: string }> {
       role: body.role,
       autonomy: body.autonomy,
       status: "idle",
+      ...(modelVal.model ? { model: modelVal.model } : {}),
     };
 
     state.agents[agentId] = newAgent;
@@ -284,6 +513,67 @@ export async function start(): Promise<{ port: number; token: string }> {
     broadcast({ kind: "agent_spawned", agent: newAgent });
 
     return reply.status(201).send(newAgent);
+  });
+
+  fastify.patch("/agents/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const agent = findAgent(id);
+    if (!agent) {
+      return reply.status(404).send({ error: "Agent not found" });
+    }
+
+    if (agent.status === "thinking") {
+      return reply.status(409).send({ error: "Agent is currently busy (status is thinking)" });
+    }
+
+    const body = request.body as {
+      model?: string | null;
+      role?: string;
+      autonomy?: Autonomy;
+    } | undefined;
+
+    if (!body || typeof body !== "object") {
+      return reply.status(400).send({ error: "Invalid request body" });
+    }
+
+    if (body.role !== undefined) {
+      if (typeof body.role !== "string" || !body.role.trim()) {
+        return reply.status(400).send({ error: "Role must be a non-empty string" });
+      }
+      agent.role = body.role.trim();
+    }
+
+    if (body.autonomy !== undefined) {
+      if (body.autonomy !== "read" && body.autonomy !== "edit" && body.autonomy !== "full") {
+        return reply.status(400).send({ error: `Invalid autonomy: ${body.autonomy}` });
+      }
+      agent.autonomy = body.autonomy;
+    }
+
+    if ("model" in body) {
+      if (body.model === null || (typeof body.model === "string" && body.model.trim() === "")) {
+        delete agent.model;
+        if (agent.usage) {
+          delete agent.usage.model;
+        }
+      } else {
+        const modelVal = validateModel(body.model);
+        if (!modelVal.valid || !modelVal.model) {
+          return reply.status(400).send({ error: "Invalid model format" });
+        }
+        agent.model = modelVal.model;
+        if (agent.usage) {
+          agent.usage.model = agent.model;
+          if (agent.usage.windowEstimated) {
+            agent.usage.windowTokens = estimateContextWindow(agent.model);
+          }
+        }
+      }
+    }
+
+    await saveState();
+    broadcast({ kind: "agent_updated", agent });
+    return agent;
   });
 
   fastify.post("/agents/:id/ask", async (request, reply) => {
@@ -367,6 +657,8 @@ export async function start(): Promise<{ port: number; token: string }> {
       agentId: agent.id,
       name: agent.name,
       status: agent.status,
+      model: agent.model,
+      usage: agent.usage,
       turnId: agent.currentTurnId,
       events,
       lastError: agent.lastError,
@@ -397,6 +689,138 @@ export async function start(): Promise<{ port: number; token: string }> {
     return { ok: true, status: agent.status };
   });
 
+  fastify.get("/models", async (): Promise<ModelCatalog> => {
+    const agy = await fetchAgyModels();
+    return {
+      claude: CLAUDE_MODELS,
+      agy,
+    };
+  });
+
+  fastify.get("/notes", async (): Promise<NoteSummary[]> => {
+    try {
+      const entries = await fs.readdir(NOTES_DIR, { withFileTypes: true });
+      const summaries: NoteSummary[] = [];
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name.endsWith(".md")) {
+          const name = entry.name.slice(0, -3);
+          if (isValidNoteName(name)) {
+            const filePath = path.join(NOTES_DIR, entry.name);
+            try {
+              const stat = await fs.stat(filePath);
+              const content = await fs.readFile(filePath, "utf-8");
+              summaries.push({
+                name,
+                title: extractTitle(name, content),
+                updatedAt: stat.mtimeMs,
+              });
+            } catch {}
+          }
+        }
+      }
+      summaries.sort((a, b) => b.updatedAt - a.updatedAt);
+      return summaries;
+    } catch {
+      return [];
+    }
+  });
+
+  fastify.get("/notes/:name", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    if (!isValidNoteName(name)) {
+      return reply.status(400).send({ error: "Invalid note name" });
+    }
+    const filePath = path.join(NOTES_DIR, `${name}.md`);
+    try {
+      const stat = await fs.stat(filePath);
+      const content = await fs.readFile(filePath, "utf-8");
+      const note: Note = {
+        name,
+        title: extractTitle(name, content),
+        updatedAt: stat.mtimeMs,
+        content,
+      };
+      return note;
+    } catch (err: any) {
+      if (err?.code === "ENOENT") {
+        return reply.status(404).send({ error: "Note not found" });
+      }
+      throw err;
+    }
+  });
+
+  fastify.put("/notes/:name", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    if (!isValidNoteName(name)) {
+      return reply.status(400).send({ error: "Invalid note name" });
+    }
+    const body = request.body as { content?: string } | undefined;
+    if (!body || typeof body.content !== "string") {
+      return reply.status(400).send({ error: "Content is required" });
+    }
+    if (Buffer.byteLength(body.content, "utf-8") > 1024 * 1024) {
+      return reply.status(413).send({ error: "Content exceeds 1 MB limit" });
+    }
+    const summary = await writeNoteAtomic(name, body.content);
+    broadcast({ kind: "note_changed", note: summary });
+    return summary;
+  });
+
+  fastify.post("/notes/:name/append", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    if (!isValidNoteName(name)) {
+      return reply.status(400).send({ error: "Invalid note name" });
+    }
+    const body = request.body as { content?: string } | undefined;
+    if (!body || typeof body.content !== "string") {
+      return reply.status(400).send({ error: "Content is required" });
+    }
+
+    const filePath = path.join(NOTES_DIR, `${name}.md`);
+    let combinedContent = body.content;
+    try {
+      const existing = await fs.readFile(filePath, "utf-8");
+      if (existing.length > 0) {
+        const separator = existing.endsWith("\n") ? "" : "\n";
+        combinedContent = `${existing}${separator}${body.content}`;
+      }
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+
+    if (Buffer.byteLength(combinedContent, "utf-8") > 1024 * 1024) {
+      return reply.status(413).send({ error: "Content exceeds 1 MB limit" });
+    }
+
+    const summary = await writeNoteAtomic(name, combinedContent);
+    broadcast({ kind: "note_changed", note: summary });
+    return summary;
+  });
+
+  fastify.delete("/notes/:name", async (request, reply) => {
+    const { name } = request.params as { name: string };
+    if (!isValidNoteName(name)) {
+      return reply.status(400).send({ error: "Invalid note name" });
+    }
+    const filePath = path.join(NOTES_DIR, `${name}.md`);
+    try {
+      await fs.unlink(filePath);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") {
+        return reply.status(404).send({ error: "Note not found" });
+      }
+      throw err;
+    }
+    broadcast({ kind: "note_deleted", name });
+    return { ok: true };
+  });
+
+  await fs.mkdir(NOTES_DIR, { recursive: true, mode: 0o700 });
+  try {
+    await fs.chmod(NOTES_DIR, 0o700);
+  } catch {}
+  closeWatcher = setupNotesWatcher();
+
   await fastify.listen({ port: 0, host: "127.0.0.1" });
   const address = fastify.server.address() as AddressInfo;
   state.port = address.port;
@@ -404,27 +828,50 @@ export async function start(): Promise<{ port: number; token: string }> {
   await writeDaemonFile(state.port, state.token);
   await saveState();
 
-  const cleanup = async () => {
-    try {
-      await saveState();
-    } catch {}
-  };
+  closeServer = () => fastify.close();
 
-  process.once("SIGINT", async () => {
-    await cleanup();
-    process.exit(0);
-  });
-
-  process.once("SIGTERM", async () => {
-    await cleanup();
-    process.exit(0);
-  });
+  if (options.handleSignals) {
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      process.once(signal, async () => {
+        await shutdown();
+        process.exit(0);
+      });
+    }
+  }
 
   return { port: state.port, token: state.token };
 }
 
+let closeServer: (() => Promise<void>) | null = null;
+let closeWatcher: () => void = () => {};
+
+/** Stops running turns (and their process trees), the notes watcher and the HTTP server, then saves state. */
+export async function shutdown(): Promise<void> {
+  for (const [agentId, session] of activeTurns) {
+    session.stopped = true;
+    try {
+      await session.adapter.stop(0);
+    } catch {}
+    const agent = state.agents[agentId];
+    if (agent) {
+      agent.status = "interrupted";
+      agent.currentTurnId = undefined;
+    }
+  }
+  activeTurns.clear();
+  try {
+    closeWatcher();
+  } catch {}
+  try {
+    await closeServer?.();
+  } catch {}
+  try {
+    await saveState();
+  } catch {}
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  start()
+  start({ handleSignals: true })
     .then(({ port }) => {
       console.log(`sinapsed running on port ${port}`);
     })

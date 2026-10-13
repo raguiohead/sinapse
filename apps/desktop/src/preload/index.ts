@@ -1,10 +1,20 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
-import type { DaemonEvent } from "@sinapse/core";
+import type {
+  DaemonEvent,
+  ContextUsage,
+  ModelCatalog,
+  NoteSummary,
+  Note,
+  AgentState,
+} from "@sinapse/core";
 import {
   IPC,
   type DaemonInfo,
   type WorkerAskPayload,
   type WorkerSpawnPayload,
+  type WorkerUpdatePayload,
+  type NoteWritePayload,
+  type BrainInfo,
 } from "../shared/ipc.js";
 
 const api = {
@@ -21,6 +31,26 @@ const api = {
     },
     resize: (cols: number, rows: number): void => {
       ipcRenderer.send(IPC.BRAIN_RESIZE, cols, rows);
+    },
+    getInfo: (): Promise<BrainInfo> => {
+      return ipcRenderer.invoke(IPC.BRAIN_INFO);
+    },
+    setModel: (model: string | null): Promise<BrainInfo> => {
+      return ipcRenderer.invoke(IPC.BRAIN_SET_MODEL, model);
+    },
+    onUsage: (cb: (usage: ContextUsage) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, usage: ContextUsage) => cb(usage);
+      ipcRenderer.on(IPC.BRAIN_USAGE, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.BRAIN_USAGE, listener);
+      };
+    },
+    onInfoChanged: (cb: (info: { model: string | null }) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, info: { model: string | null }) => cb(info);
+      ipcRenderer.on(IPC.BRAIN_INFO_CHANGED, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.BRAIN_INFO_CHANGED, listener);
+      };
     },
   },
   daemon: {
@@ -47,17 +77,44 @@ const api = {
     },
   },
   workers: {
-    list: (): Promise<any[]> => {
+    list: (): Promise<AgentState[]> => {
       return ipcRenderer.invoke(IPC.WORKER_LIST);
     },
-    spawn: (payload: WorkerSpawnPayload): Promise<any> => {
+    spawn: (payload: WorkerSpawnPayload): Promise<AgentState> => {
       return ipcRenderer.invoke(IPC.WORKER_SPAWN, payload);
+    },
+    update: (payload: WorkerUpdatePayload): Promise<AgentState> => {
+      return ipcRenderer.invoke(IPC.WORKER_UPDATE, payload);
     },
     ask: (payload: WorkerAskPayload): Promise<{ turnId: string }> => {
       return ipcRenderer.invoke(IPC.WORKER_ASK, payload);
     },
     stop: (name: string): Promise<any> => {
       return ipcRenderer.invoke(IPC.WORKER_STOP, name);
+    },
+  },
+  models: {
+    list: (): Promise<ModelCatalog> => {
+      return ipcRenderer.invoke(IPC.MODELS_LIST);
+    },
+  },
+  notes: {
+    list: (): Promise<NoteSummary[]> => {
+      return ipcRenderer.invoke(IPC.NOTES_LIST);
+    },
+    read: (name: string): Promise<Note> => {
+      return ipcRenderer.invoke(IPC.NOTE_READ, name);
+    },
+    write: (payload: NoteWritePayload): Promise<Note> => {
+      return ipcRenderer.invoke(IPC.NOTE_WRITE, payload);
+    },
+    delete: (name: string): Promise<boolean> => {
+      return ipcRenderer.invoke(IPC.NOTE_DELETE, name);
+    },
+  },
+  app: {
+    openExternal: (url: string): Promise<void> => {
+      return ipcRenderer.invoke(IPC.APP_OPEN_EXTERNAL, url);
     },
   },
 };

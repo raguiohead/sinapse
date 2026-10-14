@@ -23,6 +23,29 @@ function descendantsOf(pid: number): number[] {
 
 export const TURN_MARKER = "SINAPSE_TURN_SESSION";
 
+// Markers of the Claude Code session that launched Sinapse (e.g. `npm start` from a Claude Code terminal).
+// Inherited, they make the brain/workers believe they are its child sessions (transcripts off, so no
+// usage or resume) and expose that session's messaging socket. User config vars are left untouched.
+const PARENT_SESSION_VARS = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_EXECPATH",
+  "CLAUDE_CODE_MESSAGING_SOCKET",
+  "CLAUDE_CODE_MESSAGING_TOKEN",
+  "CLAUDE_CODE_SESSION_ATTENDED",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_EFFORT",
+  "CLAUDE_JOB_DIR",
+  "CLAUDE_PID",
+];
+
+export function agentEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  for (const name of PARENT_SESSION_VARS) delete env[name];
+  return env;
+}
+
 /**
  * Some children (MCP servers) detach from the CLI that started them, so no tree walk finds them.
  * They still inherit the env, so callers tag a spawn with a unique NAME=value and sweep it afterwards (Linux /proc only).

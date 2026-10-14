@@ -274,8 +274,8 @@ sinapse/
 - **Versão do Electron:** o projeto fixa o Electron 35. A partir do 36 (GTK4), o app fecha ao iniciar em sistemas Linux que também carregam GTK3, com o erro "GTK 2/3 symbols detected".
 - **Adapter Codex:** O adapter para OpenAI Codex ainda não foi implementado.
 - **Persistência de logs:** O histórico detalhado de eventos de turnos de workers é mantido em memória e não é persistido após o encerramento do daemon.
-- **Diretório inicial do cérebro:** O terminal do cérebro inicia no diretório pessoal (`os.homedir()`). Na primeira execução, o Claude Code solicitará confirmação de confiança da pasta.
-- **Uso de contexto do cérebro:** é lido do transcript mais recente do Claude Code na pasta pessoal. Se você usar o Claude Code em `~` ao mesmo tempo, fora do Sinapse, o medidor pode mostrar aquela sessão.
+- **Pasta do cérebro:** o cérebro roda em `~/.sinapse/cerebro` (com um `CLAUDE.md` que explica o papel dele), não nos seus projetos. Na primeira execução o Claude Code pede confiança nessa pasta, uma única vez. Para mexer em projetos, o cérebro usa caminhos absolutos e passa a pasta certa aos workers.
+- **Janela de contexto estimada:** quando o CLI não informa o limite (AGY e cérebro), o Sinapse estima pelo nome do modelo; a família Claude 5.x é tratada como 1M.
 - **Processos que se desligam do pai:** alguns servidores MCP se separam do processo que os iniciou. No Linux o Sinapse os encontra por uma marca no ambiente e os encerra; no Windows depende do `taskkill /T`, que não alcança processos já desligados da árvore.
 - **Ambiente Windows não executado em homologação:** Os scripts e caminhos foram preparados para Windows 10/11, mas o desenvolvimento inicial foi conduzido no Linux.
 

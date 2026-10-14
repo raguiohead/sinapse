@@ -7,7 +7,7 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
 import { findCliBinDir, sinapseDir } from "../paths.js";
-import { killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
+import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { randomUUID } from "node:crypto";
 import type {
   AgentConfig,
@@ -109,7 +109,7 @@ async function fetchAgyModels(): Promise<ModelOption[]> {
       const child = spawn("agy", ["models"], {
         windowsHide: true,
         stdio: ["ignore", "pipe", "ignore"],
-        env: { ...process.env, [TURN_MARKER]: marker },
+        env: agentEnv({ [TURN_MARKER]: marker }),
       });
 
       let stdout = "";

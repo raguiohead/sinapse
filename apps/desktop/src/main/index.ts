@@ -30,6 +30,7 @@ const {
   startDaemon,
   shutdownDaemon,
   sweepEnvMarker,
+  agentEnv,
   sinapseDir,
   estimateContextWindow,
 }: typeof import("@sinapse/core") = _require("@sinapse/core");
@@ -145,13 +146,29 @@ function saveBrainModel(model: string | null): void {
   }
 }
 
+const BRAIN_GUIDE = `# Cérebro do Sinapse
+
+Você é o cérebro do Sinapse: conversa com o usuário e delega trabalho a workers pela skill \`sinapse\`.
+
+- Esta pasta é só a sua base. Os projetos do usuário ficam em outras pastas: trabalhe neles por caminho absoluto e passe a pasta certa aos workers com \`--cwd\`.
+- O canvas mostra ao vivo os workers, as delegações e as notas (\`sinapse note\`).
+`;
+
+/**
+ * The brain runs in its own folder, not in home: Claude Code doesn't persist trust for the home folder
+ * (it asks again on every new session), and home transcripts mix with the user's other sessions.
+ */
+function brainCwd(): string {
+  const dir = path.join(sinapseDir(), "cerebro");
+  fs.mkdirSync(dir, { recursive: true });
+  const guide = path.join(dir, "CLAUDE.md");
+  if (!fs.existsSync(guide)) fs.writeFileSync(guide, BRAIN_GUIDE);
+  return dir;
+}
+
+// Claude Code names a project's transcript folder after its cwd, with every non-alphanumeric char as "-".
 function getTranscriptDir(): string {
-  return path.join(
-    os.homedir(),
-    ".claude",
-    "projects",
-    os.homedir().replace(/[^a-zA-Z0-9]/g, "-")
-  );
+  return path.join(os.homedir(), ".claude", "projects", brainCwd().replace(/[^a-zA-Z0-9]/g, "-"));
 }
 
 // Session of the brain's own transcript (written after its PTY started). Resuming by id, not `--continue`,
@@ -419,14 +436,13 @@ function spawnClaudePTY(model?: string | null, resumeSessionId?: string | null):
       name: "xterm-256color",
       cols: currentCols,
       rows: currentRows,
-      cwd: os.homedir(),
-      env: {
-        ...process.env,
+      cwd: brainCwd(),
+      env: agentEnv({
         PATH: combinedPath,
         SINAPSE_URL: `http://127.0.0.1:${daemonInfo.port}`,
         SINAPSE_TOKEN: daemonInfo.token,
         SINAPSE_BRAIN_SESSION: brainSession,
-      },
+      }) as Record<string, string>,
     });
 
     ptyProcess = proc;

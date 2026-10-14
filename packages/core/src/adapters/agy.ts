@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import readline from "node:readline";
 import type { Adapter, AdapterRunOptions, ContextUsage, Provider, TurnEvent, TurnResult } from "../types.js";
 import { randomUUID } from "node:crypto";
-import { killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
+import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { estimateContextWindow } from "../context.js";
 
 export class AgyAdapter implements Adapter {
@@ -30,7 +30,7 @@ export class AgyAdapter implements Adapter {
     const child = spawn("agy", args, {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, [TURN_MARKER]: marker },
+      env: agentEnv({ [TURN_MARKER]: marker }),
       windowsHide: true,
     });
 

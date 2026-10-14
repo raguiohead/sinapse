@@ -406,7 +406,8 @@ export async function start(
   state.agents = loaded.agents;
   state.token = loaded.token || nanoid();
 
-  const fastify = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
+  // forceCloseConnections: the SSE streams never end on their own, so close() would wait forever without it.
+  const fastify = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024, forceCloseConnections: true });
 
   fastify.addContentTypeParser(
     "application/json",
@@ -687,6 +688,31 @@ export async function start(
     await saveState();
 
     return { ok: true, status: agent.status };
+  });
+
+  fastify.delete("/agents/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const agent = findAgent(id);
+    if (!agent) {
+      return reply.status(404).send({ error: "Agent not found" });
+    }
+
+    // A running turn is stopped first so its CLI and everything it started die with the agent.
+    const session = activeTurns.get(agent.id);
+    if (session) {
+      session.stopped = true;
+      try {
+        await session.adapter.stop(0);
+      } catch {}
+      activeTurns.delete(agent.id);
+    }
+
+    delete state.agents[agent.id];
+    agentRecentEvents.delete(agent.id);
+    await saveState();
+    broadcast({ kind: "agent_deleted", agentId: agent.id, agentName: agent.name });
+
+    return { ok: true };
   });
 
   fastify.get("/models", async (): Promise<ModelCatalog> => {

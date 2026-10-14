@@ -21,10 +21,11 @@ import { WorkerNode } from "./nodes/WorkerNode";
 import { NoteNode } from "./nodes/NoteNode";
 import { SynapseEdge } from "./edges/SynapseEdge";
 import { TitleBar } from "./components/TitleBar";
-import { ContextMenu } from "./components/ContextMenu";
+import { ContextMenu, type ContextMenuItem } from "./components/ContextMenu";
 import { NewWorkerDialog } from "./components/NewWorkerDialog";
 import { NewNoteDialog } from "./components/NewNoteDialog";
 import { SettingsScreen } from "./components/SettingsScreen";
+import type { WorkerNodeData } from "./nodes/WorkerNode";
 
 const nodeTypes = {
   brain: BrainNode,
@@ -41,6 +42,8 @@ const initialNodes: Node[] = [
     id: "brain",
     type: "brain",
     position: { x: 100, y: 200 },
+    width: 680,
+    height: 460,
     data: { label: "Brain", anyThinking: false },
   },
 ];
@@ -101,13 +104,18 @@ export function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+
   const [daemonConnected, setDaemonConnected] = useState(false);
   const [settings, setSettings] = useState<DesktopSettings | null>(null);
 
   // Modals and context menu state
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(
-    null
-  );
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    items?: ContextMenuItem[];
+  } | null>(null);
   const [isNewWorkerDialogOpen, setIsNewWorkerDialogOpen] = useState(false);
   const [isNewNoteDialogOpen, setIsNewNoteDialogOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -119,6 +127,80 @@ export function App() {
 
   // Track active pulse timers per edge
   const edgeTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
+
+  const deleteWorker = useCallback(
+    async (workerName: string, status?: AgentStatus) => {
+      const message =
+        status === "thinking"
+          ? `Excluir o worker "${workerName}"? O turno em andamento será interrompido e a sessão dele será perdida.`
+          : `Excluir o worker "${workerName}"? A sessão dele será perdida.`;
+      if (!window.confirm(message)) return;
+
+      try {
+        await window.sinapse?.workers?.delete(workerName);
+      } catch (err: any) {
+        console.error("Erro ao excluir worker:", err);
+        const errorMsg = err?.message || "Falha ao excluir worker";
+        setNodes((nds) =>
+          nds.map((n) =>
+            n.id === `worker-${workerName}`
+              ? { ...n, data: { ...n.data, deleteError: errorMsg } }
+              : n
+          )
+        );
+      }
+    },
+    [setNodes]
+  );
+
+  const handleNodeContextMenu = useCallback(
+    (e: React.MouseEvent, node: Node) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (node.type !== "worker") {
+        setContextMenu(null);
+        return;
+      }
+
+      const data = node.data as unknown as WorkerNodeData;
+      const workerName = data.name;
+      const status = data.status;
+
+      setContextMenu({
+        x: e.clientX,
+        y: e.clientY,
+        items: [
+          {
+            type: "action",
+            label: "Excluir worker",
+            danger: true,
+            icon: (
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M3 6h18" />
+                <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+                <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+                <line x1="10" y1="11" x2="10" y2="17" />
+                <line x1="14" y1="11" x2="14" y2="17" />
+              </svg>
+            ),
+            action: () => {
+              deleteWorker(workerName, status);
+            },
+          },
+        ],
+      });
+    },
+    [deleteWorker]
+  );
 
   // Load settings once and apply motion dataset
   useEffect(() => {
@@ -197,6 +279,8 @@ export function App() {
               id: nodeId,
               type: "worker",
               position: nextWorkerPosition(nextNodes),
+              width: 330,
+              height: 420,
               data: {
                 name: worker.name,
                 provider: worker.provider,
@@ -287,6 +371,8 @@ export function App() {
             x: brainX + i * 400,
             y: brainY + brainHeight + 120,
           },
+          width: 360,
+          height: 420,
           data: {
             name: n.name,
             title: n.title,
@@ -327,6 +413,8 @@ export function App() {
                 id: nodeId,
                 type: "worker",
                 position: nextWorkerPosition(nds),
+                width: 330,
+                height: 420,
                 data: {
                   name: agent.name,
                   provider: agent.provider,
@@ -366,6 +454,8 @@ export function App() {
         case "agent_updated": {
           const agent = event.agent;
           const nodeId = `worker-${agent.name}`;
+          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
+
           setNodes((nds) =>
             nds.map((n) =>
               n.id === nodeId
@@ -386,6 +476,9 @@ export function App() {
         }
 
         case "turn_started": {
+          const nodeId = `worker-${event.agentName}`;
+          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
+
           const st = agentStateMapRef.current.get(event.agentName) || {
             status: "idle",
             log: "",
@@ -397,7 +490,6 @@ export function App() {
           st.log = (st.log + promptHeader).slice(-20_000);
           agentStateMapRef.current.set(event.agentName, st);
 
-          const nodeId = `worker-${event.agentName}`;
           const edgeId = `edge-brain-${nodeId}`;
 
           const existingTimer = edgeTimersRef.current.get(edgeId);
@@ -433,6 +525,9 @@ export function App() {
         }
 
         case "turn_event": {
+          const nodeId = `worker-${event.agentName}`;
+          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
+
           const st = agentStateMapRef.current.get(event.agentName) || {
             status: "thinking",
             log: "",
@@ -447,7 +542,6 @@ export function App() {
           }
           agentStateMapRef.current.set(event.agentName, st);
 
-          const nodeId = `worker-${event.agentName}`;
           setNodes((nds) =>
             nds.map((n) =>
               n.id === nodeId
@@ -465,6 +559,9 @@ export function App() {
         }
 
         case "turn_finished": {
+          const nodeId = `worker-${event.agentName}`;
+          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
+
           const st = agentStateMapRef.current.get(event.agentName) || {
             status: event.status,
             log: "",
@@ -473,7 +570,6 @@ export function App() {
           st.status = event.status;
           agentStateMapRef.current.set(event.agentName, st);
 
-          const nodeId = `worker-${event.agentName}`;
           const edgeId = `edge-brain-${nodeId}`;
 
           setNodes((nds) =>
@@ -520,6 +616,25 @@ export function App() {
           break;
         }
 
+        case "agent_deleted": {
+          const nodeId = `worker-${event.agentName}`;
+          const edgeId = `edge-brain-${nodeId}`;
+
+          const existingTimer = edgeTimersRef.current.get(edgeId);
+          if (existingTimer) {
+            clearTimeout(existingTimer);
+            edgeTimersRef.current.delete(edgeId);
+          }
+
+          agentStateMapRef.current.delete(event.agentName);
+
+          setNodes((nds) => nds.filter((n) => n.id !== nodeId));
+          setEdges((eds) =>
+            eds.filter((e) => e.target !== nodeId && e.source !== nodeId && e.id !== edgeId)
+          );
+          break;
+        }
+
         case "note_changed": {
           const noteSummary = event.note;
           window.sinapse?.notes
@@ -557,6 +672,8 @@ export function App() {
                         x: brainX + currentNotes.length * 400,
                         y: brainY + brainHeight + 120,
                       },
+                      width: 360,
+                      height: 420,
                       data: {
                         name: fullNote.name,
                         title: fullNote.title,
@@ -685,10 +802,12 @@ export function App() {
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           onPaneContextMenu={handlePaneContextMenu}
+          onNodeContextMenu={handleNodeContextMenu}
           onPaneClick={() => setContextMenu(null)}
           onMoveStart={() => setContextMenu(null)}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
+          deleteKeyCode={null}
           proOptions={{ hideAttribution: true }}
           fitView
           fitViewOptions={{ padding: 0.2 }}
@@ -706,6 +825,7 @@ export function App() {
         <ContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
+          items={contextMenu.items}
           onClose={() => setContextMenu(null)}
           onNewWorker={() => setIsNewWorkerDialogOpen(true)}
           onNewNote={() => setIsNewNoteDialogOpen(true)}

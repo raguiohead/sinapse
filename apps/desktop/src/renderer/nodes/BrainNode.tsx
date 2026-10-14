@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { Handle, Position, NodeResizeControl, type NodeProps } from "@xyflow/react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -205,6 +205,28 @@ export function BrainNode({ data }: NodeProps) {
         id="brain-source"
         className="flow-handle brain-handle-source"
       />
+      <NodeResizeControl
+        position="bottom-right"
+        minWidth={520}
+        minHeight={320}
+        className="node-resize-control nodrag"
+      >
+        <svg
+          width="10"
+          height="10"
+          viewBox="0 0 10 10"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          className="node-resize-grip-icon"
+          aria-hidden="true"
+        >
+          <line x1="8.5" y1="1.5" x2="1.5" y2="8.5" />
+          <line x1="8.5" y1="5" x2="5" y2="8.5" />
+          <line x1="8.5" y1="8.5" x2="8.5" y2="8.5" />
+        </svg>
+      </NodeResizeControl>
     </div>
   );
 }

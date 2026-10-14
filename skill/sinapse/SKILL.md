@@ -24,6 +24,7 @@ sinapse ask <nome> "<prompt>"            # bloqueia e imprime a resposta
 sinapse ask <nome> "<prompt>" --async    # devolve um turnId e segue
 sinapse check <nome>                     # status e últimos eventos
 sinapse stop <nome>                      # cancela o turno atual
+sinapse rm <nome>                        # remove o worker (perde a sessão); só se o usuário pedir ou o worker não servir mais
 sinapse models [claude|agy]              # lista modelos disponíveis
 sinapse model <nome> <modelo|padrao>     # altera o modelo do worker (padrao limpa)
 sinapse note list                        # lista notas

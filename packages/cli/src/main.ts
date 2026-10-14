@@ -228,6 +228,7 @@ Uso:
   sinapse ask <nome> "<prompt>" [--async]                    Envia prompt ao worker
   sinapse check <nome>                                       Consulta status e eventos do worker
   sinapse stop <nome>                                        Interrompe o turno ativo do worker
+  sinapse rm <nome>                                          Remove o worker (interrompe o turno ativo)
   sinapse models [claude|agy]                                Lista catálogo de modelos
   sinapse model <nome> <modelo|padrao>                       Altera o modelo de um worker
   sinapse note list                                          Lista todas as notas
@@ -435,6 +436,20 @@ async function main() {
       }
 
       console.log(`Agent "${name}" stopped.`);
+      break;
+    }
+
+    case "rm": {
+      const name = positional[1];
+      if (!name) {
+        console.error("Erro: Nome do worker é obrigatório. Uso: sinapse rm <nome>");
+        process.exit(1);
+      }
+      const res = await apiRequest(`/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
+      if (!res.ok) {
+        await handleResponseError(res);
+      }
+      console.log(`Worker "${name}" removido.`);
       break;
     }
 

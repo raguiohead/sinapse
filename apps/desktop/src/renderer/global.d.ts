@@ -54,6 +54,8 @@ export interface SinapseBridge {
     update: (payload: WorkerUpdatePayload) => Promise<AgentState>;
     ask: (payload: WorkerAskPayload) => Promise<{ turnId: string }>;
     stop: (name: string) => Promise<any>;
+    /** Removes the worker; a running turn is interrupted first. Emits agent_deleted on the bus. */
+    delete: (name: string) => Promise<void>;
   };
   models: {
     list: () => Promise<ModelCatalog>;

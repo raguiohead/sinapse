@@ -135,6 +135,9 @@ const api = {
     stop: (name: string): Promise<any> => {
       return ipcRenderer.invoke(IPC.WORKER_STOP, name);
     },
+    delete: (name: string): Promise<void> => {
+      return ipcRenderer.invoke(IPC.WORKER_DELETE, name);
+    },
   },
   models: {
     list: (): Promise<ModelCatalog> => {

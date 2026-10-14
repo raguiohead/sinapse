@@ -153,6 +153,9 @@ Execute no terminal PowerShell:
 - **Menu de contexto:** clique com o botão direito no canvas para criar um worker ou uma nota e para abrir as configurações. O diálogo de novo worker já vem com os padrões definidos nas configurações (provedor, modelo, autonomia e pasta).
 - **Configurações** (⚙ ou `Ctrl+,`): modelo do cérebro e uso de contexto; padrões de novos workers; status do daemon e atalhos para as pastas de dados, do cérebro e de notas; aparência (barra cromática, movimento reduzido e tamanho da fonte do terminal). Cada mudança é salva na hora.
 - **Perguntar / Parar:** cada worker aceita prompts direto pelo card e permite interromper o turno em andamento.
+- **Excluir worker:** pela lixeira no card ou com clique direito no card. Pede confirmação; um turno em andamento é interrompido e tudo o que o worker abriu é encerrado.
+- **Redimensionar:** arraste a alça no canto inferior direito de qualquer card. O terminal do cérebro se reajusta ao novo tamanho.
+- **Notas:** "Editar" ou duplo clique abre um editor fora do canvas, em tamanho normal; `Ctrl+S` salva e Esc cancela.
 - **Arestas:** partículas vão do cérebro ao worker quando um turno começa e voltam na cor do provedor quando ele termina.
 - Workers criados pelo cérebro no terminal entram no canvas sozinhos, e a câmera se reajusta.
 
@@ -168,6 +171,7 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`:
 | `sinapse ask <nome> "<prompt>" --async` | Envia prompt de modo assíncrono, retornando imediatamente o `turnId` gerado. |
 | `sinapse check <nome>` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução e últimos eventos registrados. |
 | `sinapse stop <nome>` | Interrompe imediatamente o turno em execução no worker selecionado. |
+| `sinapse rm <nome>` | Remove o worker. Um turno em andamento é interrompido antes, e a sessão do worker deixa de ser usada. |
 | `sinapse models [claude\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude e AGY. |
 | `sinapse model <nome> <modelo\|padrao>` | Altera o modelo de um worker existente (`padrao` limpa e volta ao padrão do provedor). |
 | `sinapse note list` | Lista resumos de todas as notas salvas ordenadas por data de modificação. |

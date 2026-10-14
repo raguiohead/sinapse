@@ -100,7 +100,8 @@ export type DaemonEvent =
       usage?: ContextUsage;
     }
   | { kind: "note_changed"; note: NoteSummary }
-  | { kind: "note_deleted"; name: string };
+  | { kind: "note_deleted"; name: string }
+  | { kind: "agent_deleted"; agentId: string; agentName: string };
 
 export interface DaemonState {
   agents: Record<string, AgentState>;

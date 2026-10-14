@@ -1,31 +1,35 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
+export interface ContextMenuActionItem {
+  type: "action";
+  label: string;
+  icon?: ReactNode;
+  action: () => void;
+  danger?: boolean;
+}
+
+export interface ContextMenuSeparatorItem {
+  type: "separator";
+}
+
+export type ContextMenuItem = ContextMenuActionItem | ContextMenuSeparatorItem;
+export type MenuItem = ContextMenuItem;
+
 export interface ContextMenuProps {
   x: number;
   y: number;
   onClose: () => void;
-  onNewWorker: () => void;
-  onNewNote: () => void;
-  onOpenSettings: () => void;
+  items?: ContextMenuItem[];
+  onNewWorker?: () => void;
+  onNewNote?: () => void;
+  onOpenSettings?: () => void;
 }
-
-interface ActionItem {
-  type: "action";
-  label: string;
-  icon: ReactNode;
-  action: () => void;
-}
-
-interface SeparatorItem {
-  type: "separator";
-}
-
-type MenuItem = ActionItem | SeparatorItem;
 
 export function ContextMenu({
   x,
   y,
   onClose,
+  items,
   onNewWorker,
   onNewNote,
   onOpenSettings,
@@ -33,7 +37,7 @@ export function ContextMenu({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
 
-  const menuItems: MenuItem[] = [
+  const defaultItems: MenuItem[] = [
     {
       type: "action",
       label: "Novo worker",
@@ -53,8 +57,7 @@ export function ContextMenu({
         </svg>
       ),
       action: () => {
-        onClose();
-        onNewWorker();
+        onNewWorker?.();
       },
     },
     {
@@ -78,8 +81,7 @@ export function ContextMenu({
         </svg>
       ),
       action: () => {
-        onClose();
-        onNewNote();
+        onNewNote?.();
       },
     },
     { type: "separator" },
@@ -102,17 +104,17 @@ export function ContextMenu({
         </svg>
       ),
       action: () => {
-        onClose();
-        onOpenSettings();
+        onOpenSettings?.();
       },
     },
   ];
 
-  const actions = menuItems.filter((i): i is ActionItem => i.type === "action");
+  const menuItems: MenuItem[] = items && items.length > 0 ? items : defaultItems;
+  const actions = menuItems.filter((i): i is ContextMenuActionItem => i.type === "action");
 
   // Clamping within window boundaries
   const MENU_WIDTH = 190;
-  const MENU_HEIGHT = 145;
+  const MENU_HEIGHT = Math.max(40, menuItems.length * 36 + 16);
   const clampedX = Math.max(8, Math.min(x, window.innerWidth - MENU_WIDTH - 8));
   const clampedY = Math.max(40, Math.min(y, window.innerHeight - MENU_HEIGHT - 8));
 
@@ -150,7 +152,11 @@ export function ContextMenu({
       setSelectedIndex((prev) => (prev - 1 + actions.length) % actions.length);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      actions[selectedIndex]?.action();
+      const currentAction = actions[selectedIndex];
+      if (currentAction) {
+        onClose();
+        currentAction.action();
+      }
     }
   };
 
@@ -178,12 +184,15 @@ export function ContextMenu({
           <button
             key={item.label}
             type="button"
-            className={`context-menu-item ${isCurrentAction ? "active" : ""}`}
-            onClick={item.action}
+            className={`context-menu-item ${isCurrentAction ? "active" : ""} ${item.danger ? "danger" : ""}`}
+            onClick={() => {
+              onClose();
+              item.action();
+            }}
             onMouseEnter={() => setSelectedIndex(currentIdx)}
             role="menuitem"
           >
-            <span className="context-menu-icon">{item.icon}</span>
+            {item.icon && <span className="context-menu-icon">{item.icon}</span>}
             <span className="context-menu-label">{item.label}</span>
           </button>
         );

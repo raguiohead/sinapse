@@ -912,6 +912,14 @@ function registerIpcHandlers(): void {
     return await response.json();
   });
 
+  ipcMain.handle(IPC.WORKER_DELETE, async (_event, name: string): Promise<void> => {
+    const response = await daemonFetch(`/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Não foi possível excluir o worker ${name}: ${response.status} ${errText}`);
+    }
+  });
+
   // Notes
   ipcMain.handle(IPC.NOTES_LIST, async (): Promise<NoteSummary[]> => {
     const response = await daemonFetch("/notes", { method: "GET" });

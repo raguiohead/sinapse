@@ -21,7 +21,8 @@ import type {
   NoteSummary,
   Note,
 } from "@sinapse/core";
-import { ORCHESTRATOR_AUTHOR, USER_AUTHOR } from "@sinapse/core";
+// The routes subpath is browser-safe; the package root would pull the daemon (Fastify, node:*) into the renderer.
+import { ORCHESTRATOR_AUTHOR, USER_AUTHOR } from "@sinapse/core/routes";
 import type { DesktopSettings } from "../shared/ipc";
 
 import { BrainNode } from "./nodes/BrainNode";
@@ -104,48 +105,29 @@ function computeNotePosition(
   createdBy: string | undefined,
   nodes: Node[]
 ): { x: number; y: number } {
-  const authorNode = getAuthorNode(createdBy, nodes);
-  if (authorNode) {
-    const authorX = authorNode.position.x;
-    const authorY = authorNode.position.y;
-    const authorHeight =
-      authorNode.measured?.height ?? (authorNode.type === "brain" ? 460 : 420);
-    const startY = authorY + authorHeight + 40;
-
-    const notesUnderAuthor = nodes.filter(
-      (n) =>
-        n.type === "note" &&
-        n.id !== `note-${noteName}` &&
-        Math.abs(n.position.x - authorX) < 50
-    );
-
-    if (notesUnderAuthor.length === 0) {
-      return { x: authorX, y: startY };
-    }
-
-    const maxY = Math.max(
-      ...notesUnderAuthor.map((n) => n.position.y + (n.measured?.height ?? 420))
-    );
-    return { x: authorX, y: maxY + 20 };
-  }
-
-  // Notes without author keep the row under the brain
+  // Lanes that can't collide: unauthored notes left of the brain, the brain's notes under it,
+  // worker notes right of the whole worker grid (under a worker they'd land on the next worker in its column).
   const brain = nodes.find((n) => n.id === "brain");
   const brainX = brain?.position.x ?? 100;
   const brainY = brain?.position.y ?? 200;
   const brainHeight = brain?.measured?.height ?? 460;
-
-  const notesUnderBrain = nodes.filter(
-    (n) =>
-      n.type === "note" &&
-      n.id !== `note-${noteName}` &&
-      !getAuthorNode((n.data as any)?.createdBy, nodes)
-  );
-
-  return {
-    x: brainX + notesUnderBrain.length * 400,
-    y: brainY + brainHeight + 120,
+  const otherNotes = nodes.filter((n) => n.type === "note" && n.id !== `note-${noteName}`);
+  const stackBelow = (x: number, startY: number) => {
+    const inLane = otherNotes.filter((n) => Math.abs(n.position.x - x) < 50);
+    const bottom = Math.max(startY - 40, ...inLane.map((n) => n.position.y + (n.measured?.height ?? 420)));
+    return { x, y: inLane.length ? bottom + 40 : startY };
   };
+
+  const authorNode = getAuthorNode(createdBy, nodes);
+  if (authorNode?.id === "brain") {
+    return stackBelow(brainX, brainY + brainHeight + 60);
+  }
+  if (authorNode) {
+    const workers = nodes.filter((n) => n.type === "worker");
+    const gridRight = Math.max(...workers.map((w) => w.position.x + (w.measured?.width ?? 330)));
+    return stackBelow(gridRight + 120, authorNode.position.y);
+  }
+  return stackBelow(brainX - 360 - 120, brainY);
 }
 
 function extractToolName(raw: string): string {
@@ -298,6 +280,40 @@ export function App() {
   const agentStateMapRef = useRef<
     Map<string, { status: AgentStatus; log: string; lastPrompt: string }>
   >(new Map());
+
+  // Every worker's activity, across all workspaces. Saved per-workspace canvases hold stale node data, and workers
+  // created while their workspace is in the background have no saved state at all; cards are rehydrated from here.
+  const agentActivityRef = useRef<
+    Map<string, { status: AgentStatus; log: string; lastPrompt: string }>
+  >(new Map());
+
+  const recordAgentActivity = (event: DaemonEvent) => {
+    const store = agentActivityRef.current;
+    if (event.kind === "agent_deleted") {
+      store.delete(event.agentId);
+      return;
+    }
+    if (event.kind !== "turn_started" && event.kind !== "turn_event" && event.kind !== "turn_finished") return;
+    const st = store.get(event.agentId) ?? { status: "idle" as AgentStatus, log: "", lastPrompt: "" };
+    if (event.kind === "turn_started") {
+      st.status = "thinking";
+      st.lastPrompt = event.prompt;
+      st.log = (st.log + (st.log ? `\n> ${event.prompt}\n` : `> ${event.prompt}\n`)).slice(-20_000);
+    } else if (event.kind === "turn_event") {
+      if (event.event.type === "text") st.log = (st.log + event.event.data).slice(-20_000);
+      else if (event.event.type === "tool_use") st.log = (st.log + `⚙ ${extractToolName(event.event.data)}\n`).slice(-20_000);
+    } else {
+      st.status = event.status;
+    }
+    store.set(event.agentId, st);
+  };
+
+  const withAgentActivity = (nodes: Node[]): Node[] =>
+    nodes.map((n) => {
+      if (n.type !== "worker") return n;
+      const st = agentActivityRef.current.get(String((n.data as any)?.id ?? n.id.replace(/^worker-/, "")));
+      return st ? { ...n, data: { ...n.data, status: st.status, log: st.log, lastPrompt: st.lastPrompt } } : n;
+    });
 
   // Track active pulse timers per edge
   const edgeTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
@@ -532,7 +548,7 @@ export function App() {
         );
 
         agentStateMapRef.current = newAgentState;
-        setNodes(newNodes);
+        setNodes(withAgentActivity(newNodes));
         setEdges(newEdges);
 
         workspaceCanvasStateMapRef.current.set(wsId, {
@@ -571,7 +587,7 @@ export function App() {
       if (workspaceCanvasStateMapRef.current.has(targetWsId)) {
         const saved = workspaceCanvasStateMapRef.current.get(targetWsId)!;
         agentStateMapRef.current = new Map(saved.agentState);
-        setNodes(saved.nodes);
+        setNodes(withAgentActivity(saved.nodes));
         setEdges(saved.edges);
       } else {
         loadWorkspaceCanvas(targetWsId);
@@ -627,6 +643,7 @@ export function App() {
   // Handle incoming DaemonEvents
   const handleDaemonEvent = useCallback(
     (event: DaemonEvent) => {
+      recordAgentActivity(event);
       switch (event.kind) {
         case "workspace_created": {
           setWorkspaces((prev) => {

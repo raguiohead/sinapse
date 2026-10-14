@@ -159,14 +159,36 @@ Execute no terminal PowerShell:
 - **Arestas:** partículas vão do cérebro ao worker quando um turno começa e voltam na cor do provedor quando ele termina.
 - Workers criados pelo cérebro no terminal entram no canvas sozinhos, e a câmera se reajusta.
 
+### Workspaces
+
+Cada workspace é um projeto (uma pasta que você escolhe), com o próprio orquestrador, workers e notas.
+
+- **Seletor** (canto superior direito): lista os workspaces, troca entre eles, cria um novo ("＋ Novo workspace": nome, pasta, orquestrador e modelo) e apaga existentes (🗑).
+- **Orquestrador por workspace:** Claude Code ou AGY, com o modelo que você quiser; dá para trocar na seção "Orquestrador" das configurações. Mudar só o modelo do Claude retoma a conversa; mudar de provedor começa uma nova.
+- **Seu projeto fica intocado:** o orquestrador roda numa pasta do Sinapse (`~/.sinapse/workspaces/<id>/orquestrador`) e acessa o projeto via `--add-dir`. Nada é criado dentro do repositório do projeto. Na primeira vez, o Claude Code ou o AGY pede confiança nessa pasta.
+- **Em segundo plano:** ao trocar de workspace, o anterior continua rodando (orquestrador e turnos dos workers); ao voltar, os cards mostram o que aconteceu nesse meio-tempo.
+- **Apagar:** interrompe e remove os workers do workspace, encerra o orquestrador e apaga as notas e a sessão dele. A pasta do projeto não é tocada. O último workspace não pode ser apagado.
+- **Atualização de versões anteriores:** os workers e notas que existiam antes viram o workspace "Geral" (pasta: sua pasta pessoal) na primeira abertura.
+
+### Autoria
+
+Notas e workers ficam ligados a quem os criou:
+
+- O orquestrador e cada worker rodam com uma identidade (`SINAPSE_AGENT_ID`), que a CLI envia ao daemon.
+- **Nota:** aresta do autor até a nota, e uma aresta mais tênue de cada agente que escreveu nela depois. A aresta pulsa quando o agente escreve. Notas criadas por você, ou fora do Sinapse, ficam sem aresta.
+- **Worker criado por outro worker:** aresta tracejada do criador, além da ligação de delegação com o orquestrador.
+
 ### Comandos da CLI
 
-A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`:
+A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os comandos atuam num workspace, escolhido nesta ordem: `--workspace <nome|id>`, a variável `SINAPSE_WORKSPACE` (o orquestrador e os workers já a recebem), o workspace cuja pasta contém o diretório atual e, por fim, "geral".
 
 | Comando | Descrição |
 |---|---|
+| `sinapse workspaces` | Lista os workspaces, com pasta, orquestrador e número de workers. |
+| `sinapse workspace create <nome> --folder <dir> [--orchestrator claude\|agy] [--model <m>]` | Cria um workspace. |
+| `sinapse workspace rm <nome\|id>` | Apaga um workspace (a pasta do projeto não é tocada). |
 | `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia e diretório de trabalho. |
-| `sinapse spawn <nome> --provider <p> --cwd <dir> --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|agy`, `--cwd`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). |
+| `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
 | `sinapse ask <nome> "<prompt>"` | Envia prompt ao worker de modo síncrono, exibindo a saída em tempo real no terminal. |
 | `sinapse ask <nome> "<prompt>" --async` | Envia prompt de modo assíncrono, retornando imediatamente o `turnId` gerado. |
 | `sinapse check <nome>` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução e últimos eventos registrados. |
@@ -185,16 +207,16 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`:
 
 Tanto no canvas quanto na CLI, é possível selecionar e alternar os modelos dos workers:
 - **Seleção no Canvas e na CLI:** utilize `--model <modelo>` no `sinapse spawn` ou consulte os modelos disponíveis via `sinapse models [claude|agy]`. Para alterar o modelo de um worker existente, utilize `sinapse model <nome> <modelo>` (ou `sinapse model <nome> padrao` para remover o modelo customizado). No canvas, o modelo pode ser escolhido na criação e modificado no card do worker.
-- **Cérebro:** a seção Cérebro das configurações troca o modelo do cérebro. Ele reinicia retomando a própria sessão (`--resume` com o id dela), então a conversa continua; a escolha fica salva em `desktop.json`.
+- **Orquestrador:** a seção "Orquestrador" das configurações troca o agente e o modelo do workspace ativo (veja Workspaces).
 - **Janela de contexto:**
   - O **Claude** reporta o tamanho real de sua janela de contexto diretamente pela CLI (`contextWindow`).
-  - O **AGY** e o **cérebro** exibem uma estimativa da janela de contexto marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
-  - O uso de contexto do **cérebro** é lido a partir do transcript de sessão do Claude Code.
+  - O **AGY** e o **orquestrador** exibem uma estimativa da janela de contexto marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
+  - O uso de contexto do **orquestrador Claude** é lido a partir do transcript de sessão do Claude Code; o orquestrador AGY mostra só o modelo.
 
 ### Notas
 
 As notas representam a memória compartilhada entre o usuário, o cérebro e os workers:
-- **Onde vivem:** arquivos Markdown salvos em `~/.sinapse/notes/<nome>.md` (ou `$SINAPSE_HOME/notes/<nome>.md`). Nomes devem ser minúsculos com hífens ou sublinhados (`^[a-z0-9][a-z0-9_-]{0,63}$`).
+- **Onde vivem:** arquivos Markdown em `~/.sinapse/workspaces/<id>/notes/<nome>.md`, um conjunto por workspace (com `$SINAPSE_HOME`, dentro dessa pasta). Nomes devem ser minúsculos com hífens ou sublinhados (`^[a-z0-9][a-z0-9_-]{0,63}$`).
 - **CLI:** gerenciadas pelos subcomandos `sinapse note list`, `sinapse note read <nome>`, `sinapse note write <nome> "<texto>"|-`, `sinapse note append <nome> "<texto>"|-` e `sinapse note rm <nome>`. Em `write` e `append`, o texto é obrigatório; use `-` para ler do stdin (útil para várias linhas: `sinapse note write plano - <<'EOF'`).
 - **Comportamento no Canvas:**
   - Apresentadas como cards com visualização e edição direta.
@@ -242,11 +264,11 @@ Quando o Claude Code atua como cérebro usando o skill do Sinapse:
 
 Todos os dados de runtime do Sinapse ficam armazenados no diretório do usuário:
 
-- `~/.sinapse/state.json`: Estado persistido dos agentes cadastrados (id, nome, provedor, diretório, status, sessionId, modelo, uso de contexto).
+- `~/.sinapse/state.json`: workspaces e agentes (id, workspace, nome, provedor, pasta, status, sessão, modelo, uso de contexto, quem criou).
 - `~/.sinapse/daemon.json`: Informações do daemon em execução (`port`, `token`, `pid`).
-- `~/.sinapse/notes/`: Diretório de notas compartilhadas em Markdown (`<nome>.md`).
-- `~/.sinapse/desktop.json`: configurações do app (modelo do cérebro, padrões de novos workers e aparência).
-- `~/.sinapse/cerebro/`: pasta de trabalho do cérebro, com o `CLAUDE.md` que descreve o papel dele.
+- `~/.sinapse/workspaces/<id>/notes/`: notas do workspace (`<nome>.md`) e `.meta.json` com a autoria.
+- `~/.sinapse/workspaces/<id>/orquestrador/`: pasta onde o orquestrador roda, com o guia (`CLAUDE.md` ou `AGENTS.md`) e, para o AGY, a skill em `.agent/skills/sinapse`.
+- `~/.sinapse/desktop.json`: configurações do app (workspace ativo, padrões de novos workers e aparência).
 - `~/.sinapse/desktop.log`: Log de saída do processo de build e inicialização do Electron Desktop.
 
 > [!NOTE]
@@ -280,7 +302,9 @@ sinapse/
 - **Versão do Electron:** o projeto fixa o Electron 35. A partir do 36 (GTK4), o app fecha ao iniciar em sistemas Linux que também carregam GTK3, com o erro "GTK 2/3 symbols detected".
 - **Adapter Codex:** O adapter para OpenAI Codex ainda não foi implementado.
 - **Persistência de logs:** O histórico detalhado de eventos de turnos de workers é mantido em memória e não é persistido após o encerramento do daemon.
-- **Pasta do cérebro:** o cérebro roda em `~/.sinapse/cerebro` (com um `CLAUDE.md` que explica o papel dele), não nos seus projetos. Na primeira execução o Claude Code pede confiança nessa pasta, uma única vez. Para mexer em projetos, o cérebro usa caminhos absolutos e passa a pasta certa aos workers.
+- **Confiança por workspace:** cada orquestrador roda na sua própria pasta, então o Claude Code ou o AGY pede confiança uma vez por workspace novo.
+- **Orquestrador AGY:** ao abrir, o AGY às vezes mostra um aviso de novidades que precisa ser fechado com Esc antes de digitar. Ele não informa o uso de contexto, então o card mostra só o modelo.
+- **Pasta antiga `~/.sinapse/cerebro`:** depois da atualização para workspaces, ela não é mais usada (o orquestrador do Geral começa numa sessão nova). Pode ser apagada.
 - **Janela de contexto estimada:** quando o CLI não informa o limite (AGY e cérebro), o Sinapse estima pelo nome do modelo; a família Claude 5.x é tratada como 1M.
 - **Processos que se desligam do pai:** alguns servidores MCP se separam do processo que os iniciou. No Linux o Sinapse os encontra por uma marca no ambiente e os encerra; no Windows depende do `taskkill /T`, que não alcança processos já desligados da árvore.
 - **Ambiente Windows não executado em homologação:** Os scripts e caminhos foram preparados para Windows 10/11, mas o desenvolvimento inicial foi conduzido no Linux.

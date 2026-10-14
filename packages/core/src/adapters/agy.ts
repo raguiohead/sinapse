@@ -30,7 +30,7 @@ export class AgyAdapter implements Adapter {
     const child = spawn("agy", args, {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: agentEnv({ [TURN_MARKER]: marker }),
+      env: agentEnv({ [TURN_MARKER]: marker, ...options.env }),
       windowsHide: true,
     });
 

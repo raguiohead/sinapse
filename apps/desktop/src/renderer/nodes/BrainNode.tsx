@@ -9,42 +9,111 @@ import { ContextMeter } from "../components/ContextMeter";
 export interface BrainNodeData {
   label?: string;
   anyThinking?: boolean;
+  workspaceId?: string;
 }
 
 export function BrainNode({ data }: NodeProps) {
   const nodeData = (data ?? {}) as BrainNodeData;
   const anyThinking = Boolean(nodeData.anyThinking);
 
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>(
+    nodeData.workspaceId || ""
+  );
+  const [provider, setProvider] = useState<"claude" | "agy">("claude");
   const [brainModel, setBrainModel] = useState<string | null>(null);
   const [brainUsage, setBrainUsage] = useState<ContextUsage | undefined>(undefined);
+
+  const activeWorkspaceIdRef = useRef<string>(activeWorkspaceId);
+  activeWorkspaceIdRef.current = activeWorkspaceId;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const fontSizeRef = useRef<number>(13);
 
-  // Initial fetch and subscriptions for brain model and context usage
+  // Sync workspaceId from prop or from daemon onActiveChanged
   useEffect(() => {
-    window.sinapse?.brain?.getInfo().then((info) => {
+    if (nodeData.workspaceId && nodeData.workspaceId !== activeWorkspaceIdRef.current) {
+      setActiveWorkspaceId(nodeData.workspaceId);
+    }
+  }, [nodeData.workspaceId]);
+
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      window.sinapse?.workspaces?.getActive().then((wsId) => {
+        if (wsId) setActiveWorkspaceId(wsId);
+      });
+    }
+
+    const unsubActive = window.sinapse?.workspaces?.onActiveChanged((wsId) => {
+      setActiveWorkspaceId(wsId);
+    });
+
+    return () => {
+      if (unsubActive) unsubActive();
+    };
+  }, [activeWorkspaceId]);
+
+  // Fetch info and listen to updates for the active workspace
+  useEffect(() => {
+    if (!activeWorkspaceId) return;
+
+    window.sinapse?.brain?.getInfo(activeWorkspaceId).then((info) => {
       if (info) {
+        setProvider(info.provider || "claude");
         setBrainModel(info.model ?? null);
         setBrainUsage(info.usage);
       }
     });
 
-    const unsubUsage = window.sinapse?.brain?.onUsage((usage) => {
-      setBrainUsage(usage);
+    const unsubUsage = window.sinapse?.brain?.onUsage((wsId, usage) => {
+      if (wsId === activeWorkspaceIdRef.current) {
+        setBrainUsage(usage);
+      }
     });
 
     const unsubInfoChanged = window.sinapse?.brain?.onInfoChanged((info) => {
-      setBrainModel(info.model ?? null);
+      if (info.workspaceId === activeWorkspaceIdRef.current) {
+        setProvider(info.provider || "claude");
+        setBrainModel(info.model ?? null);
+        if (info.usage !== undefined) {
+          setBrainUsage(info.usage);
+        }
+      }
     });
 
     return () => {
       if (unsubUsage) unsubUsage();
       if (unsubInfoChanged) unsubInfoChanged();
     };
-  }, []);
+  }, [activeWorkspaceId]);
+
+  // Terminal replay on active workspace switch
+  useEffect(() => {
+    const term = terminalRef.current;
+    const fitAddon = fitAddonRef.current;
+    if (!term || !activeWorkspaceId) return;
+
+    term.reset();
+    let isCancelled = false;
+
+    window.sinapse?.brain?.replay(activeWorkspaceId).then((replayData) => {
+      if (isCancelled || !term) return;
+      if (replayData) {
+        term.write(replayData);
+      }
+      try {
+        fitAddon?.fit();
+        window.sinapse?.brain?.resize(activeWorkspaceId, term.cols, term.rows);
+      } catch (err) {
+        // Ignored if DOM not ready
+      }
+    });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [activeWorkspaceId]);
 
   // Settings subscription for terminal font size
   useEffect(() => {
@@ -56,7 +125,9 @@ export function BrainNode({ data }: NodeProps) {
       term.options.fontSize = size;
       try {
         fitAddon.fit();
-        window.sinapse?.brain?.resize(term.cols, term.rows);
+        if (activeWorkspaceIdRef.current) {
+          window.sinapse?.brain?.resize(activeWorkspaceIdRef.current, term.cols, term.rows);
+        }
       } catch (err) {
         // Ignored if DOM not yet measured
       }
@@ -115,7 +186,9 @@ export function BrainNode({ data }: NodeProps) {
     const fitAndResize = () => {
       try {
         fitAddon.fit();
-        window.sinapse?.brain?.resize(term.cols, term.rows);
+        if (activeWorkspaceIdRef.current) {
+          window.sinapse?.brain?.resize(activeWorkspaceIdRef.current, term.cols, term.rows);
+        }
       } catch (err) {
         // Ignored if DOM not yet measured
       }
@@ -123,12 +196,16 @@ export function BrainNode({ data }: NodeProps) {
 
     const timer = setTimeout(fitAndResize, 50);
 
-    const unsubData = window.sinapse?.brain?.onData((termData: string) => {
-      term.write(termData);
+    const unsubData = window.sinapse?.brain?.onData((wsId: string, termData: string) => {
+      if (wsId === activeWorkspaceIdRef.current) {
+        term.write(termData);
+      }
     });
 
     const onDataDisposable = term.onData((inputData: string) => {
-      window.sinapse?.brain?.write(inputData);
+      if (activeWorkspaceIdRef.current) {
+        window.sinapse?.brain?.write(activeWorkspaceIdRef.current, inputData);
+      }
     });
 
     const resizeObserver = new ResizeObserver(() => {
@@ -148,7 +225,8 @@ export function BrainNode({ data }: NodeProps) {
     };
   }, []);
 
-  const modelChipLabel = brainUsage?.model ?? brainModel ?? "padrão";
+  const modelChipLabel =
+    (provider === "claude" ? brainUsage?.model : null) ?? brainModel ?? "padrão";
 
   return (
     <div className={`brain-node-card ${anyThinking ? "brain-breathing" : ""}`}>
@@ -185,14 +263,15 @@ export function BrainNode({ data }: NodeProps) {
                 </linearGradient>
               </defs>
             </svg>
-            <span className="brain-node-label">cérebro · claude</span>
+            <span className="brain-node-label">orquestrador · {provider}</span>
           </div>
-          <div className="brain-node-tag">orquestrador</div>
         </div>
 
         <div className="brain-node-controls nodrag">
-          <ContextMeter usage={brainUsage} className="brain-context-meter" />
-          <span className="brain-model-chip" title="Modelo do cérebro">
+          {provider === "claude" && (
+            <ContextMeter usage={brainUsage} className="brain-context-meter" />
+          )}
+          <span className="brain-model-chip" title="Modelo do orquestrador">
             {modelChipLabel}
           </span>
         </div>

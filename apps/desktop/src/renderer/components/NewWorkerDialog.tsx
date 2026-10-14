@@ -3,12 +3,16 @@ import type { WorkerDefaults, Autonomy, WorkerSpawnPayload } from "../../shared/
 import { ModelSelect } from "./ModelSelect";
 
 export interface NewWorkerDialogProps {
+  workspaceId: string;
+  workspaceDefaultFolder?: string;
   defaults?: WorkerDefaults;
   onClose: () => void;
   onSuccess?: () => void;
 }
 
 export function NewWorkerDialog({
+  workspaceId,
+  workspaceDefaultFolder = "",
   defaults,
   onClose,
   onSuccess,
@@ -22,7 +26,7 @@ export function NewWorkerDialog({
   const [autonomy, setAutonomy] = useState<Autonomy>(
     defaults?.autonomy ?? "edit"
   );
-  const [cwd, setCwd] = useState(defaults?.cwd ?? "");
+  const [cwd, setCwd] = useState(workspaceDefaultFolder);
   const [isSpawning, setIsSpawning] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -47,6 +51,7 @@ export function NewWorkerDialog({
 
     try {
       const payload: WorkerSpawnPayload = {
+        workspaceId,
         name: workerName,
         provider,
         role: role.trim() || "Agente worker",

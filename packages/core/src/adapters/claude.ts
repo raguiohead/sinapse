@@ -31,7 +31,7 @@ export class ClaudeAdapter implements Adapter {
     const child = spawn("claude", args, {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: agentEnv({ [TURN_MARKER]: marker }),
+      env: agentEnv({ [TURN_MARKER]: marker, ...options.env }),
       windowsHide: true,
     });
 

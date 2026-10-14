@@ -1,10 +1,12 @@
 import { getBezierPath, type EdgeProps } from "@xyflow/react";
 
 export type SynapsePulse = "idle" | "out" | "back";
+export type SynapseVariant = "default" | "author" | "contributor" | "creator";
 
 export interface SynapseEdgeData {
   pulse?: SynapsePulse;
   provider?: "claude" | "agy" | string;
+  variant?: SynapseVariant;
 }
 
 export function SynapseEdge({
@@ -21,6 +23,10 @@ export function SynapseEdge({
   const edgeData = (data ?? {}) as SynapseEdgeData;
   const pulse: SynapsePulse = edgeData.pulse ?? "idle";
   const provider = edgeData.provider ?? "claude";
+  const variant: SynapseVariant = edgeData.variant ?? "default";
+
+  const isContributor = variant === "contributor";
+  const isCreator = variant === "creator";
 
   const [edgePath] = getBezierPath({
     sourceX,
@@ -37,6 +43,16 @@ export function SynapseEdge({
   const isOut = pulse === "out";
   const isActive = isOut || isBack;
   const particleColor = isBack ? providerColor : "var(--accent-a)";
+
+  const strokeWidth = isContributor
+    ? pulse === "idle"
+      ? 1
+      : 1.8
+    : pulse === "idle"
+    ? 1.5
+    : 2.5;
+
+  const strokeDasharray = isCreator ? "5 4" : undefined;
 
   // Negative begins start each particle mid-flight, so none sits at the SVG origin before moving.
   const delays = [0, -0.6, -1.2];
@@ -74,7 +90,9 @@ export function SynapseEdge({
       <path
         id={`edgepath-${safeId}`}
         d={edgePath}
-        className={`synapse-edge-path ${pulse !== "idle" ? "synapse-active" : ""}`}
+        className={`synapse-edge-path ${pulse !== "idle" ? "synapse-active" : ""} ${
+          isContributor ? "synapse-variant-contributor" : ""
+        } ${isCreator ? "synapse-variant-creator" : ""}`}
         style={{
           stroke:
             pulse === "idle"
@@ -82,16 +100,22 @@ export function SynapseEdge({
               : isBack
               ? providerColor
               : `url(#synapse-grad-${safeId})`,
-          strokeWidth: pulse === "idle" ? 1.5 : 2.5,
+          strokeWidth,
+          strokeDasharray,
           filter: pulse !== "idle" ? `url(#synapse-glow-${safeId})` : undefined,
           fill: "none",
+          opacity: isContributor ? 0.5 : 1,
         }}
         markerEnd={markerEnd}
       />
 
       {/* Glowing particles travelling along the path */}
       {isActive && (
-        <g className="synapse-particles" filter={`url(#synapse-glow-${safeId})`}>
+        <g
+          className="synapse-particles"
+          filter={`url(#synapse-glow-${safeId})`}
+          style={{ opacity: isContributor ? 0.5 : 1 }}
+        >
           {delays.map((delay, idx) => (
             <circle
               key={idx}

@@ -13,17 +13,26 @@ import {
   useReactFlow,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import type { DaemonEvent, AgentStatus } from "@sinapse/core";
+import type {
+  DaemonEvent,
+  AgentStatus,
+  Workspace,
+  AgentState,
+  NoteSummary,
+  Note,
+} from "@sinapse/core";
+import { ORCHESTRATOR_AUTHOR, USER_AUTHOR } from "@sinapse/core";
 import type { DesktopSettings } from "../shared/ipc";
 
 import { BrainNode } from "./nodes/BrainNode";
 import { WorkerNode } from "./nodes/WorkerNode";
 import { NoteNode } from "./nodes/NoteNode";
-import { SynapseEdge } from "./edges/SynapseEdge";
+import { SynapseEdge, type SynapsePulse, type SynapseVariant } from "./edges/SynapseEdge";
 import { TitleBar } from "./components/TitleBar";
 import { ContextMenu, type ContextMenuItem } from "./components/ContextMenu";
 import { NewWorkerDialog } from "./components/NewWorkerDialog";
 import { NewNoteDialog } from "./components/NewNoteDialog";
+import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
 import { SettingsScreen } from "./components/SettingsScreen";
 import type { WorkerNodeData } from "./nodes/WorkerNode";
 
@@ -37,18 +46,16 @@ const edgeTypes = {
   synapse: SynapseEdge,
 };
 
-const initialNodes: Node[] = [
-  {
+function createInitialBrainNode(workspaceId: string): Node {
+  return {
     id: "brain",
     type: "brain",
     position: { x: 100, y: 200 },
     width: 680,
     height: 460,
-    data: { label: "Brain", anyThinking: false },
-  },
-];
-
-const initialEdges: Edge[] = [];
+    data: { label: "Brain", anyThinking: false, workspaceId },
+  };
+}
 
 function AutoFit({
   workerCount,
@@ -73,14 +80,71 @@ function nextWorkerPosition(nodes: Node[]): { x: number; y: number } {
   const brainY = brain?.position.y ?? 200;
   const brainWidth = brain?.measured?.width ?? 720;
   const workers = nodes.filter((n) => n.type === "worker");
-  const workerWidth = workers[0]?.measured?.width ?? 320;
-  const workerHeight = Math.max(...workers.map((w) => w.measured?.height ?? 440), 440);
+  const workerWidth = workers[0]?.measured?.width ?? 330;
+  const workerHeight = Math.max(...workers.map((w) => w.measured?.height ?? 420), 420);
   const index = workers.length;
   const column = Math.floor(index / 3);
   const row = index % 3;
   return {
     x: brainX + brainWidth + 160 + column * (workerWidth + 80),
     y: brainY + row * (workerHeight + 60),
+  };
+}
+
+function getAuthorNode(createdBy: string | undefined, nodes: Node[]): Node | undefined {
+  if (!createdBy || createdBy === USER_AUTHOR) return undefined;
+  if (createdBy === ORCHESTRATOR_AUTHOR) {
+    return nodes.find((n) => n.id === "brain");
+  }
+  return nodes.find((n) => n.id === `worker-${createdBy}`);
+}
+
+function computeNotePosition(
+  noteName: string,
+  createdBy: string | undefined,
+  nodes: Node[]
+): { x: number; y: number } {
+  const authorNode = getAuthorNode(createdBy, nodes);
+  if (authorNode) {
+    const authorX = authorNode.position.x;
+    const authorY = authorNode.position.y;
+    const authorHeight =
+      authorNode.measured?.height ?? (authorNode.type === "brain" ? 460 : 420);
+    const startY = authorY + authorHeight + 40;
+
+    const notesUnderAuthor = nodes.filter(
+      (n) =>
+        n.type === "note" &&
+        n.id !== `note-${noteName}` &&
+        Math.abs(n.position.x - authorX) < 50
+    );
+
+    if (notesUnderAuthor.length === 0) {
+      return { x: authorX, y: startY };
+    }
+
+    const maxY = Math.max(
+      ...notesUnderAuthor.map((n) => n.position.y + (n.measured?.height ?? 420))
+    );
+    return { x: authorX, y: maxY + 20 };
+  }
+
+  // Notes without author keep the row under the brain
+  const brain = nodes.find((n) => n.id === "brain");
+  const brainX = brain?.position.x ?? 100;
+  const brainY = brain?.position.y ?? 200;
+  const brainHeight = brain?.measured?.height ?? 460;
+
+  const notesUnderBrain = nodes.filter(
+    (n) =>
+      n.type === "note" &&
+      n.id !== `note-${noteName}` &&
+      !getAuthorNode((n.data as any)?.createdBy, nodes)
+  );
+
+  return {
+    x: brainX + notesUnderBrain.length * 400,
+    y: brainY + brainHeight + 120,
   };
 }
 
@@ -100,12 +164,121 @@ function extractToolName(raw: string): string {
   }
 }
 
+interface WorkspaceCanvasState {
+  nodes: Node[];
+  edges: Edge[];
+  agentState: Map<string, { status: AgentStatus; log: string; lastPrompt: string }>;
+}
+
+function buildEdges(
+  workers: AgentState[],
+  notes: (NoteSummary | Note)[],
+  orchestratorProvider: "claude" | "agy"
+): Edge[] {
+  const edges: Edge[] = [];
+
+  // 1. Brain -> worker edges & worker creator edges
+  for (const worker of workers) {
+    const workerNodeId = `worker-${worker.id}`;
+    edges.push({
+      id: `edge-brain-${workerNodeId}`,
+      source: "brain",
+      target: workerNodeId,
+      type: "synapse",
+      data: { pulse: "idle", provider: worker.provider, variant: "default" },
+    });
+
+    if (
+      worker.createdBy &&
+      worker.createdBy !== ORCHESTRATOR_AUTHOR &&
+      worker.createdBy !== USER_AUTHOR
+    ) {
+      const creatorExists = workers.some((w) => w.id === worker.createdBy);
+      if (creatorExists) {
+        edges.push({
+          id: `edge-creator-worker-${worker.createdBy}-${workerNodeId}`,
+          source: `worker-${worker.createdBy}`,
+          target: workerNodeId,
+          type: "synapse",
+          data: { pulse: "idle", provider: worker.provider, variant: "creator" },
+        });
+      }
+    }
+  }
+
+  // 2. Note author & contributor edges
+  for (const note of notes) {
+    const noteNodeId = `note-${note.name}`;
+
+    if (note.createdBy === ORCHESTRATOR_AUTHOR) {
+      edges.push({
+        id: `edge-author-brain-${noteNodeId}`,
+        source: "brain",
+        target: noteNodeId,
+        type: "synapse",
+        data: { pulse: "idle", provider: orchestratorProvider, variant: "author" },
+      });
+    } else if (note.createdBy && note.createdBy !== USER_AUTHOR) {
+      const creatorWorker = workers.find((w) => w.id === note.createdBy);
+      if (creatorWorker) {
+        edges.push({
+          id: `edge-author-worker-${note.createdBy}-${noteNodeId}`,
+          source: `worker-${note.createdBy}`,
+          target: noteNodeId,
+          type: "synapse",
+          data: { pulse: "idle", provider: creatorWorker.provider, variant: "author" },
+        });
+      }
+    }
+
+    for (const contrib of note.contributors || []) {
+      if (contrib === ORCHESTRATOR_AUTHOR) {
+        edges.push({
+          id: `edge-contrib-brain-${noteNodeId}`,
+          source: "brain",
+          target: noteNodeId,
+          type: "synapse",
+          data: { pulse: "idle", provider: orchestratorProvider, variant: "contributor" },
+        });
+      } else if (contrib && contrib !== USER_AUTHOR) {
+        const contribWorker = workers.find((w) => w.id === contrib);
+        if (contribWorker) {
+          edges.push({
+            id: `edge-contrib-worker-${contrib}-${noteNodeId}`,
+            source: `worker-${contrib}`,
+            target: noteNodeId,
+            type: "synapse",
+            data: { pulse: "idle", provider: contribWorker.provider, variant: "contributor" },
+          });
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
 export function App() {
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>("");
+  const activeWorkspaceIdRef = useRef(activeWorkspaceId);
+  activeWorkspaceIdRef.current = activeWorkspaceId;
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   const nodesRef = useRef(nodes);
   nodesRef.current = nodes;
+  const edgesRef = useRef(edges);
+  edgesRef.current = edges;
+
+  // Stored per-workspace canvas state: Map<workspaceId, WorkspaceCanvasState>
+  const workspaceCanvasStateMapRef = useRef<Map<string, WorkspaceCanvasState>>(new Map());
+  const prevActiveWorkspaceIdRef = useRef<string>("");
+
+  // Thinking agent tracker: Map<workspaceId, Set<agentId>>
+  const thinkingAgentsPerWsRef = useRef<Map<string, Set<string>>>(new Map());
+  const [thinkingCounts, setThinkingCounts] = useState<Record<string, number>>({});
 
   const [daemonConnected, setDaemonConnected] = useState(false);
   const [settings, setSettings] = useState<DesktopSettings | null>(null);
@@ -118,9 +291,10 @@ export function App() {
   } | null>(null);
   const [isNewWorkerDialogOpen, setIsNewWorkerDialogOpen] = useState(false);
   const [isNewNoteDialogOpen, setIsNewNoteDialogOpen] = useState(false);
+  const [isNewWorkspaceDialogOpen, setIsNewWorkspaceDialogOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
-  // Per-agent state tracking: status, log string, lastPrompt
+  // Per-agent state tracking for active workspace: agentId -> { status, log, lastPrompt }
   const agentStateMapRef = useRef<
     Map<string, { status: AgentStatus; log: string; lastPrompt: string }>
   >(new Map());
@@ -128,8 +302,59 @@ export function App() {
   // Track active pulse timers per edge
   const edgeTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
 
+  const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) || null;
+
+  const updateThinkingState = useCallback((wsId: string, agentId: string, isThinking: boolean) => {
+    let set = thinkingAgentsPerWsRef.current.get(wsId);
+    if (!set) {
+      set = new Set();
+      thinkingAgentsPerWsRef.current.set(wsId, set);
+    }
+    if (isThinking) {
+      set.add(agentId);
+    } else {
+      set.delete(agentId);
+    }
+    setThinkingCounts((prev) => ({
+      ...prev,
+      [wsId]: set.size,
+    }));
+  }, []);
+
+  const pulseEdge = useCallback(
+    (sourceId: string, targetId: string, durationMs = 1500, pulseType: SynapsePulse = "out") => {
+      setEdges((eds) => {
+        const targetEdge = eds.find((e) => e.source === sourceId && e.target === targetId);
+        if (!targetEdge) return eds;
+
+        const edgeId = targetEdge.id;
+        const existingTimer = edgeTimersRef.current.get(edgeId);
+        if (existingTimer) {
+          clearTimeout(existingTimer);
+          edgeTimersRef.current.delete(edgeId);
+        }
+
+        const timer = setTimeout(() => {
+          setEdges((currentEds) =>
+            currentEds.map((e) =>
+              e.id === edgeId ? { ...e, data: { ...e.data, pulse: "idle" } } : e
+            )
+          );
+          edgeTimersRef.current.delete(edgeId);
+        }, durationMs);
+
+        edgeTimersRef.current.set(edgeId, timer);
+
+        return eds.map((e) =>
+          e.id === edgeId ? { ...e, data: { ...e.data, pulse: pulseType } } : e
+        );
+      });
+    },
+    [setEdges]
+  );
+
   const deleteWorker = useCallback(
-    async (workerName: string, status?: AgentStatus) => {
+    async (agentId: string, workerName: string, status?: AgentStatus) => {
       const message =
         status === "thinking"
           ? `Excluir o worker "${workerName}"? O turno em andamento será interrompido e a sessão dele será perdida.`
@@ -137,13 +362,13 @@ export function App() {
       if (!window.confirm(message)) return;
 
       try {
-        await window.sinapse?.workers?.delete(workerName);
+        await window.sinapse?.workers?.delete(activeWorkspaceIdRef.current, agentId);
       } catch (err: any) {
         console.error("Erro ao excluir worker:", err);
         const errorMsg = err?.message || "Falha ao excluir worker";
         setNodes((nds) =>
           nds.map((n) =>
-            n.id === `worker-${workerName}`
+            n.id === `worker-${agentId}`
               ? { ...n, data: { ...n.data, deleteError: errorMsg } }
               : n
           )
@@ -163,6 +388,7 @@ export function App() {
       }
 
       const data = node.data as unknown as WorkerNodeData;
+      const agentId = data.id;
       const workerName = data.name;
       const status = data.status;
 
@@ -193,7 +419,7 @@ export function App() {
               </svg>
             ),
             action: () => {
-              deleteWorker(workerName, status);
+              deleteWorker(agentId, workerName, status);
             },
           },
         ],
@@ -202,7 +428,159 @@ export function App() {
     [deleteWorker]
   );
 
-  // Load settings once and apply motion dataset
+  // Load canvas for a workspace from daemon
+  const loadWorkspaceCanvas = useCallback(
+    async (wsId: string) => {
+      if (!wsId) return;
+      try {
+        const [workerList, summaries, brainInfo] = await Promise.all([
+          window.sinapse?.workers?.list(wsId),
+          window.sinapse?.notes?.list(wsId),
+          window.sinapse?.brain?.getInfo(wsId).catch(() => null),
+        ]);
+
+        const orchestratorProvider = brainInfo?.provider ?? "claude";
+
+        const fullNotes: Note[] = Array.isArray(summaries)
+          ? await Promise.all(
+              summaries.map(async (s) => {
+                try {
+                  return await window.sinapse?.notes?.read(wsId, s.name);
+                } catch {
+                  return {
+                    workspaceId: wsId,
+                    name: s.name,
+                    title: s.title,
+                    content: "",
+                    updatedAt: s.updatedAt,
+                    createdBy: s.createdBy,
+                    contributors: s.contributors || [],
+                  };
+                }
+              })
+            )
+          : [];
+
+        const brainNode = createInitialBrainNode(wsId);
+        const newNodes: Node[] = [brainNode];
+        const newAgentState = new Map<
+          string,
+          { status: AgentStatus; log: string; lastPrompt: string }
+        >();
+
+        const thinkingSet = new Set<string>();
+
+        if (Array.isArray(workerList)) {
+          for (const worker of workerList) {
+            if (worker.status === "thinking") {
+              thinkingSet.add(worker.id);
+            }
+            newAgentState.set(worker.id, {
+              status: worker.status || "idle",
+              log: "",
+              lastPrompt: "",
+            });
+            newNodes.push({
+              id: `worker-${worker.id}`,
+              type: "worker",
+              position: nextWorkerPosition(newNodes),
+              width: 330,
+              height: 420,
+              data: {
+                id: worker.id,
+                workspaceId: wsId,
+                name: worker.name,
+                provider: worker.provider,
+                role: worker.role,
+                status: worker.status || "idle",
+                model: worker.model,
+                usage: worker.usage,
+                log: "",
+                lastPrompt: "",
+              },
+            });
+          }
+        }
+
+        thinkingAgentsPerWsRef.current.set(wsId, thinkingSet);
+        setThinkingCounts((prev) => ({ ...prev, [wsId]: thinkingSet.size }));
+
+        for (const note of fullNotes) {
+          const pos = computeNotePosition(note.name, note.createdBy, newNodes);
+          newNodes.push({
+            id: `note-${note.name}`,
+            type: "note",
+            position: pos,
+            width: 360,
+            height: 420,
+            data: {
+              workspaceId: wsId,
+              name: note.name,
+              title: note.title,
+              content: note.content,
+              updatedAt: note.updatedAt,
+              createdBy: note.createdBy,
+              contributors: note.contributors || [],
+            },
+          });
+        }
+
+        const newEdges = buildEdges(
+          Array.isArray(workerList) ? workerList : [],
+          fullNotes,
+          orchestratorProvider
+        );
+
+        agentStateMapRef.current = newAgentState;
+        setNodes(newNodes);
+        setEdges(newEdges);
+
+        workspaceCanvasStateMapRef.current.set(wsId, {
+          nodes: newNodes,
+          edges: newEdges,
+          agentState: new Map(newAgentState),
+        });
+      } catch (err) {
+        console.error("Erro ao carregar canvas do workspace:", err);
+      }
+    },
+    [setNodes, setEdges]
+  );
+
+  // Switch workspace: save current canvas and restore target
+  const switchWorkspace = useCallback(
+    (targetWsId: string) => {
+      const prevWsId = prevActiveWorkspaceIdRef.current;
+      if (prevWsId && prevWsId !== targetWsId && nodesRef.current.length > 0) {
+        workspaceCanvasStateMapRef.current.set(prevWsId, {
+          nodes: nodesRef.current,
+          edges: edgesRef.current,
+          agentState: new Map(agentStateMapRef.current),
+        });
+      }
+
+      // Clear edge timers from previous workspace
+      for (const timer of edgeTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      edgeTimersRef.current.clear();
+
+      prevActiveWorkspaceIdRef.current = targetWsId;
+      setActiveWorkspaceId(targetWsId);
+
+      if (workspaceCanvasStateMapRef.current.has(targetWsId)) {
+        const saved = workspaceCanvasStateMapRef.current.get(targetWsId)!;
+        agentStateMapRef.current = new Map(saved.agentState);
+        setNodes(saved.nodes);
+        setEdges(saved.edges);
+      } else {
+        loadWorkspaceCanvas(targetWsId);
+      }
+    },
+    [loadWorkspaceCanvas, setNodes, setEdges]
+  );
+
+  // Initial load: settings, workspaces list, active workspace
   useEffect(() => {
     window.sinapse?.settings?.get().then((s) => {
       if (s) {
@@ -213,7 +591,7 @@ export function App() {
       }
     });
 
-    const unsub = window.sinapse?.settings?.onChanged((s) => {
+    const unsubSettings = window.sinapse?.settings?.onChanged((s) => {
       if (s) {
         setSettings(s);
         if (s.appearance?.motion) {
@@ -222,10 +600,664 @@ export function App() {
       }
     });
 
+    window.sinapse?.workspaces?.list().then((list) => {
+      if (Array.isArray(list)) {
+        setWorkspaces(list);
+      }
+    });
+
+    window.sinapse?.workspaces?.getActive().then((activeId) => {
+      if (activeId) {
+        switchWorkspace(activeId);
+      }
+    });
+
+    const unsubActive = window.sinapse?.workspaces?.onActiveChanged((activeId) => {
+      if (activeId && activeId !== activeWorkspaceIdRef.current) {
+        switchWorkspace(activeId);
+      }
+    });
+
     return () => {
-      if (unsub) unsub();
+      if (unsubSettings) unsubSettings();
+      if (unsubActive) unsubActive();
     };
-  }, []);
+  }, [switchWorkspace]);
+
+  // Handle incoming DaemonEvents
+  const handleDaemonEvent = useCallback(
+    (event: DaemonEvent) => {
+      switch (event.kind) {
+        case "workspace_created": {
+          setWorkspaces((prev) => {
+            if (prev.some((w) => w.id === event.workspace.id)) return prev;
+            return [...prev, event.workspace];
+          });
+          break;
+        }
+
+        case "workspace_updated": {
+          setWorkspaces((prev) =>
+            prev.map((w) => (w.id === event.workspace.id ? event.workspace : w))
+          );
+          break;
+        }
+
+        case "workspace_deleted": {
+          setWorkspaces((prev) => prev.filter((w) => w.id !== event.workspaceId));
+          workspaceCanvasStateMapRef.current.delete(event.workspaceId);
+          thinkingAgentsPerWsRef.current.delete(event.workspaceId);
+          setThinkingCounts((prev) => {
+            const next = { ...prev };
+            delete next[event.workspaceId];
+            return next;
+          });
+          break;
+        }
+
+        case "agent_spawned": {
+          const wsId = event.workspaceId;
+          const agent = event.agent;
+          const isThinking = agent.status === "thinking";
+          updateThinkingState(wsId, agent.id, isThinking);
+
+          if (wsId === activeWorkspaceIdRef.current) {
+            const nodeId = `worker-${agent.id}`;
+            const edgeId = `edge-brain-${nodeId}`;
+
+            if (!agentStateMapRef.current.has(agent.id)) {
+              agentStateMapRef.current.set(agent.id, {
+                status: agent.status || "idle",
+                log: "",
+                lastPrompt: "",
+              });
+            }
+
+            setNodes((nds) => {
+              if (nds.some((n) => n.id === nodeId)) return nds;
+              return [
+                ...nds,
+                {
+                  id: nodeId,
+                  type: "worker",
+                  position: nextWorkerPosition(nds),
+                  width: 330,
+                  height: 420,
+                  data: {
+                    id: agent.id,
+                    workspaceId: wsId,
+                    name: agent.name,
+                    provider: agent.provider,
+                    role: agent.role,
+                    status: agent.status || "idle",
+                    model: agent.model,
+                    usage: agent.usage,
+                    log: "",
+                    lastPrompt: "",
+                  },
+                },
+              ];
+            });
+
+            setEdges((eds) => {
+              let nextEds = eds;
+              if (!nextEds.some((e) => e.id === edgeId)) {
+                nextEds = addEdge(
+                  {
+                    id: edgeId,
+                    source: "brain",
+                    target: nodeId,
+                    type: "synapse",
+                    data: { pulse: "idle", provider: agent.provider, variant: "default" },
+                  },
+                  nextEds
+                );
+              }
+              if (
+                agent.createdBy &&
+                agent.createdBy !== ORCHESTRATOR_AUTHOR &&
+                agent.createdBy !== USER_AUTHOR
+              ) {
+                const creatorEdgeId = `edge-creator-worker-${agent.createdBy}-${nodeId}`;
+                if (!nextEds.some((e) => e.id === creatorEdgeId)) {
+                  nextEds = addEdge(
+                    {
+                      id: creatorEdgeId,
+                      source: `worker-${agent.createdBy}`,
+                      target: nodeId,
+                      type: "synapse",
+                      data: { pulse: "idle", provider: agent.provider, variant: "creator" },
+                    },
+                    nextEds
+                  );
+                }
+              }
+              return nextEds;
+            });
+          } else {
+            // Update background workspace cache
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              const nodeId = `worker-${agent.id}`;
+              if (!cached.nodes.some((n) => n.id === nodeId)) {
+                cached.nodes.push({
+                  id: nodeId,
+                  type: "worker",
+                  position: nextWorkerPosition(cached.nodes),
+                  width: 330,
+                  height: 420,
+                  data: {
+                    id: agent.id,
+                    workspaceId: wsId,
+                    name: agent.name,
+                    provider: agent.provider,
+                    role: agent.role,
+                    status: agent.status || "idle",
+                    model: agent.model,
+                    usage: agent.usage,
+                    log: "",
+                    lastPrompt: "",
+                  },
+                });
+                cached.edges.push({
+                  id: `edge-brain-${nodeId}`,
+                  source: "brain",
+                  target: nodeId,
+                  type: "synapse",
+                  data: { pulse: "idle", provider: agent.provider, variant: "default" },
+                });
+              }
+            }
+          }
+          break;
+        }
+
+        case "agent_updated": {
+          const wsId = event.workspaceId;
+          const agent = event.agent;
+          const isThinking = agent.status === "thinking";
+          updateThinkingState(wsId, agent.id, isThinking);
+
+          if (wsId === activeWorkspaceIdRef.current) {
+            const nodeId = `worker-${agent.id}`;
+            setNodes((nds) =>
+              nds.map((n) =>
+                n.id === nodeId
+                  ? {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        role: agent.role,
+                        model: agent.model,
+                        usage: agent.usage ?? n.data?.usage,
+                        status: agent.status || n.data?.status,
+                      },
+                    }
+                  : n
+              )
+            );
+          } else {
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              cached.nodes = cached.nodes.map((n) =>
+                n.id === `worker-${agent.id}`
+                  ? {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        role: agent.role,
+                        model: agent.model,
+                        usage: agent.usage ?? n.data?.usage,
+                        status: agent.status || n.data?.status,
+                      },
+                    }
+                  : n
+              );
+            }
+          }
+          break;
+        }
+
+        case "turn_started": {
+          const wsId = event.workspaceId;
+          updateThinkingState(wsId, event.agentId, true);
+
+          if (wsId === activeWorkspaceIdRef.current) {
+            const nodeId = `worker-${event.agentId}`;
+            const st = agentStateMapRef.current.get(event.agentId) || {
+              status: "idle",
+              log: "",
+              lastPrompt: "",
+            };
+            st.status = "thinking";
+            st.lastPrompt = event.prompt;
+            const promptHeader = st.log ? `\n> ${event.prompt}\n` : `> ${event.prompt}\n`;
+            st.log = (st.log + promptHeader).slice(-20_000);
+            agentStateMapRef.current.set(event.agentId, st);
+
+            setNodes((nds) =>
+              nds.map((n) =>
+                n.id === nodeId
+                  ? {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        status: "thinking",
+                        log: st.log,
+                        lastPrompt: st.lastPrompt,
+                      },
+                    }
+                  : n
+              )
+            );
+
+            // Pulse edge brain -> worker
+            const edgeId = `edge-brain-${nodeId}`;
+            const existingTimer = edgeTimersRef.current.get(edgeId);
+            if (existingTimer) {
+              clearTimeout(existingTimer);
+              edgeTimersRef.current.delete(edgeId);
+            }
+            setEdges((eds) =>
+              eds.map((e) =>
+                e.id === edgeId || (e.source === "brain" && e.target === nodeId)
+                  ? { ...e, data: { ...e.data, pulse: "out" } }
+                  : e
+              )
+            );
+          } else {
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              const st = cached.agentState.get(event.agentId) || {
+                status: "idle",
+                log: "",
+                lastPrompt: "",
+              };
+              st.status = "thinking";
+              st.lastPrompt = event.prompt;
+              cached.agentState.set(event.agentId, st);
+              cached.nodes = cached.nodes.map((n) =>
+                n.id === `worker-${event.agentId}`
+                  ? { ...n, data: { ...n.data, status: "thinking", lastPrompt: event.prompt } }
+                  : n
+              );
+            }
+          }
+          break;
+        }
+
+        case "turn_event": {
+          const wsId = event.workspaceId;
+          if (wsId === activeWorkspaceIdRef.current) {
+            const nodeId = `worker-${event.agentId}`;
+            const st = agentStateMapRef.current.get(event.agentId) || {
+              status: "thinking",
+              log: "",
+              lastPrompt: "",
+            };
+
+            if (event.event.type === "text") {
+              st.log = (st.log + event.event.data).slice(-20_000);
+            } else if (event.event.type === "tool_use") {
+              const toolName = extractToolName(event.event.data);
+              st.log = (st.log + `⚙ ${toolName}\n`).slice(-20_000);
+            }
+            agentStateMapRef.current.set(event.agentId, st);
+
+            setNodes((nds) =>
+              nds.map((n) =>
+                n.id === nodeId
+                  ? {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        log: st.log,
+                      },
+                    }
+                  : n
+              )
+            );
+          } else {
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              const st = cached.agentState.get(event.agentId);
+              if (st) {
+                if (event.event.type === "text") {
+                  st.log = (st.log + event.event.data).slice(-20_000);
+                } else if (event.event.type === "tool_use") {
+                  const toolName = extractToolName(event.event.data);
+                  st.log = (st.log + `⚙ ${toolName}\n`).slice(-20_000);
+                }
+              }
+            }
+          }
+          break;
+        }
+
+        case "turn_finished": {
+          const wsId = event.workspaceId;
+          updateThinkingState(wsId, event.agentId, false);
+
+          if (wsId === activeWorkspaceIdRef.current) {
+            const nodeId = `worker-${event.agentId}`;
+            const st = agentStateMapRef.current.get(event.agentId) || {
+              status: event.status,
+              log: "",
+              lastPrompt: "",
+            };
+            st.status = event.status;
+            agentStateMapRef.current.set(event.agentId, st);
+
+            const edgeId = `edge-brain-${nodeId}`;
+
+            setNodes((nds) =>
+              nds.map((n) =>
+                n.id === nodeId
+                  ? {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        status: event.status,
+                        ...(event.usage ? { usage: event.usage } : {}),
+                      },
+                    }
+                  : n
+              )
+            );
+
+            const existingTimer = edgeTimersRef.current.get(edgeId);
+            if (existingTimer) {
+              clearTimeout(existingTimer);
+              edgeTimersRef.current.delete(edgeId);
+            }
+
+            setEdges((eds) =>
+              eds.map((e) =>
+                e.id === edgeId || (e.source === "brain" && e.target === nodeId)
+                  ? { ...e, data: { ...e.data, pulse: "back" } }
+                  : e
+              )
+            );
+
+            const backTimer = setTimeout(() => {
+              setEdges((eds) =>
+                eds.map((e) =>
+                  e.id === edgeId || (e.source === "brain" && e.target === nodeId)
+                    ? { ...e, data: { ...e.data, pulse: "idle" } }
+                    : e
+                )
+              );
+              edgeTimersRef.current.delete(edgeId);
+            }, 1500);
+
+            edgeTimersRef.current.set(edgeId, backTimer);
+          } else {
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              const st = cached.agentState.get(event.agentId);
+              if (st) st.status = event.status;
+              cached.nodes = cached.nodes.map((n) =>
+                n.id === `worker-${event.agentId}`
+                  ? {
+                      ...n,
+                      data: {
+                        ...n.data,
+                        status: event.status,
+                        ...(event.usage ? { usage: event.usage } : {}),
+                      },
+                    }
+                  : n
+              );
+            }
+          }
+          break;
+        }
+
+        case "agent_deleted": {
+          const wsId = event.workspaceId;
+          updateThinkingState(wsId, event.agentId, false);
+
+          if (wsId === activeWorkspaceIdRef.current) {
+            const nodeId = `worker-${event.agentId}`;
+            agentStateMapRef.current.delete(event.agentId);
+
+            setNodes((nds) => nds.filter((n) => n.id !== nodeId));
+            setEdges((eds) =>
+              eds.filter((e) => e.target !== nodeId && e.source !== nodeId)
+            );
+          } else {
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              const nodeId = `worker-${event.agentId}`;
+              cached.agentState.delete(event.agentId);
+              cached.nodes = cached.nodes.filter((n) => n.id !== nodeId);
+              cached.edges = cached.edges.filter(
+                (e) => e.target !== nodeId && e.source !== nodeId
+              );
+            }
+          }
+          break;
+        }
+
+        case "note_changed": {
+          const wsId = event.workspaceId;
+          const noteSummary = event.note;
+          const changer = event.by;
+
+          if (wsId === activeWorkspaceIdRef.current) {
+            window.sinapse?.notes
+              ?.read(wsId, noteSummary.name)
+              .then((fullNote) => {
+                const nodeId = `note-${fullNote.name}`;
+                setNodes((nds) => {
+                  const exists = nds.some((n) => n.id === nodeId);
+                  if (exists) {
+                    return nds.map((n) =>
+                      n.id === nodeId
+                        ? {
+                            ...n,
+                            data: {
+                              ...n.data,
+                              title: fullNote.title,
+                              content: fullNote.content,
+                              updatedAt: fullNote.updatedAt,
+                              createdBy: fullNote.createdBy,
+                              contributors: fullNote.contributors || [],
+                            },
+                          }
+                        : n
+                    );
+                  } else {
+                    const pos = computeNotePosition(fullNote.name, fullNote.createdBy, nds);
+                    return [
+                      ...nds,
+                      {
+                        id: nodeId,
+                        type: "note",
+                        position: pos,
+                        width: 360,
+                        height: 420,
+                        data: {
+                          workspaceId: wsId,
+                          name: fullNote.name,
+                          title: fullNote.title,
+                          content: fullNote.content,
+                          updatedAt: fullNote.updatedAt,
+                          createdBy: fullNote.createdBy,
+                          contributors: fullNote.contributors || [],
+                        },
+                      },
+                    ];
+                  }
+                });
+
+                // Ensure author and contributor edges exist for this note
+                setEdges((currentEdges) => {
+                  let nextEdges = [...currentEdges];
+                  const activeProvider = activeWorkspace?.orchestrator?.provider ?? "claude";
+
+                  if (fullNote.createdBy === ORCHESTRATOR_AUTHOR) {
+                    const authorEdgeId = `edge-author-brain-${nodeId}`;
+                    if (!nextEdges.some((e) => e.id === authorEdgeId)) {
+                      nextEdges.push({
+                        id: authorEdgeId,
+                        source: "brain",
+                        target: nodeId,
+                        type: "synapse",
+                        data: { pulse: "idle", provider: activeProvider, variant: "author" },
+                      });
+                    }
+                  } else if (
+                    fullNote.createdBy &&
+                    fullNote.createdBy !== USER_AUTHOR &&
+                    nodesRef.current.some((n) => n.id === `worker-${fullNote.createdBy}`)
+                  ) {
+                    const authorEdgeId = `edge-author-worker-${fullNote.createdBy}-${nodeId}`;
+                    if (!nextEdges.some((e) => e.id === authorEdgeId)) {
+                      nextEdges.push({
+                        id: authorEdgeId,
+                        source: `worker-${fullNote.createdBy}`,
+                        target: nodeId,
+                        type: "synapse",
+                        data: { pulse: "idle", provider: "claude", variant: "author" },
+                      });
+                    }
+                  }
+
+                  for (const contrib of fullNote.contributors || []) {
+                    if (contrib === ORCHESTRATOR_AUTHOR) {
+                      const contribEdgeId = `edge-contrib-brain-${nodeId}`;
+                      if (!nextEdges.some((e) => e.id === contribEdgeId)) {
+                        nextEdges.push({
+                          id: contribEdgeId,
+                          source: "brain",
+                          target: nodeId,
+                          type: "synapse",
+                          data: { pulse: "idle", provider: activeProvider, variant: "contributor" },
+                        });
+                      }
+                    } else if (
+                      contrib &&
+                      contrib !== USER_AUTHOR &&
+                      nodesRef.current.some((n) => n.id === `worker-${contrib}`)
+                    ) {
+                      const contribEdgeId = `edge-contrib-worker-${contrib}-${nodeId}`;
+                      if (!nextEdges.some((e) => e.id === contribEdgeId)) {
+                        nextEdges.push({
+                          id: contribEdgeId,
+                          source: `worker-${contrib}`,
+                          target: nodeId,
+                          type: "synapse",
+                          data: { pulse: "idle", provider: "claude", variant: "contributor" },
+                        });
+                      }
+                    }
+                  }
+
+                  return nextEdges;
+                });
+
+                // Pulse edge from changer to note
+                if (changer) {
+                  let sourceId: string | null = null;
+                  if (changer === ORCHESTRATOR_AUTHOR) {
+                    sourceId = "brain";
+                  } else if (changer !== USER_AUTHOR) {
+                    sourceId = `worker-${changer}`;
+                  }
+                  if (sourceId) {
+                    pulseEdge(sourceId, nodeId, 1500, "out");
+                  }
+                }
+              })
+              .catch((err) => console.error("Erro ao ler nota atualizada:", err));
+          } else {
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              const nodeId = `note-${noteSummary.name}`;
+              const idx = cached.nodes.findIndex((n) => n.id === nodeId);
+              if (idx !== -1) {
+                cached.nodes[idx] = {
+                  ...cached.nodes[idx],
+                  data: {
+                    ...cached.nodes[idx].data,
+                    title: noteSummary.title,
+                    updatedAt: noteSummary.updatedAt,
+                    createdBy: noteSummary.createdBy,
+                    contributors: noteSummary.contributors || [],
+                  },
+                };
+              }
+            }
+          }
+          break;
+        }
+
+        case "note_deleted": {
+          const wsId = event.workspaceId;
+          const deletedName = event.name;
+          const nodeId = `note-${deletedName}`;
+
+          if (wsId === activeWorkspaceIdRef.current) {
+            setNodes((nds) => nds.filter((n) => n.id !== nodeId));
+            setEdges((eds) => eds.filter((e) => e.target !== nodeId && e.source !== nodeId));
+          } else {
+            const cached = workspaceCanvasStateMapRef.current.get(wsId);
+            if (cached) {
+              cached.nodes = cached.nodes.filter((n) => n.id !== nodeId);
+              cached.edges = cached.edges.filter(
+                (e) => e.target !== nodeId && e.source !== nodeId
+              );
+            }
+          }
+          break;
+        }
+      }
+    },
+    [activeWorkspace?.orchestrator?.provider, pulseEdge, setNodes, setEdges, updateThinkingState]
+  );
+
+  // Sync anyThinking to brain node data
+  useEffect(() => {
+    const anyThinking = nodes.some(
+      (n) => n.type === "worker" && n.data?.status === "thinking"
+    );
+
+    setNodes((current) => {
+      const brainNode = current.find((n) => n.id === "brain");
+      if (
+        brainNode &&
+        (brainNode.data?.anyThinking !== anyThinking ||
+          brainNode.data?.workspaceId !== activeWorkspaceId)
+      ) {
+        return current.map((n) =>
+          n.id === "brain"
+            ? { ...n, data: { ...n.data, anyThinking, workspaceId: activeWorkspaceId } }
+            : n
+        );
+      }
+      return current;
+    });
+  }, [nodes, activeWorkspaceId, setNodes]);
+
+  // Event bus and daemon status subscriptions
+  useEffect(() => {
+    const unsubStatus = window.sinapse?.daemon?.onStatus((status) => {
+      setDaemonConnected(status.connected);
+      if (status.connected && activeWorkspaceIdRef.current) {
+        loadWorkspaceCanvas(activeWorkspaceIdRef.current);
+      }
+    });
+
+    const unsubEvent = window.sinapse?.daemon?.onEvent((event: DaemonEvent) => {
+      handleDaemonEvent(event);
+    });
+
+    return () => {
+      if (unsubStatus) unsubStatus();
+      if (unsubEvent) unsubEvent();
+    };
+  }, [loadWorkspaceCanvas, handleDaemonEvent]);
 
   // Global shortcut Ctrl+, (or Cmd+, on Mac) to open settings
   useEffect(() => {
@@ -246,7 +1278,7 @@ export function App() {
           {
             ...connection,
             type: "synapse",
-            data: { pulse: "idle", provider: "claude" },
+            data: { pulse: "idle", provider: "claude", variant: "default" },
           },
           eds
         )
@@ -255,528 +1287,12 @@ export function App() {
     [setEdges]
   );
 
-  const syncExistingWorkers = useCallback(async () => {
-    try {
-      const workerList = await window.sinapse?.workers?.list();
-      if (!Array.isArray(workerList)) return;
-
-      setNodes((currentNodes) => {
-        const nextNodes = [...currentNodes];
-        for (const worker of workerList) {
-          const nodeId = `worker-${worker.name}`;
-          if (!agentStateMapRef.current.has(worker.name)) {
-            agentStateMapRef.current.set(worker.name, {
-              status: worker.status || "idle",
-              log: "",
-              lastPrompt: "",
-            });
-          }
-          const st = agentStateMapRef.current.get(worker.name)!;
-
-          const idx = nextNodes.findIndex((n) => n.id === nodeId);
-          if (idx === -1) {
-            nextNodes.push({
-              id: nodeId,
-              type: "worker",
-              position: nextWorkerPosition(nextNodes),
-              width: 330,
-              height: 420,
-              data: {
-                name: worker.name,
-                provider: worker.provider,
-                role: worker.role,
-                status: worker.status || st.status || "idle",
-                model: worker.model,
-                usage: worker.usage,
-                log: st.log,
-                lastPrompt: st.lastPrompt,
-              },
-            });
-          } else {
-            nextNodes[idx] = {
-              ...nextNodes[idx],
-              data: {
-                ...nextNodes[idx].data,
-                role: worker.role ?? nextNodes[idx].data.role,
-                status: worker.status ?? nextNodes[idx].data.status,
-                model: worker.model ?? nextNodes[idx].data.model,
-                usage: worker.usage ?? nextNodes[idx].data.usage,
-              },
-            };
-          }
-        }
-        return nextNodes;
-      });
-
-      setEdges((currentEdges) => {
-        let nextEdges = [...currentEdges];
-        for (const worker of workerList) {
-          const nodeId = `worker-${worker.name}`;
-          const edgeId = `edge-brain-${nodeId}`;
-          if (
-            !nextEdges.some(
-              (e) => e.id === edgeId || (e.source === "brain" && e.target === nodeId)
-            )
-          ) {
-            nextEdges = addEdge(
-              {
-                id: edgeId,
-                source: "brain",
-                target: nodeId,
-                type: "synapse",
-                data: { pulse: "idle", provider: worker.provider },
-              },
-              nextEdges
-            );
-          }
-        }
-        return nextEdges;
-      });
-    } catch (err) {
-      console.log("Could not sync workers initially:", err);
-    }
-  }, [setNodes, setEdges]);
-
-  const syncNotes = useCallback(async () => {
-    try {
-      const summaries = await window.sinapse?.notes?.list();
-      if (!Array.isArray(summaries)) return;
-
-      const fullNotes = await Promise.all(
-        summaries.map(async (s) => {
-          try {
-            return await window.sinapse?.notes?.read(s.name);
-          } catch {
-            return {
-              name: s.name,
-              title: s.title,
-              content: "",
-              updatedAt: s.updatedAt,
-            };
-          }
-        })
-      );
-
-      setNodes((currentNodes) => {
-        const brain = currentNodes.find((n) => n.id === "brain");
-        const brainX = brain?.position.x ?? 100;
-        const brainY = brain?.position.y ?? 200;
-        const brainHeight = brain?.measured?.height ?? 440;
-
-        const nonNotes = currentNodes.filter((n) => n.type !== "note");
-        const noteNodes: Node[] = fullNotes.map((n, i) => ({
-          id: `note-${n.name}`,
-          type: "note",
-          position: {
-            x: brainX + i * 400,
-            y: brainY + brainHeight + 120,
-          },
-          width: 360,
-          height: 420,
-          data: {
-            name: n.name,
-            title: n.title,
-            content: n.content,
-            updatedAt: n.updatedAt,
-          },
-        }));
-
-        return [...nonNotes, ...noteNodes];
-      });
-    } catch (err) {
-      console.log("Could not sync notes initially:", err);
-    }
-  }, [setNodes]);
-
-  // Handle incoming DaemonEvents from the bus
-  const handleDaemonEvent = useCallback(
-    (event: DaemonEvent) => {
-      switch (event.kind) {
-        case "agent_spawned": {
-          const agent = event.agent;
-          const nodeId = `worker-${agent.name}`;
-          const edgeId = `edge-brain-${nodeId}`;
-
-          if (!agentStateMapRef.current.has(agent.name)) {
-            agentStateMapRef.current.set(agent.name, {
-              status: agent.status || "idle",
-              log: "",
-              lastPrompt: "",
-            });
-          }
-
-          setNodes((nds) => {
-            if (nds.some((n) => n.id === nodeId)) return nds;
-            return [
-              ...nds,
-              {
-                id: nodeId,
-                type: "worker",
-                position: nextWorkerPosition(nds),
-                width: 330,
-                height: 420,
-                data: {
-                  name: agent.name,
-                  provider: agent.provider,
-                  role: agent.role,
-                  status: agent.status || "idle",
-                  model: agent.model,
-                  usage: agent.usage,
-                  log: "",
-                  lastPrompt: "",
-                },
-              },
-            ];
-          });
-
-          setEdges((eds) => {
-            if (
-              eds.some(
-                (e) => e.id === edgeId || (e.source === "brain" && e.target === nodeId)
-              )
-            ) {
-              return eds;
-            }
-            return addEdge(
-              {
-                id: edgeId,
-                source: "brain",
-                target: nodeId,
-                type: "synapse",
-                data: { pulse: "idle", provider: agent.provider },
-              },
-              eds
-            );
-          });
-          break;
-        }
-
-        case "agent_updated": {
-          const agent = event.agent;
-          const nodeId = `worker-${agent.name}`;
-          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
-
-          setNodes((nds) =>
-            nds.map((n) =>
-              n.id === nodeId
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      role: agent.role,
-                      model: agent.model,
-                      usage: agent.usage ?? n.data?.usage,
-                      status: agent.status || n.data?.status,
-                    },
-                  }
-                : n
-            )
-          );
-          break;
-        }
-
-        case "turn_started": {
-          const nodeId = `worker-${event.agentName}`;
-          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
-
-          const st = agentStateMapRef.current.get(event.agentName) || {
-            status: "idle",
-            log: "",
-            lastPrompt: "",
-          };
-          st.status = "thinking";
-          st.lastPrompt = event.prompt;
-          const promptHeader = st.log ? `\n> ${event.prompt}\n` : `> ${event.prompt}\n`;
-          st.log = (st.log + promptHeader).slice(-20_000);
-          agentStateMapRef.current.set(event.agentName, st);
-
-          const edgeId = `edge-brain-${nodeId}`;
-
-          const existingTimer = edgeTimersRef.current.get(edgeId);
-          if (existingTimer) {
-            clearTimeout(existingTimer);
-            edgeTimersRef.current.delete(edgeId);
-          }
-
-          setNodes((nds) =>
-            nds.map((n) =>
-              n.id === nodeId
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      status: "thinking",
-                      log: st.log,
-                      lastPrompt: st.lastPrompt,
-                    },
-                  }
-                : n
-            )
-          );
-
-          setEdges((eds) =>
-            eds.map((e) =>
-              e.id === edgeId || (e.source === "brain" && e.target === nodeId)
-                ? { ...e, data: { ...e.data, pulse: "out" } }
-                : e
-            )
-          );
-          break;
-        }
-
-        case "turn_event": {
-          const nodeId = `worker-${event.agentName}`;
-          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
-
-          const st = agentStateMapRef.current.get(event.agentName) || {
-            status: "thinking",
-            log: "",
-            lastPrompt: "",
-          };
-
-          if (event.event.type === "text") {
-            st.log = (st.log + event.event.data).slice(-20_000);
-          } else if (event.event.type === "tool_use") {
-            const toolName = extractToolName(event.event.data);
-            st.log = (st.log + `⚙ ${toolName}\n`).slice(-20_000);
-          }
-          agentStateMapRef.current.set(event.agentName, st);
-
-          setNodes((nds) =>
-            nds.map((n) =>
-              n.id === nodeId
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      log: st.log,
-                    },
-                  }
-                : n
-            )
-          );
-          break;
-        }
-
-        case "turn_finished": {
-          const nodeId = `worker-${event.agentName}`;
-          if (!nodesRef.current.some((n) => n.id === nodeId)) return;
-
-          const st = agentStateMapRef.current.get(event.agentName) || {
-            status: event.status,
-            log: "",
-            lastPrompt: "",
-          };
-          st.status = event.status;
-          agentStateMapRef.current.set(event.agentName, st);
-
-          const edgeId = `edge-brain-${nodeId}`;
-
-          setNodes((nds) =>
-            nds.map((n) =>
-              n.id === nodeId
-                ? {
-                    ...n,
-                    data: {
-                      ...n.data,
-                      status: event.status,
-                      ...(event.usage ? { usage: event.usage } : {}),
-                    },
-                  }
-                : n
-            )
-          );
-
-          const existingTimer = edgeTimersRef.current.get(edgeId);
-          if (existingTimer) {
-            clearTimeout(existingTimer);
-            edgeTimersRef.current.delete(edgeId);
-          }
-
-          setEdges((eds) =>
-            eds.map((e) =>
-              e.id === edgeId || (e.source === "brain" && e.target === nodeId)
-                ? { ...e, data: { ...e.data, pulse: "back" } }
-                : e
-            )
-          );
-
-          const backTimer = setTimeout(() => {
-            setEdges((eds) =>
-              eds.map((e) =>
-                e.id === edgeId || (e.source === "brain" && e.target === nodeId)
-                  ? { ...e, data: { ...e.data, pulse: "idle" } }
-                  : e
-              )
-            );
-            edgeTimersRef.current.delete(edgeId);
-          }, 1500);
-
-          edgeTimersRef.current.set(edgeId, backTimer);
-          break;
-        }
-
-        case "agent_deleted": {
-          const nodeId = `worker-${event.agentName}`;
-          const edgeId = `edge-brain-${nodeId}`;
-
-          const existingTimer = edgeTimersRef.current.get(edgeId);
-          if (existingTimer) {
-            clearTimeout(existingTimer);
-            edgeTimersRef.current.delete(edgeId);
-          }
-
-          agentStateMapRef.current.delete(event.agentName);
-
-          setNodes((nds) => nds.filter((n) => n.id !== nodeId));
-          setEdges((eds) =>
-            eds.filter((e) => e.target !== nodeId && e.source !== nodeId && e.id !== edgeId)
-          );
-          break;
-        }
-
-        case "note_changed": {
-          const noteSummary = event.note;
-          window.sinapse?.notes
-            ?.read(noteSummary.name)
-            .then((fullNote) => {
-              setNodes((nds) => {
-                const nodeId = `note-${fullNote.name}`;
-                const exists = nds.some((n) => n.id === nodeId);
-                if (exists) {
-                  return nds.map((n) =>
-                    n.id === nodeId
-                      ? {
-                          ...n,
-                          data: {
-                            ...n.data,
-                            title: fullNote.title,
-                            content: fullNote.content,
-                            updatedAt: fullNote.updatedAt,
-                          },
-                        }
-                      : n
-                  );
-                } else {
-                  const currentNotes = nds.filter((n) => n.type === "note");
-                  const brain = nds.find((n) => n.id === "brain");
-                  const brainX = brain?.position.x ?? 100;
-                  const brainY = brain?.position.y ?? 200;
-                  const brainHeight = brain?.measured?.height ?? 440;
-                  return [
-                    ...nds,
-                    {
-                      id: nodeId,
-                      type: "note",
-                      position: {
-                        x: brainX + currentNotes.length * 400,
-                        y: brainY + brainHeight + 120,
-                      },
-                      width: 360,
-                      height: 420,
-                      data: {
-                        name: fullNote.name,
-                        title: fullNote.title,
-                        content: fullNote.content,
-                        updatedAt: fullNote.updatedAt,
-                      },
-                    },
-                  ];
-                }
-              });
-            })
-            .catch((err) => console.error("Erro ao ler nota atualizada:", err));
-          break;
-        }
-
-        case "note_deleted": {
-          const deletedName = event.name;
-          setNodes((nds) => {
-            const remaining = nds.filter((n) => n.id !== `note-${deletedName}`);
-            const brain = remaining.find((n) => n.id === "brain");
-            const brainX = brain?.position.x ?? 100;
-            const brainY = brain?.position.y ?? 200;
-            const brainHeight = brain?.measured?.height ?? 440;
-
-            let noteIdx = 0;
-            return remaining.map((n) => {
-              if (n.type === "note") {
-                const pos = {
-                  x: brainX + noteIdx * 400,
-                  y: brainY + brainHeight + 120,
-                };
-                noteIdx++;
-                return { ...n, position: pos };
-              }
-              return n;
-            });
-          });
-          break;
-        }
-      }
-    },
-    [setNodes, setEdges]
-  );
-
-  // Sync anyThinking to brain node data
-  useEffect(() => {
-    const anyThinking = nodes.some(
-      (n) => n.type === "worker" && n.data?.status === "thinking"
-    );
-
-    setNodes((current) => {
-      const brainNode = current.find((n) => n.id === "brain");
-      if (brainNode && brainNode.data?.anyThinking !== anyThinking) {
-        return current.map((n) =>
-          n.id === "brain"
-            ? { ...n, data: { ...n.data, anyThinking } }
-            : n
-        );
-      }
-      return current;
-    });
-  }, [nodes, setNodes]);
-
-  // Initial sync & event bus subscriptions
-  useEffect(() => {
-    syncExistingWorkers();
-    syncNotes();
-
-    const unsubInfo = window.sinapse?.daemon?.onInfo(() => {
-      syncExistingWorkers();
-      syncNotes();
-    });
-
-    const unsubStatus = window.sinapse?.daemon?.onStatus((status) => {
-      setDaemonConnected(status.connected);
-      if (status.connected) {
-        syncExistingWorkers();
-        syncNotes();
-      }
-    });
-
-    const unsubEvent = window.sinapse?.daemon?.onEvent((event: DaemonEvent) => {
-      handleDaemonEvent(event);
-    });
-
-    return () => {
-      if (unsubInfo) unsubInfo();
-      if (unsubStatus) unsubStatus();
-      if (unsubEvent) unsubEvent();
-
-      for (const timer of edgeTimersRef.current.values()) {
-        clearTimeout(timer);
-      }
-      edgeTimersRef.current.clear();
-    };
-  }, [syncExistingWorkers, syncNotes, handleDaemonEvent]);
-
   const handlePaneContextMenu = useCallback((e: React.MouseEvent | MouseEvent) => {
     e.preventDefault();
     setContextMenu({ x: e.clientX, y: e.clientY });
   }, []);
 
-  const activeCount = nodes.filter(
+  const activeThinkingCount = nodes.filter(
     (n) => n.type === "worker" && n.data?.status === "thinking"
   ).length;
 
@@ -788,12 +1304,16 @@ export function App() {
       {/* Top 40px Chromatic Title Bar */}
       <TitleBar
         connected={daemonConnected}
-        activeCount={activeCount}
+        activeCount={activeThinkingCount}
         onOpenSettings={() => setIsSettingsOpen(true)}
         chromaticBar={settings?.appearance?.chromaticBar ?? "animada"}
+        workspaces={workspaces}
+        activeWorkspaceId={activeWorkspaceId}
+        thinkingCounts={thinkingCounts}
+        onNewWorkspace={() => setIsNewWorkspaceDialogOpen(true)}
       />
 
-      {/* ReactFlow Canvas container takes remaining viewport below title bar */}
+      {/* ReactFlow Canvas container */}
       <div className="flow-canvas-wrapper">
         <ReactFlow
           nodes={nodes}
@@ -836,6 +1356,8 @@ export function App() {
       {/* New Worker Dialog */}
       {isNewWorkerDialogOpen && (
         <NewWorkerDialog
+          workspaceId={activeWorkspaceId}
+          workspaceDefaultFolder={activeWorkspace?.folder}
           defaults={settings?.workerDefaults}
           onClose={() => setIsNewWorkerDialogOpen(false)}
         />
@@ -844,13 +1366,28 @@ export function App() {
       {/* New Note Dialog */}
       {isNewNoteDialogOpen && (
         <NewNoteDialog
+          workspaceId={activeWorkspaceId}
           onClose={() => setIsNewNoteDialogOpen(false)}
+        />
+      )}
+
+      {/* New Workspace Dialog */}
+      {isNewWorkspaceDialogOpen && (
+        <NewWorkspaceDialog
+          onClose={() => setIsNewWorkspaceDialogOpen(false)}
         />
       )}
 
       {/* Settings Screen */}
       {isSettingsOpen && (
         <SettingsScreen
+          activeWorkspaceId={activeWorkspaceId}
+          workspaces={workspaces}
+          onWorkspaceUpdated={(updated) => {
+            setWorkspaces((prev) =>
+              prev.map((w) => (w.id === updated.id ? updated : w))
+            );
+          }}
           onClose={() => setIsSettingsOpen(false)}
         />
       )}

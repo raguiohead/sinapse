@@ -1,14 +1,17 @@
 import { useState } from "react";
-import { NodeResizeControl, type NodeProps } from "@xyflow/react";
+import { Handle, Position, NodeResizeControl, type NodeProps } from "@xyflow/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { NoteEditorDialog } from "../components/NoteEditorDialog";
 
 export interface NoteNodeData {
+  workspaceId: string;
   name: string;
   title: string;
   content: string;
   updatedAt: number;
+  createdBy?: string;
+  contributors?: string[];
 }
 
 export function NoteNode({ data }: NodeProps) {
@@ -22,7 +25,7 @@ export function NoteNode({ data }: NodeProps) {
     if (!ok) return;
 
     try {
-      await window.sinapse?.notes?.delete(nodeData.name);
+      await window.sinapse?.notes?.delete(nodeData.workspaceId, nodeData.name);
     } catch (err) {
       console.error("Erro ao excluir nota:", err);
     }
@@ -37,6 +40,12 @@ export function NoteNode({ data }: NodeProps) {
 
   return (
     <div className="note-node-card">
+      <Handle
+        type="target"
+        position={Position.Top}
+        id="note-target"
+        className="flow-handle note-handle-target"
+      />
       <div className="note-node-header">
         <div className="note-header-info">
           <span className="note-title" title={nodeData.title || nodeData.name}>
@@ -97,6 +106,7 @@ export function NoteNode({ data }: NodeProps) {
 
       {isEditorOpen && (
         <NoteEditorDialog
+          workspaceId={nodeData.workspaceId}
           name={nodeData.name}
           title={nodeData.title}
           content={nodeData.content || ""}

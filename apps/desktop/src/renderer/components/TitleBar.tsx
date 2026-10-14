@@ -1,10 +1,16 @@
 import { useState, useEffect } from "react";
+import type { Workspace } from "@sinapse/core";
+import { WorkspaceSelector } from "./WorkspaceSelector";
 
 export interface TitleBarProps {
   connected: boolean;
   activeCount: number;
   onOpenSettings: () => void;
   chromaticBar?: "animada" | "estatica" | "desligada";
+  workspaces: Workspace[];
+  activeWorkspaceId: string;
+  thinkingCounts: Record<string, number>;
+  onNewWorkspace: () => void;
 }
 
 export function TitleBar({
@@ -12,6 +18,10 @@ export function TitleBar({
   activeCount,
   onOpenSettings,
   chromaticBar = "animada",
+  workspaces,
+  activeWorkspaceId,
+  thinkingCounts,
+  onNewWorkspace,
 }: TitleBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
 
@@ -84,6 +94,13 @@ export function TitleBar({
       </div>
 
       <div className="title-bar-right">
+        <WorkspaceSelector
+          workspaces={workspaces}
+          activeWorkspaceId={activeWorkspaceId}
+          thinkingCounts={thinkingCounts}
+          onNewWorkspace={onNewWorkspace}
+        />
+
         <button
           type="button"
           onClick={onOpenSettings}

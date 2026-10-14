@@ -18,8 +18,9 @@ Você é o **cérebro**. Os workers rodam turnos headless com sessão persistent
 ## Comandos
 
 ```bash
-sinapse list
-sinapse spawn <nome> --provider agy|claude --cwd <dir> --role "<papel>" [--autonomy read|edit|full] [--model <modelo>]
+sinapse workspaces                       # lista workspaces do daemon
+sinapse list                             # lista workers do workspace atual
+sinapse spawn <nome> --provider agy|claude [--cwd <dir>] --role "<papel>" [--autonomy read|edit|full] [--model <modelo>]
 sinapse ask <nome> "<prompt>"            # bloqueia e imprime a resposta
 sinapse ask <nome> "<prompt>" --async    # devolve um turnId e segue
 sinapse check <nome>                     # status e últimos eventos
@@ -52,3 +53,9 @@ sinapse note rm <nome>                   # remove nota
 - Use notas para planos de ataque, handoffs entre workers e consolidação de resultados.
 - Nomes de notas devem seguir o padrão minúsculo com hífens (`lowercase-with-hyphens`, ex: `plano-migracao`, `handoff-refactor`).
 - **Instrução aos workers**: em vez de colar blocos extensos de contexto diretamente nos prompts, oriente os workers a ler a nota relevante (`sinapse note read <nome>`).
+ 
+## Workspaces
+
+- Os comandos já operam no workspace do orquestrador automaticamente (`SINAPSE_WORKSPACE`).
+- Novos workers usam por padrão a pasta do projeto (omita `--cwd` a menos que precise de outra pasta).
+- Notas e workers que você criar ficam vinculados a você no canvas.

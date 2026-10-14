@@ -1,13 +1,14 @@
 import { useState, useEffect, type FormEvent } from "react";
 
 export interface NewNoteDialogProps {
+  workspaceId: string;
   onClose: () => void;
   onSuccess?: () => void;
 }
 
 const NOTE_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-export function NewNoteDialog({ onClose, onSuccess }: NewNoteDialogProps) {
+export function NewNoteDialog({ workspaceId, onClose, onSuccess }: NewNoteDialogProps) {
   const [name, setName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -40,6 +41,7 @@ export function NewNoteDialog({ onClose, onSuccess }: NewNoteDialogProps) {
 
     try {
       await window.sinapse?.notes?.write({
+        workspaceId,
         name: raw,
         content: `# ${raw}\n\n`,
       });

@@ -5,6 +5,8 @@ import { ModelSelect } from "../components/ModelSelect";
 import { ContextMeter } from "../components/ContextMeter";
 
 export interface WorkerNodeData {
+  id: string;
+  workspaceId: string;
   name: string;
   provider: Provider;
   role?: string;
@@ -62,6 +64,8 @@ function getStatusColor(s: AgentStatus): string {
 
 export function WorkerNode({ data }: NodeProps) {
   const nodeData = (data ?? {}) as unknown as WorkerNodeData;
+  const agentId = nodeData.id;
+  const workspaceId = nodeData.workspaceId;
   const workerName = nodeData.name || "worker";
   const provider = nodeData.provider || "claude";
   const role = nodeData.role || "Agente worker";
@@ -100,7 +104,7 @@ export function WorkerNode({ data }: NodeProps) {
 
     setDeleteError(null);
     try {
-      await window.sinapse?.workers?.delete(workerName);
+      await window.sinapse?.workers?.delete(workspaceId, agentId);
     } catch (err: any) {
       console.error("Erro ao excluir worker:", err);
       setDeleteError(err?.message || "Falha ao excluir worker");
@@ -112,7 +116,8 @@ export function WorkerNode({ data }: NodeProps) {
     setModelError(null);
     try {
       await window.sinapse?.workers?.update({
-        name: workerName,
+        workspaceId,
+        agent: agentId,
         model: newModel,
       });
       setIsEditingModel(false);
@@ -133,7 +138,8 @@ export function WorkerNode({ data }: NodeProps) {
     setInputPrompt("");
     try {
       await window.sinapse?.workers?.ask({
-        name: workerName,
+        workspaceId,
+        agent: agentId,
         prompt: query,
       });
     } catch (err: any) {
@@ -145,7 +151,7 @@ export function WorkerNode({ data }: NodeProps) {
 
   const handleStop = async () => {
     try {
-      await window.sinapse?.workers?.stop(workerName);
+      await window.sinapse?.workers?.stop(workspaceId, agentId);
     } catch (err) {
       console.error("Erro ao interromper worker:", err);
     }
@@ -158,6 +164,12 @@ export function WorkerNode({ data }: NodeProps) {
         position={Position.Left}
         id="worker-target"
         className="flow-handle worker-handle-target"
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        id="worker-source"
+        className="flow-handle worker-handle-source"
       />
 
       <div className="worker-node-header">

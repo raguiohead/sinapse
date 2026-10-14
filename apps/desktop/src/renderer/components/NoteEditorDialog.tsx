@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import ReactDOM from "react-dom";
 
 export interface NoteEditorDialogProps {
+  workspaceId: string;
   name: string;
   title?: string;
   content: string;
@@ -10,6 +11,7 @@ export interface NoteEditorDialogProps {
 }
 
 export function NoteEditorDialog({
+  workspaceId,
   name,
   title,
   content,
@@ -58,7 +60,11 @@ export function NoteEditorDialog({
   useEffect(() => {
     const unsub = window.sinapse?.daemon?.onEvent((event: any) => {
       const kind = event.kind || event.type;
-      if (kind === "note_changed" && event.note?.name === name) {
+      if (
+        (!event.workspaceId || event.workspaceId === workspaceId) &&
+        kind === "note_changed" &&
+        event.note?.name === name
+      ) {
         if (!isSavingRef.current) {
           setHasConflict(true);
         }
@@ -67,7 +73,7 @@ export function NoteEditorDialog({
     return () => {
       unsub?.();
     };
-  }, [name]);
+  }, [workspaceId, name]);
 
   const handleCancel = () => {
     if (draftRef.current !== syncedContentRef.current) {
@@ -85,6 +91,7 @@ export function NoteEditorDialog({
     setSaveError(null);
     try {
       await window.sinapse?.notes?.write({
+        workspaceId,
         name,
         content: draftRef.current,
       });
@@ -101,7 +108,7 @@ export function NoteEditorDialog({
 
   const handleReloadExternal = async () => {
     try {
-      const fullNote = await window.sinapse?.notes?.read(name);
+      const fullNote = await window.sinapse?.notes?.read(workspaceId, name);
       if (fullNote && typeof fullNote.content === "string") {
         setDraft(fullNote.content);
         setSyncedContent(fullNote.content);

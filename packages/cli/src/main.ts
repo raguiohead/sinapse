@@ -14,8 +14,15 @@ import type {
   NoteSummary,
   Provider,
   TurnEvent,
+  Workspace,
 } from "@sinapse/core";
-import { startDaemon as start, sinapseDir } from "@sinapse/core";
+import {
+  startDaemon as start,
+  sinapseDir,
+  routes,
+  AUTHOR_HEADER,
+  ENV,
+} from "@sinapse/core";
 
 const SINAPSE_DIR = sinapseDir();
 const DAEMON_FILE = path.join(SINAPSE_DIR, "daemon.json");
@@ -53,7 +60,6 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-// stdin only on an explicit "-": agents run the CLI with an open, never-closing stdin, so an implicit read would hang them.
 async function noteText(positional: string[], command: "write" | "append"): Promise<string> {
   const words = positional.slice(3);
   if (words.length === 1 && words[0] === "-") return readStdin();
@@ -86,7 +92,7 @@ async function readDaemonFile(): Promise<DaemonInfo | null> {
 
 async function isDaemonHealthy(info: DaemonInfo): Promise<boolean> {
   try {
-    const res = await fetch(`http://127.0.0.1:${info.port}/health`, {
+    const res = await fetch(`http://127.0.0.1:${info.port}${routes.health()}`, {
       headers: { Authorization: `Bearer ${info.token}` },
       signal: AbortSignal.timeout(1000),
     });
@@ -106,7 +112,6 @@ async function ensureDaemon(): Promise<DaemonInfo> {
     return info;
   }
 
-  // Auto-start daemon in background
   const scriptPath = process.argv[1];
   const isTsx = scriptPath?.endsWith(".ts");
   const child = isTsx && !process.execPath.includes("tsx")
@@ -138,7 +143,71 @@ async function apiRequest(endpoint: string, options: RequestInit = {}): Promise<
   return fetch(url, { ...options, headers });
 }
 
-// Only "-x" / "--name" are flags; text like "- [x] item" (markdown) must stay positional.
+function authorHeaders(): Record<string, string> {
+  const agentId = process.env.SINAPSE_AGENT_ID || process.env[ENV.agentId];
+  if (agentId && agentId.trim()) {
+    return { [AUTHOR_HEADER]: agentId.trim() };
+  }
+  return {};
+}
+
+let cachedWorkspaces: Workspace[] | null = null;
+async function getWorkspaces(): Promise<Workspace[]> {
+  if (cachedWorkspaces) return cachedWorkspaces;
+  const res = await apiRequest(routes.workspaces());
+  if (!res.ok) await handleResponseError(res);
+  cachedWorkspaces = (await res.json()) as Workspace[];
+  return cachedWorkspaces;
+}
+
+async function resolveWorkspace(flags: Record<string, any>): Promise<Workspace> {
+  const workspaces = await getWorkspaces();
+  if (workspaces.length === 0) {
+    console.error("Erro: Nenhum workspace disponível.");
+    process.exit(1);
+  }
+
+  const explicit = (flags.workspace || flags.w) as string | undefined;
+  if (explicit && typeof explicit === "string" && explicit.trim()) {
+    const target = explicit.trim();
+    const targetLower = target.toLowerCase();
+    const found = workspaces.find((w) => w.id === target || w.name.toLowerCase() === targetLower);
+    if (!found) {
+      console.error(`Erro: Workspace "${target}" não encontrado.`);
+      process.exit(1);
+    }
+    return found;
+  }
+
+  const envWs = process.env.SINAPSE_WORKSPACE || process.env[ENV.workspace];
+  if (envWs && envWs.trim()) {
+    const target = envWs.trim();
+    const targetLower = target.toLowerCase();
+    const found = workspaces.find((w) => w.id === target || w.name.toLowerCase() === targetLower);
+    if (!found) {
+      console.error(`Erro: Workspace "${target}" não encontrado.`);
+      process.exit(1);
+    }
+    return found;
+  }
+
+  const cwd = process.cwd();
+  const matching = workspaces.filter((w) => {
+    const rel = path.relative(w.folder, cwd);
+    return !rel.startsWith("..") && !path.isAbsolute(rel);
+  });
+
+  if (matching.length > 0) {
+    matching.sort((a, b) => b.folder.length - a.folder.length);
+    return matching[0];
+  }
+
+  const geral = workspaces.find((w) => w.id === "geral" || w.name.toLowerCase() === "geral");
+  if (geral) return geral;
+
+  return workspaces[0];
+}
+
 const FLAG_PATTERN = /^--?[A-Za-z]/;
 
 function parseArgs(argv: string[]) {
@@ -205,6 +274,58 @@ function printTable(agents: AgentState[]) {
   }
 }
 
+async function listWorkspaces() {
+  const workspaces = await getWorkspaces();
+  if (workspaces.length === 0) {
+    console.log("Nenhum workspace encontrado.");
+    return;
+  }
+
+  const agentCounts = await Promise.all(
+    workspaces.map(async (w) => {
+      try {
+        const res = await apiRequest(routes.agents(w.id));
+        if (res.ok) {
+          const agents = (await res.json()) as AgentState[];
+          return agents.length;
+        }
+      } catch {}
+      return 0;
+    })
+  );
+
+  const headers = ["ID", "NOME", "PASTA", "ORQUESTRADOR", "AGENTES"];
+  const rows = workspaces.map((w, idx) => {
+    const orch = w.orchestrator.model
+      ? `${w.orchestrator.provider} (${w.orchestrator.model})`
+      : w.orchestrator.provider;
+    return [w.id, w.name, w.folder, orch, String(agentCounts[idx])];
+  });
+
+  const colWidths = headers.map((header, colIdx) => {
+    const maxVal = Math.max(
+      header.length,
+      ...rows.map((row) => (row[colIdx] ? row[colIdx].length : 0))
+    );
+    return Math.min(maxVal, 60);
+  });
+
+  const formatRow = (cols: string[]) =>
+    cols
+      .map((col, idx) => {
+        const truncated =
+          col.length > colWidths[idx] ? col.slice(0, colWidths[idx] - 3) + "..." : col;
+        return truncated.padEnd(colWidths[idx]);
+      })
+      .join("  ");
+
+  console.log(formatRow(headers));
+  console.log(colWidths.map((w) => "-".repeat(w)).join("  "));
+  for (const row of rows) {
+    console.log(formatRow(row));
+  }
+}
+
 async function handleResponseError(res: Response): Promise<never> {
   let errMsg = `Request failed with status ${res.status}`;
   try {
@@ -223,19 +344,22 @@ function printHelp() {
 
 Uso:
   sinapse start                                              Inicia o daemon
-  sinapse list                                               Lista todos os workers
-  sinapse spawn <nome> --provider <p> --cwd <dir> --role <r> [--autonomy edit] [--model <m>]
-  sinapse ask <nome> "<prompt>" [--async]                    Envia prompt ao worker
-  sinapse check <nome>                                       Consulta status e eventos do worker
-  sinapse stop <nome>                                        Interrompe o turno ativo do worker
-  sinapse rm <nome>                                          Remove o worker (interrompe o turno ativo)
+  sinapse workspaces                                         Lista todos os workspaces
+  sinapse workspace create <nome> --folder <dir> [--orchestrator claude|agy] [--model <m>]
+  sinapse workspace rm <nome|id>                             Remove um workspace
+  sinapse list [--workspace <ws>]                            Lista workers do workspace
+  sinapse spawn <nome> --provider <p> [--cwd <dir>] --role <r> [--autonomy edit] [--model <m>] [--workspace <ws>]
+  sinapse ask <nome> "<prompt>" [--async] [--workspace <ws>] Envia prompt ao worker
+  sinapse check <nome> [--workspace <ws>]                    Consulta status e eventos do worker
+  sinapse stop <nome> [--workspace <ws>]                     Interrompe o turno ativo do worker
+  sinapse rm <nome> [--workspace <ws>]                       Remove o worker
   sinapse models [claude|agy]                                Lista catálogo de modelos
-  sinapse model <nome> <modelo|padrao>                       Altera o modelo de um worker
-  sinapse note list                                          Lista todas as notas
-  sinapse note read <nome>                                   Exibe o conteúdo da nota
-  sinapse note write <nome> "<texto>"|-                          Cria ou sobrescreve uma nota
-  sinapse note append <nome> "<texto>"|-                         Adiciona texto a uma nota existente
-  sinapse note rm <nome>                                     Remove uma nota
+  sinapse model <nome> <modelo|padrao> [--workspace <ws>]    Altera o modelo de um worker
+  sinapse note list [--workspace <ws>]                       Lista notas do workspace
+  sinapse note read <nome> [--workspace <ws>]                Exibe o conteúdo da nota
+  sinapse note write <nome> "<texto>"|- [--workspace <ws>]   Cria ou sobrescreve uma nota
+  sinapse note append <nome> "<texto>"|- [--workspace <ws>]  Adiciona texto a uma nota existente
+  sinapse note rm <nome> [--workspace <ws>]                  Remove uma nota
 `);
 }
 
@@ -261,12 +385,81 @@ async function main() {
       break;
     }
 
+    case "workspaces":
+    case "workspace": {
+      const subCommand = positional[1];
+      if (!subCommand || subCommand === "list") {
+        await listWorkspaces();
+        break;
+      }
+
+      if (subCommand === "create") {
+        const name = positional[2];
+        if (!name) {
+          console.error(
+            'Erro: Nome do workspace é obrigatório. Uso: sinapse workspace create <nome> --folder <dir> [--orchestrator claude|agy] [--model <m>]'
+          );
+          process.exit(1);
+        }
+        const folder = (flags.folder || flags.f) as string | undefined;
+        if (!folder) {
+          console.error("Erro: Pasta do workspace é obrigatória (--folder <dir>).");
+          process.exit(1);
+        }
+        const provider = ((flags.orchestrator || flags.o || "claude") as string).toLowerCase();
+        if (provider !== "claude" && provider !== "agy") {
+          console.error('Erro: Provedor do orquestrador inválido. Use "claude" ou "agy".');
+          process.exit(1);
+        }
+        const model = (flags.model || flags.m) as string | undefined;
+
+        const res = await apiRequest(routes.workspaces(), {
+          method: "POST",
+          body: JSON.stringify({
+            name,
+            folder: path.resolve(folder),
+            orchestrator: {
+              provider,
+              ...(model ? { model } : {}),
+            },
+          }),
+        });
+        if (!res.ok) {
+          await handleResponseError(res);
+        }
+        const ws = (await res.json()) as Workspace;
+        console.log(`Workspace "${ws.name}" criado (id: ${ws.id}, pasta: ${ws.folder}).`);
+        break;
+      }
+
+      if (subCommand === "rm" || subCommand === "delete") {
+        const name = positional[2];
+        if (!name) {
+          console.error("Erro: Identificador do workspace é obrigatório. Uso: sinapse workspace rm <nome|id>");
+          process.exit(1);
+        }
+        const res = await apiRequest(routes.workspace(name), {
+          method: "DELETE",
+        });
+        if (!res.ok) {
+          await handleResponseError(res);
+        }
+        console.log(`Workspace "${name}" removido.`);
+        break;
+      }
+
+      console.error(`Subcomando desconhecido: "${subCommand}". Uso: sinapse workspace [list|create|rm]`);
+      process.exit(1);
+    }
+
     case "list": {
-      const res = await apiRequest("/agents");
+      const ws = await resolveWorkspace(flags);
+      const res = await apiRequest(routes.agents(ws.id));
       if (!res.ok) {
         await handleResponseError(res);
       }
       const agents = (await res.json()) as AgentState[];
+      console.log(`Workspace: ${ws.name} (${ws.folder})`);
       printTable(agents);
       break;
     }
@@ -274,7 +467,7 @@ async function main() {
     case "spawn": {
       const name = positional[1];
       if (!name) {
-        console.error("Erro: Nome do agente é obrigatório. Uso: sinapse spawn <name> --provider <p> --cwd <dir> --role \"...\" [--autonomy edit] [--model <m>]");
+        console.error("Erro: Nome do agente é obrigatório. Uso: sinapse spawn <name> --provider <p> [--cwd <dir>] --role \"...\" [--autonomy edit] [--model <m>]");
         process.exit(1);
       }
 
@@ -284,17 +477,20 @@ async function main() {
         process.exit(1);
       }
 
-      const cwd = (flags.cwd || flags.c || process.cwd()) as string;
+      const cwd = (flags.cwd || flags.c) as string | undefined;
       const role = (flags.role || flags.r || "assistant") as string;
       const autonomy = (flags.autonomy || flags.a || "edit") as Autonomy;
       const model = (flags.model || flags.m) as string | undefined;
 
-      const res = await apiRequest("/agents", {
+      const ws = await resolveWorkspace(flags);
+
+      const res = await apiRequest(routes.agents(ws.id), {
         method: "POST",
+        headers: authorHeaders(),
         body: JSON.stringify({
           name,
           provider,
-          cwd,
+          ...(cwd ? { cwd } : {}),
           role,
           autonomy,
           ...(model ? { model } : {}),
@@ -318,10 +514,11 @@ async function main() {
         process.exit(1);
       }
 
+      const ws = await resolveWorkspace(flags);
       const isAsync = Boolean(flags.async);
 
       if (isAsync) {
-        const res = await apiRequest(`/agents/${encodeURIComponent(name)}/ask`, {
+        const res = await apiRequest(routes.agentAsk(ws.id, name), {
           method: "POST",
           body: JSON.stringify({ prompt, async: true }),
         });
@@ -331,7 +528,7 @@ async function main() {
         const data = (await res.json()) as { turnId: string };
         console.log(`Turn started: ${data.turnId}`);
       } else {
-        const res = await apiRequest(`/agents/${encodeURIComponent(name)}/ask`, {
+        const res = await apiRequest(routes.agentAsk(ws.id, name), {
           method: "POST",
           body: JSON.stringify({ prompt, async: false }),
         });
@@ -383,7 +580,8 @@ async function main() {
         process.exit(1);
       }
 
-      const res = await apiRequest(`/agents/${encodeURIComponent(name)}/check`);
+      const ws = await resolveWorkspace(flags);
+      const res = await apiRequest(routes.agentCheck(ws.id, name));
       if (!res.ok) {
         await handleResponseError(res);
       }
@@ -428,7 +626,8 @@ async function main() {
         process.exit(1);
       }
 
-      const res = await apiRequest(`/agents/${encodeURIComponent(name)}/stop`, {
+      const ws = await resolveWorkspace(flags);
+      const res = await apiRequest(routes.agentStop(ws.id, name), {
         method: "POST",
       });
       if (!res.ok) {
@@ -445,7 +644,8 @@ async function main() {
         console.error("Erro: Nome do worker é obrigatório. Uso: sinapse rm <nome>");
         process.exit(1);
       }
-      const res = await apiRequest(`/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
+      const ws = await resolveWorkspace(flags);
+      const res = await apiRequest(routes.agent(ws.id, name), { method: "DELETE" });
       if (!res.ok) {
         await handleResponseError(res);
       }
@@ -455,7 +655,7 @@ async function main() {
 
     case "models": {
       const provider = positional[1]?.toLowerCase();
-      const res = await apiRequest("/models");
+      const res = await apiRequest(routes.models());
       if (!res.ok) {
         await handleResponseError(res);
       }
@@ -491,8 +691,9 @@ async function main() {
         process.exit(1);
       }
 
+      const ws = await resolveWorkspace(flags);
       const isDefault = modelArg === "padrao" || modelArg === "padrão";
-      const res = await apiRequest(`/agents/${encodeURIComponent(name)}`, {
+      const res = await apiRequest(routes.agent(ws.id, name), {
         method: "PATCH",
         body: JSON.stringify({ model: isDefault ? null : modelArg }),
       });
@@ -511,17 +712,18 @@ async function main() {
       const subCommand = positional[1];
       if (!subCommand || subCommand === "help") {
         console.log(`Uso:
-  sinapse note list
-  sinapse note read <nome>
-  sinapse note write <nome> "<texto>"|-
-  sinapse note append <nome> "<texto>"|-
-  sinapse note rm <nome>`);
+  sinapse note list [--workspace <ws>]
+  sinapse note read <nome> [--workspace <ws>]
+  sinapse note write <nome> "<texto>"|- [--workspace <ws>]
+  sinapse note append <nome> "<texto>"|- [--workspace <ws>]
+  sinapse note rm <nome> [--workspace <ws>]`);
         return;
       }
 
       switch (subCommand) {
         case "list": {
-          const res = await apiRequest("/notes");
+          const ws = await resolveWorkspace(flags);
+          const res = await apiRequest(routes.notes(ws.id));
           if (!res.ok) await handleResponseError(res);
           const notes = (await res.json()) as NoteSummary[];
           if (notes.length === 0) {
@@ -553,7 +755,8 @@ async function main() {
             console.error("Erro: Nome da nota é obrigatório. Uso: sinapse note read <nome>");
             process.exit(1);
           }
-          const res = await apiRequest(`/notes/${encodeURIComponent(name)}`);
+          const ws = await resolveWorkspace(flags);
+          const res = await apiRequest(routes.note(ws.id, name));
           if (!res.ok) await handleResponseError(res);
           const note = (await res.json()) as Note;
           process.stdout.write(note.content);
@@ -570,8 +773,10 @@ async function main() {
             process.exit(1);
           }
           const text = await noteText(positional, "write");
-          const res = await apiRequest(`/notes/${encodeURIComponent(name)}`, {
+          const ws = await resolveWorkspace(flags);
+          const res = await apiRequest(routes.note(ws.id, name), {
             method: "PUT",
+            headers: authorHeaders(),
             body: JSON.stringify({ content: text }),
           });
           if (!res.ok) await handleResponseError(res);
@@ -586,8 +791,10 @@ async function main() {
             process.exit(1);
           }
           const text = await noteText(positional, "append");
-          const res = await apiRequest(`/notes/${encodeURIComponent(name)}/append`, {
+          const ws = await resolveWorkspace(flags);
+          const res = await apiRequest(routes.noteAppend(ws.id, name), {
             method: "POST",
+            headers: authorHeaders(),
             body: JSON.stringify({ content: text }),
           });
           if (!res.ok) await handleResponseError(res);
@@ -601,7 +808,8 @@ async function main() {
             console.error("Erro: Nome da nota é obrigatório. Uso: sinapse note rm <nome>");
             process.exit(1);
           }
-          const res = await apiRequest(`/notes/${encodeURIComponent(name)}`, {
+          const ws = await resolveWorkspace(flags);
+          const res = await apiRequest(routes.note(ws.id, name), {
             method: "DELETE",
           });
           if (!res.ok) await handleResponseError(res);

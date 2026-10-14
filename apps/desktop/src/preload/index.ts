@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
+import { contextBridge, ipcRenderer } from "electron";
 import type {
   DaemonEvent,
   ContextUsage,
@@ -6,6 +6,7 @@ import type {
   NoteSummary,
   Note,
   AgentState,
+  Workspace,
 } from "@sinapse/core";
 import {
   IPC,
@@ -19,38 +20,40 @@ import {
   type DesktopSettingsPatch,
   type FolderKey,
   type DaemonDetails,
+  type WorkspaceCreatePayload,
+  type WorkspaceUpdatePayload,
 } from "../shared/ipc.js";
 
 const api = {
   brain: {
-    onData: (cb: (data: string) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, data: string) => cb(data);
+    onData: (cb: (workspaceId: string, data: string) => void): (() => void) => {
+      const listener = (_event: any, workspaceId: string, data: string) => cb(workspaceId, data);
       ipcRenderer.on(IPC.BRAIN_DATA, listener);
       return () => {
         ipcRenderer.removeListener(IPC.BRAIN_DATA, listener);
       };
     },
-    write: (data: string): void => {
-      ipcRenderer.send(IPC.BRAIN_INPUT, data);
+    write: (workspaceId: string, data: string): void => {
+      ipcRenderer.send(IPC.BRAIN_INPUT, workspaceId, data);
     },
-    resize: (cols: number, rows: number): void => {
-      ipcRenderer.send(IPC.BRAIN_RESIZE, cols, rows);
+    resize: (workspaceId: string, cols: number, rows: number): void => {
+      ipcRenderer.send(IPC.BRAIN_RESIZE, workspaceId, cols, rows);
     },
-    getInfo: (): Promise<BrainInfo> => {
-      return ipcRenderer.invoke(IPC.BRAIN_INFO);
+    getInfo: (workspaceId: string): Promise<BrainInfo> => {
+      return ipcRenderer.invoke(IPC.BRAIN_INFO, workspaceId);
     },
-    setModel: (model: string | null): Promise<BrainInfo> => {
-      return ipcRenderer.invoke(IPC.BRAIN_SET_MODEL, model);
+    replay: (workspaceId: string): Promise<string> => {
+      return ipcRenderer.invoke(IPC.BRAIN_REPLAY, workspaceId);
     },
-    onUsage: (cb: (usage: ContextUsage) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, usage: ContextUsage) => cb(usage);
+    onUsage: (cb: (workspaceId: string, usage: ContextUsage) => void): (() => void) => {
+      const listener = (_event: any, workspaceId: string, usage: ContextUsage) => cb(workspaceId, usage);
       ipcRenderer.on(IPC.BRAIN_USAGE, listener);
       return () => {
         ipcRenderer.removeListener(IPC.BRAIN_USAGE, listener);
       };
     },
-    onInfoChanged: (cb: (info: { model: string | null }) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, info: { model: string | null }) => cb(info);
+    onInfoChanged: (cb: (info: BrainInfo) => void): (() => void) => {
+      const listener = (_event: any, info: BrainInfo) => cb(info);
       ipcRenderer.on(IPC.BRAIN_INFO_CHANGED, listener);
       return () => {
         ipcRenderer.removeListener(IPC.BRAIN_INFO_CHANGED, listener);
@@ -59,21 +62,21 @@ const api = {
   },
   daemon: {
     onInfo: (cb: (info: DaemonInfo) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, info: DaemonInfo) => cb(info);
+      const listener = (_event: any, info: DaemonInfo) => cb(info);
       ipcRenderer.on(IPC.DAEMON_INFO, listener);
       return () => {
         ipcRenderer.removeListener(IPC.DAEMON_INFO, listener);
       };
     },
     onEvent: (cb: (e: DaemonEvent) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, e: DaemonEvent) => cb(e);
+      const listener = (_event: any, e: DaemonEvent) => cb(e);
       ipcRenderer.on(IPC.DAEMON_EVENT, listener);
       return () => {
         ipcRenderer.removeListener(IPC.DAEMON_EVENT, listener);
       };
     },
     onStatus: (cb: (s: { connected: boolean }) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, s: { connected: boolean }) => cb(s);
+      const listener = (_event: any, s: { connected: boolean }) => cb(s);
       ipcRenderer.on(IPC.DAEMON_STATUS, listener);
       return () => {
         ipcRenderer.removeListener(IPC.DAEMON_STATUS, listener);
@@ -81,6 +84,33 @@ const api = {
     },
     details: (): Promise<DaemonDetails> => {
       return ipcRenderer.invoke(IPC.DAEMON_DETAILS);
+    },
+  },
+  workspaces: {
+    list: (): Promise<Workspace[]> => {
+      return ipcRenderer.invoke(IPC.WORKSPACES_LIST);
+    },
+    create: (payload: WorkspaceCreatePayload): Promise<Workspace> => {
+      return ipcRenderer.invoke(IPC.WORKSPACES_CREATE, payload);
+    },
+    update: (payload: WorkspaceUpdatePayload): Promise<Workspace> => {
+      return ipcRenderer.invoke(IPC.WORKSPACES_UPDATE, payload);
+    },
+    delete: (workspaceId: string): Promise<void> => {
+      return ipcRenderer.invoke(IPC.WORKSPACES_DELETE, workspaceId);
+    },
+    getActive: (): Promise<string> => {
+      return ipcRenderer.invoke(IPC.WORKSPACE_GET_ACTIVE);
+    },
+    setActive: (workspaceId: string): Promise<void> => {
+      return ipcRenderer.invoke(IPC.WORKSPACE_SET_ACTIVE, workspaceId);
+    },
+    onActiveChanged: (cb: (workspaceId: string) => void): (() => void) => {
+      const listener = (_event: any, workspaceId: string) => cb(workspaceId);
+      ipcRenderer.on(IPC.WORKSPACE_ACTIVE_CHANGED, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.WORKSPACE_ACTIVE_CHANGED, listener);
+      };
     },
   },
   settings: {
@@ -91,7 +121,7 @@ const api = {
       return ipcRenderer.invoke(IPC.SETTINGS_SET, patch);
     },
     onChanged: (cb: (settings: DesktopSettings) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, settings: DesktopSettings) => cb(settings);
+      const listener = (_event: any, settings: DesktopSettings) => cb(settings);
       ipcRenderer.on(IPC.SETTINGS_CHANGED, listener);
       return () => {
         ipcRenderer.removeListener(IPC.SETTINGS_CHANGED, listener);
@@ -112,7 +142,7 @@ const api = {
       return ipcRenderer.invoke(IPC.WINDOW_IS_MAXIMIZED);
     },
     onMaximizedChanged: (cb: (maximized: boolean) => void): (() => void) => {
-      const listener = (_event: IpcRendererEvent, maximized: boolean) => cb(maximized);
+      const listener = (_event: any, maximized: boolean) => cb(maximized);
       ipcRenderer.on(IPC.WINDOW_MAXIMIZED, listener);
       return () => {
         ipcRenderer.removeListener(IPC.WINDOW_MAXIMIZED, listener);
@@ -120,8 +150,8 @@ const api = {
     },
   },
   workers: {
-    list: (): Promise<AgentState[]> => {
-      return ipcRenderer.invoke(IPC.WORKER_LIST);
+    list: (workspaceId: string): Promise<AgentState[]> => {
+      return ipcRenderer.invoke(IPC.WORKER_LIST, workspaceId);
     },
     spawn: (payload: WorkerSpawnPayload): Promise<AgentState> => {
       return ipcRenderer.invoke(IPC.WORKER_SPAWN, payload);
@@ -132,11 +162,11 @@ const api = {
     ask: (payload: WorkerAskPayload): Promise<{ turnId: string }> => {
       return ipcRenderer.invoke(IPC.WORKER_ASK, payload);
     },
-    stop: (name: string): Promise<any> => {
-      return ipcRenderer.invoke(IPC.WORKER_STOP, name);
+    stop: (workspaceId: string, agent: string): Promise<any> => {
+      return ipcRenderer.invoke(IPC.WORKER_STOP, workspaceId, agent);
     },
-    delete: (name: string): Promise<void> => {
-      return ipcRenderer.invoke(IPC.WORKER_DELETE, name);
+    delete: (workspaceId: string, agent: string): Promise<void> => {
+      return ipcRenderer.invoke(IPC.WORKER_DELETE, workspaceId, agent);
     },
   },
   models: {
@@ -145,25 +175,28 @@ const api = {
     },
   },
   notes: {
-    list: (): Promise<NoteSummary[]> => {
-      return ipcRenderer.invoke(IPC.NOTES_LIST);
+    list: (workspaceId: string): Promise<NoteSummary[]> => {
+      return ipcRenderer.invoke(IPC.NOTES_LIST, workspaceId);
     },
-    read: (name: string): Promise<Note> => {
-      return ipcRenderer.invoke(IPC.NOTE_READ, name);
+    read: (workspaceId: string, name: string): Promise<Note> => {
+      return ipcRenderer.invoke(IPC.NOTE_READ, workspaceId, name);
     },
     write: (payload: NoteWritePayload): Promise<Note> => {
       return ipcRenderer.invoke(IPC.NOTE_WRITE, payload);
     },
-    delete: (name: string): Promise<boolean> => {
-      return ipcRenderer.invoke(IPC.NOTE_DELETE, name);
+    delete: (workspaceId: string, name: string): Promise<boolean> => {
+      return ipcRenderer.invoke(IPC.NOTE_DELETE, workspaceId, name);
     },
   },
   app: {
     openExternal: (url: string): Promise<void> => {
       return ipcRenderer.invoke(IPC.APP_OPEN_EXTERNAL, url);
     },
-    openFolder: (key: FolderKey): Promise<void> => {
-      return ipcRenderer.invoke(IPC.APP_OPEN_FOLDER, key);
+    openFolder: (key: FolderKey, workspaceId?: string): Promise<void> => {
+      return ipcRenderer.invoke(IPC.APP_OPEN_FOLDER, key, workspaceId);
+    },
+    pickFolder: (): Promise<string | null> => {
+      return ipcRenderer.invoke(IPC.APP_PICK_FOLDER);
     },
   },
 };

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,6 +13,7 @@ import type {
   NoteSummary,
   Note,
   AgentState,
+  Workspace,
 } from "@sinapse/core";
 import {
   IPC,
@@ -26,6 +27,8 @@ import {
   type DesktopSettingsPatch,
   type FolderKey,
   type DaemonDetails,
+  type WorkspaceCreatePayload,
+  type WorkspaceUpdatePayload,
 } from "../shared/ipc.js";
 
 const _require = createRequire(import.meta.url);
@@ -37,14 +40,34 @@ const {
   agentEnv,
   sinapseDir,
   estimateContextWindow,
+  routes,
+  AUTHOR_HEADER,
+  ORCHESTRATOR_AUTHOR,
+  USER_AUTHOR,
+  ENV,
 }: typeof import("@sinapse/core") = _require("@sinapse/core");
+
+interface Brain {
+  pty: IPty | null;
+  session: string;
+  sessionId: string | null;
+  usage?: ContextUsage;
+  scrollback: string;
+  cols: number;
+  rows: number;
+  provider: "claude" | "agy";
+  model: string | null;
+  ptyStartTime: number;
+}
+
+const MAX_SCROLLBACK = 256 * 1024; // 256 KB ring buffer
+const brains = new Map<string, Brain>();
 
 function getDefaultSettings(): DesktopSettings {
   return {
     workerDefaults: {
       provider: "agy",
       autonomy: "edit",
-      cwd: os.homedir(),
     },
     appearance: {
       chromaticBar: "animada",
@@ -57,42 +80,328 @@ function getDefaultSettings(): DesktopSettings {
 let mainWindow: BrowserWindow | null = null;
 let daemonInfo: DaemonInfo | null = null;
 let ownsDaemon = false;
-let ptyProcess: IPty | null = null;
 let isDaemonConnected = false;
 let sseAbortController: AbortController | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let isQuitting = false;
+let brainUsageTimer: NodeJS.Timeout | null = null;
 
 let settings: DesktopSettings = getDefaultSettings();
-let brainModel: string | null = null;
-let latestBrainUsage: ContextUsage | undefined = undefined;
-let brainUsageTimer: NodeJS.Timeout | null = null;
-let ptyStartTime = 0;
-let brainSession = "";
 
-/**
- * Ends the brain PTY, then sweeps what it left behind once it had a moment to exit cleanly:
- * some MCP servers detach from the brain, but they inherit SINAPSE_BRAIN_SESSION.
- */
-function killBrain(): Promise<void> {
-  const session = brainSession;
-  if (ptyProcess) {
-    try {
-      ptyProcess.kill();
-    } catch {}
-    ptyProcess = null;
+const MODEL_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$/;
+
+function appendScrollback(brain: Brain, data: string): void {
+  brain.scrollback += data;
+  if (brain.scrollback.length > MAX_SCROLLBACK) {
+    brain.scrollback = brain.scrollback.slice(brain.scrollback.length - MAX_SCROLLBACK);
   }
+}
+
+function brainDir(ws: Workspace | string): string {
+  const id = typeof ws === "string" ? ws : ws.id;
+  const dir = path.join(sinapseDir(), "workspaces", id, "orquestrador");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function generateBrainGuide(ws: Workspace): string {
+  return `# Orquestrador do Sinapse — Workspace ${ws.name}
+
+Você é o orquestrador do workspace ${ws.name}. O projeto está em ${ws.folder} (acessível via --add-dir). Conversa com o usuário e delega trabalho a workers pela skill \`sinapse\`.
+
+- Esta pasta é a sua base. O projeto principal está em ${ws.folder}: trabalhe nele diretamente ou por caminho absoluto e passe a pasta certa aos workers com \`--cwd\`.
+- O canvas mostra ao vivo os workers, as delegações e as notas (\`sinapse note\`).
+`;
+}
+
+function ensureAgySkill(bDir: string): void {
+  try {
+    const skillsDir = path.join(bDir, ".agent", "skills");
+    fs.mkdirSync(skillsDir, { recursive: true });
+    const linkPath = path.join(skillsDir, "sinapse");
+    const skillSource = path.resolve(app.getAppPath(), "../../skill/sinapse");
+
+    try {
+      const stat = fs.lstatSync(linkPath);
+      if (stat.isSymbolicLink()) {
+        const target = fs.readlinkSync(linkPath);
+        if (target !== skillSource) {
+          fs.unlinkSync(linkPath);
+          fs.symlinkSync(skillSource, linkPath, process.platform === "win32" ? "junction" : "dir");
+        }
+      } else {
+        fs.rmSync(linkPath, { recursive: true, force: true });
+        fs.symlinkSync(skillSource, linkPath, process.platform === "win32" ? "junction" : "dir");
+      }
+    } catch (err: any) {
+      if (err.code === "ENOENT") {
+        fs.symlinkSync(skillSource, linkPath, process.platform === "win32" ? "junction" : "dir");
+      } else {
+        throw err;
+      }
+    }
+  } catch (err) {
+    if (process.platform === "win32") {
+      console.warn("Falha ao criar symlink da skill AGY no Windows:", err);
+    } else {
+      console.warn("Falha ao criar symlink da skill AGY:", err);
+    }
+  }
+}
+
+function getBrainInfo(workspaceId: string, ws?: Workspace): BrainInfo {
+  const brain = brains.get(workspaceId);
+  const provider = brain?.provider ?? ws?.orchestrator.provider ?? "agy";
+  const model = brain ? brain.model : (ws?.orchestrator.model ?? null);
+  return {
+    workspaceId,
+    provider,
+    model,
+    usage: provider === "claude" ? brain?.usage : undefined,
+    running: brain?.pty != null,
+  };
+}
+
+function getOrCreateBrain(ws: Workspace): Brain {
+  let brain = brains.get(ws.id);
+  if (!brain) {
+    brain = {
+      pty: null,
+      session: "",
+      sessionId: null,
+      usage: undefined,
+      scrollback: "",
+      cols: 80,
+      rows: 24,
+      provider: ws.orchestrator.provider,
+      model: ws.orchestrator.model ?? null,
+      ptyStartTime: 0,
+    };
+    brains.set(ws.id, brain);
+  } else {
+    brain.provider = ws.orchestrator.provider;
+    brain.model = ws.orchestrator.model ?? null;
+  }
+  return brain;
+}
+
+async function killBrain(ws: Workspace | string): Promise<void> {
+  const id = typeof ws === "string" ? ws : ws.id;
+  const brain = brains.get(id);
+  if (!brain) return;
+
+  const session = brain.session;
+  if (brain.pty) {
+    try {
+      brain.pty.kill();
+    } catch {}
+    brain.pty = null;
+  }
+
   return new Promise((resolve) =>
     setTimeout(() => {
-      sweepEnvMarker("SINAPSE_BRAIN_SESSION", session);
+      if (session) {
+        sweepEnvMarker("SINAPSE_BRAIN_SESSION", session);
+      }
       resolve();
     }, 1000)
   );
 }
-let currentCols = 80;
-let currentRows = 24;
 
-const MODEL_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$/;
+async function spawnBrain(ws: Workspace, resumeSessionId?: string | null): Promise<void> {
+  if (!daemonInfo) return;
+  const brain = getOrCreateBrain(ws);
+  if (brain.pty) {
+    await killBrain(ws.id);
+  }
+
+  const home = os.homedir();
+  const cliBinPath = path.resolve(app.getAppPath(), "../../node_modules/.bin");
+  const localBin = path.join(home, ".local", "bin");
+  const userPath = (process.env.PATH || "").split(path.delimiter);
+  const extraPaths =
+    process.platform !== "win32" ? ["/usr/local/bin", "/usr/bin", "/bin"] : [];
+  const combinedPath = Array.from(new Set([cliBinPath, localBin, ...userPath, ...extraPaths]))
+    .filter(Boolean)
+    .join(path.delimiter);
+
+  const provider = ws.orchestrator.provider;
+  const model = ws.orchestrator.model;
+  const args: string[] = [];
+
+  if (provider === "claude") {
+    if (resumeSessionId) {
+      args.push("--resume", resumeSessionId);
+    }
+    if (model) {
+      args.push("--model", model);
+    }
+    args.push("--add-dir", ws.folder);
+  } else {
+    // agy
+    if (model) {
+      args.push("--model", model);
+    }
+    args.push("--add-dir", ws.folder);
+  }
+
+  const bDir = brainDir(ws.id);
+  const guideFilename = provider === "claude" ? "CLAUDE.md" : "AGENTS.md";
+  fs.writeFileSync(path.join(bDir, guideFilename), generateBrainGuide(ws), "utf-8");
+
+  if (provider === "agy") {
+    ensureAgySkill(bDir);
+  }
+
+  try {
+    brain.ptyStartTime = Date.now();
+    brain.session = randomUUID();
+    brain.provider = provider;
+    brain.model = model ?? null;
+    if (!resumeSessionId) {
+      brain.scrollback = "";
+    }
+
+    const command = provider === "claude" ? "claude" : "agy";
+    const proc = pty.spawn(command, args, {
+      name: "xterm-256color",
+      cols: brain.cols || 80,
+      rows: brain.rows || 24,
+      cwd: bDir,
+      env: agentEnv({
+        PATH: combinedPath,
+        SINAPSE_URL: `http://127.0.0.1:${daemonInfo.port}`,
+        SINAPSE_TOKEN: daemonInfo.token,
+        SINAPSE_BRAIN_SESSION: brain.session,
+        [ENV.workspace]: ws.id,
+        [ENV.agentId]: ORCHESTRATOR_AUTHOR,
+      }) as Record<string, string>,
+    });
+
+    brain.pty = proc;
+
+    proc.onData((data: string) => {
+      // A killed PTY can still flush output; only the current one may write to the terminal.
+      const currentBrain = brains.get(ws.id);
+      if (!currentBrain || proc !== currentBrain.pty) return;
+      appendScrollback(currentBrain, data);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC.BRAIN_DATA, ws.id, data);
+      }
+    });
+
+    proc.onExit(({ exitCode, signal }: { exitCode: number; signal?: number }) => {
+      console.log(`Brain PTY for ${ws.id} exited (exitCode=${exitCode}, signal=${signal})`);
+      const currentBrain = brains.get(ws.id);
+      if (currentBrain && currentBrain.pty === proc) {
+        currentBrain.pty = null;
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send(IPC.BRAIN_INFO_CHANGED, getBrainInfo(ws.id, ws));
+        }
+      }
+    });
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(IPC.BRAIN_INFO_CHANGED, getBrainInfo(ws.id, ws));
+    }
+  } catch (err) {
+    console.error(`Failed to spawn ${provider} PTY process for workspace ${ws.id}:`, err);
+  }
+}
+
+function isUsageEqual(a?: ContextUsage, b?: ContextUsage): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return (
+    a.usedTokens === b.usedTokens &&
+    a.windowTokens === b.windowTokens &&
+    a.windowEstimated === b.windowEstimated &&
+    a.model === b.model
+  );
+}
+
+function pollBrainUsage(): void {
+  for (const [workspaceId, brain] of brains.entries()) {
+    if (brain.provider !== "claude" || !brain.pty) continue;
+    try {
+      const bDir = brainDir(workspaceId);
+      const dir = path.join(os.homedir(), ".claude", "projects", bDir.replace(/[^a-zA-Z0-9]/g, "-"));
+      if (!fs.existsSync(dir)) continue;
+
+      const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+      if (files.length === 0) continue;
+
+      const minMtime = brain.ptyStartTime - 5000;
+      let newestFile: string | null = null;
+      let newestMtime = -1;
+
+      for (const file of files) {
+        try {
+          const fullPath = path.join(dir, file);
+          const stat = fs.statSync(fullPath);
+          if (stat.mtimeMs >= minMtime && stat.mtimeMs > newestMtime) {
+            newestMtime = stat.mtimeMs;
+            newestFile = fullPath;
+          }
+        } catch {}
+      }
+
+      if (!newestFile) continue;
+      brain.sessionId = path.basename(newestFile, ".jsonl");
+
+      const stat = fs.statSync(newestFile);
+      const size = stat.size;
+      if (size === 0) continue;
+
+      const readSize = Math.min(size, 256 * 1024);
+      const buffer = Buffer.alloc(readSize);
+      const fd = fs.openSync(newestFile, "r");
+      try {
+        fs.readSync(fd, buffer, 0, readSize, Math.max(0, size - readSize));
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      const text = buffer.toString("utf-8");
+      const lines = text.split("\n");
+
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line);
+          if (parsed.type === "assistant" && parsed.message?.usage) {
+            const usage = parsed.message.usage;
+            const inputTokens = usage.input_tokens || 0;
+            const cacheCreation = usage.cache_creation_input_tokens || 0;
+            const cacheRead = usage.cache_read_input_tokens || 0;
+            const usedTokens = inputTokens + cacheCreation + cacheRead;
+            const model = parsed.message.model;
+            const windowTokens = estimateContextWindow(model);
+            const newUsage: ContextUsage = {
+              usedTokens,
+              windowTokens,
+              windowEstimated: true,
+              model,
+            };
+
+            if (!isUsageEqual(brain.usage, newUsage)) {
+              brain.usage = newUsage;
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send(IPC.BRAIN_USAGE, workspaceId, newUsage);
+              }
+            }
+            break;
+          }
+        } catch {
+          // Skip malformed/partial line
+        }
+      }
+    } catch {
+      // Never crash on poll errors
+    }
+  }
+}
 
 function getCurrentDir(): string {
   if (typeof __dirname !== "undefined") {
@@ -135,8 +444,8 @@ function loadSettings(): DesktopSettings {
       const content = fs.readFileSync(configPath, "utf-8");
       const data = JSON.parse(content);
       if (data && typeof data === "object") {
-        if (typeof data.brainModel === "string" && MODEL_REGEX.test(data.brainModel.trim())) {
-          current.brainModel = data.brainModel.trim();
+        if (typeof data.activeWorkspaceId === "string" && data.activeWorkspaceId.trim() !== "") {
+          current.activeWorkspaceId = data.activeWorkspaceId.trim();
         }
         if (data.workerDefaults && typeof data.workerDefaults === "object") {
           const wd = data.workerDefaults;
@@ -145,14 +454,6 @@ function loadSettings(): DesktopSettings {
           }
           if (wd.autonomy === "read" || wd.autonomy === "edit" || wd.autonomy === "full") {
             current.workerDefaults.autonomy = wd.autonomy;
-          }
-          if (typeof wd.cwd === "string" && wd.cwd.trim() !== "") {
-            try {
-              const resolved = path.resolve(wd.cwd);
-              if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-                current.workerDefaults.cwd = resolved;
-              }
-            } catch {}
           }
           if (typeof wd.model === "string" && MODEL_REGEX.test(wd.model.trim())) {
             current.workerDefaults.model = wd.model.trim();
@@ -200,130 +501,37 @@ function saveSettings(s: DesktopSettings): void {
   }
 }
 
-const BRAIN_GUIDE = `# Cérebro do Sinapse
-
-Você é o cérebro do Sinapse: conversa com o usuário e delega trabalho a workers pela skill \`sinapse\`.
-
-- Esta pasta é só a sua base. Os projetos do usuário ficam em outras pastas: trabalhe neles por caminho absoluto e passe a pasta certa aos workers com \`--cwd\`.
-- O canvas mostra ao vivo os workers, as delegações e as notas (\`sinapse note\`).
-`;
-
-/**
- * The brain runs in its own folder, not in home: Claude Code doesn't persist trust for the home folder
- * (it asks again on every new session), and home transcripts mix with the user's other sessions.
- */
-function brainCwd(): string {
-  const dir = path.join(sinapseDir(), "cerebro");
-  fs.mkdirSync(dir, { recursive: true });
-  const guide = path.join(dir, "CLAUDE.md");
-  if (!fs.existsSync(guide)) fs.writeFileSync(guide, BRAIN_GUIDE);
-  return dir;
-}
-
-// Claude Code names a project's transcript folder after its cwd, with every non-alphanumeric char as "-".
-function getTranscriptDir(): string {
-  return path.join(os.homedir(), ".claude", "projects", brainCwd().replace(/[^a-zA-Z0-9]/g, "-"));
-}
-
-// Session of the brain's own transcript (written after its PTY started). Resuming by id, not `--continue`,
-// because the home folder also holds the user's unrelated Claude Code sessions.
-let brainSessionId: string | null = null;
-
-function isUsageEqual(a?: ContextUsage, b?: ContextUsage): boolean {
-  if (!a && !b) return true;
-  if (!a || !b) return false;
-  return (
-    a.usedTokens === b.usedTokens &&
-    a.windowTokens === b.windowTokens &&
-    a.windowEstimated === b.windowEstimated &&
-    a.model === b.model
-  );
-}
-
-function pollBrainUsage(): void {
-  try {
-    const dir = getTranscriptDir();
-    if (!fs.existsSync(dir)) return;
-
-    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-    if (files.length === 0) return;
-
-    const minMtime = ptyStartTime - 5000;
-    let newestFile: string | null = null;
-    let newestMtime = -1;
-
-    for (const file of files) {
-      try {
-        const fullPath = path.join(dir, file);
-        const stat = fs.statSync(fullPath);
-        if (stat.mtimeMs >= minMtime && stat.mtimeMs > newestMtime) {
-          newestMtime = stat.mtimeMs;
-          newestFile = fullPath;
-        }
-      } catch {}
-    }
-
-    if (!newestFile) return;
-    brainSessionId = path.basename(newestFile, ".jsonl");
-
-    const stat = fs.statSync(newestFile);
-    const size = stat.size;
-    if (size === 0) return;
-
-    const readSize = Math.min(size, 256 * 1024);
-    const buffer = Buffer.alloc(readSize);
-    const fd = fs.openSync(newestFile, "r");
-    try {
-      fs.readSync(fd, buffer, 0, readSize, Math.max(0, size - readSize));
-    } finally {
-      fs.closeSync(fd);
-    }
-
-    const text = buffer.toString("utf-8");
-    const lines = text.split("\n");
-
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.type === "assistant" && parsed.message?.usage) {
-          const usage = parsed.message.usage;
-          const inputTokens = usage.input_tokens || 0;
-          const cacheCreation = usage.cache_creation_input_tokens || 0;
-          const cacheRead = usage.cache_read_input_tokens || 0;
-          const usedTokens = inputTokens + cacheCreation + cacheRead;
-          const model = parsed.message.model;
-          const windowTokens = estimateContextWindow(model);
-          const newUsage: ContextUsage = {
-            usedTokens,
-            windowTokens,
-            windowEstimated: true,
-            model,
-          };
-
-          if (!isUsageEqual(latestBrainUsage, newUsage)) {
-            latestBrainUsage = newUsage;
-            if (mainWindow && !mainWindow.isDestroyed()) {
-              mainWindow.webContents.send(IPC.BRAIN_USAGE, newUsage);
-            }
-          }
-          break;
-        }
-      } catch {
-        // Skip malformed/partial line
-      }
-    }
-  } catch {
-    // Never crash on poll errors
-  }
-}
-
 function broadcastDaemonStatus(connected: boolean): void {
   isDaemonConnected = connected;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(IPC.DAEMON_STATUS, { connected });
   }
+}
+
+async function daemonFetch(endpoint: string, init?: RequestInit): Promise<Response> {
+  if (!daemonInfo) {
+    throw new Error("Sinapse daemon is not ready");
+  }
+  return fetch(`http://127.0.0.1:${daemonInfo.port}${endpoint}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${daemonInfo.token}`,
+      ...(init?.headers || {}),
+    },
+  });
+}
+
+async function extractDaemonError(res: Response, fallback: string): Promise<string> {
+  try {
+    const text = await res.text();
+    try {
+      const json = JSON.parse(text);
+      if (json && typeof json.error === "string") return json.error;
+      if (json && typeof json.message === "string") return json.message;
+    } catch {}
+    if (text && text.trim()) return text.trim();
+  } catch {}
+  return fallback;
 }
 
 async function connectDaemonSSE(): Promise<void> {
@@ -335,7 +543,7 @@ async function connectDaemonSSE(): Promise<void> {
   }
 
   sseAbortController = new AbortController();
-  const url = `http://127.0.0.1:${daemonInfo.port}/events`;
+  const url = `http://127.0.0.1:${daemonInfo.port}${routes.events()}`;
 
   try {
     const response = await fetch(url, {
@@ -374,6 +582,13 @@ async function connectDaemonSSE(): Promise<void> {
           if (jsonStr) {
             try {
               const event: DaemonEvent = JSON.parse(jsonStr);
+
+              if (event.kind === "workspace_deleted") {
+                void killBrain(event.workspaceId).then(() => {
+                  brains.delete(event.workspaceId);
+                });
+              }
+
               if (mainWindow && !mainWindow.isDestroyed()) {
                 mainWindow.webContents.send(IPC.DAEMON_EVENT, event);
               }
@@ -481,102 +696,6 @@ function createWindow(): BrowserWindow {
   return mainWindow;
 }
 
-function spawnClaudePTY(model?: string | null, resumeSessionId?: string | null): void {
-  if (!daemonInfo) return;
-  if (ptyProcess) void killBrain();
-
-  const home = os.homedir();
-  const cliBinPath = path.resolve(app.getAppPath(), "../../node_modules/.bin");
-  const localBin = path.join(home, ".local", "bin");
-  const userPath = (process.env.PATH || "").split(path.delimiter);
-  const extraPaths =
-    process.platform !== "win32" ? ["/usr/local/bin", "/usr/bin", "/bin"] : [];
-  const combinedPath = Array.from(new Set([cliBinPath, localBin, ...userPath, ...extraPaths]))
-    .filter(Boolean)
-    .join(path.delimiter);
-
-  const args: string[] = [];
-  if (resumeSessionId) {
-    args.push("--resume", resumeSessionId);
-  }
-  if (model) {
-    args.push("--model", model);
-  }
-
-  try {
-    ptyStartTime = Date.now();
-    brainSession = randomUUID();
-    const proc = pty.spawn("claude", args, {
-      name: "xterm-256color",
-      cols: currentCols,
-      rows: currentRows,
-      cwd: brainCwd(),
-      env: agentEnv({
-        PATH: combinedPath,
-        SINAPSE_URL: `http://127.0.0.1:${daemonInfo.port}`,
-        SINAPSE_TOKEN: daemonInfo.token,
-        SINAPSE_BRAIN_SESSION: brainSession,
-      }) as Record<string, string>,
-    });
-
-    ptyProcess = proc;
-
-    proc.onData((data: string) => {
-      // A killed PTY can still flush output; only the current one may write to the terminal.
-      if (proc !== ptyProcess) return;
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send(IPC.BRAIN_DATA, data);
-      }
-    });
-
-    proc.onExit(({ exitCode, signal }: { exitCode: number; signal?: number }) => {
-      console.log(`Claude PTY exited (exitCode=${exitCode}, signal=${signal})`);
-    });
-  } catch (err) {
-    console.error("Failed to spawn claude PTY process:", err);
-  }
-}
-
-function applyBrainModel(model: string | null): BrainInfo {
-  brainModel = model;
-  if (model) {
-    settings.brainModel = model;
-  } else {
-    delete settings.brainModel;
-  }
-  saveSettings(settings);
-
-  void killBrain();
-
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send(IPC.BRAIN_DATA, "\x1bc");
-  }
-
-  spawnClaudePTY(brainModel, brainSessionId);
-
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send(IPC.BRAIN_INFO_CHANGED, { model: brainModel });
-  }
-
-  return {
-    model: brainModel,
-    usage: latestBrainUsage,
-  };
-}
-
-async function daemonFetch(endpoint: string, init?: RequestInit): Promise<Response> {
-  if (!daemonInfo) {
-    throw new Error("Sinapse daemon is not ready");
-  }
-  return fetch(`http://127.0.0.1:${daemonInfo.port}${endpoint}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${daemonInfo.token}`,
-      ...(init?.headers || {}),
-    },
-  });
-}
-
 function registerIpcHandlers(): void {
   // Window controls
   ipcMain.on(IPC.WINDOW_MINIMIZE, () => {
@@ -610,19 +729,6 @@ function registerIpcHandlers(): void {
       throw new Error("Configurações inválidas");
     }
 
-    // 1. Validate everything before applying anything
-    let nextBrainModel: string | null | undefined = undefined;
-    if ("brainModel" in patch && patch.brainModel !== undefined) {
-      if (patch.brainModel === null || (typeof patch.brainModel === "string" && patch.brainModel.trim() === "")) {
-        nextBrainModel = null;
-      } else if (typeof patch.brainModel === "string" && MODEL_REGEX.test(patch.brainModel.trim())) {
-        nextBrainModel = patch.brainModel.trim();
-      } else {
-        throw new Error("Modelo inválido");
-      }
-    }
-
-    let resolvedCwd: string | undefined = undefined;
     let nextWorkerModel: string | null | undefined = undefined;
     if (patch.workerDefaults !== undefined) {
       if (!patch.workerDefaults || typeof patch.workerDefaults !== "object") {
@@ -640,22 +746,6 @@ function registerIpcHandlers(): void {
           patch.workerDefaults.autonomy !== "full"
         ) {
           throw new Error("Autonomia inválida: deve ser 'read', 'edit' ou 'full'");
-        }
-      }
-      if (patch.workerDefaults.cwd !== undefined) {
-        if (typeof patch.workerDefaults.cwd !== "string" || !patch.workerDefaults.cwd.trim()) {
-          throw new Error("Pasta inválida");
-        }
-        resolvedCwd = path.resolve(patch.workerDefaults.cwd);
-        try {
-          if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
-            throw new Error(`Pasta não encontrada: ${resolvedCwd}`);
-          }
-        } catch (err: any) {
-          if (err.message && err.message.startsWith("Pasta não encontrada:")) {
-            throw err;
-          }
-          throw new Error(`Pasta não encontrada: ${resolvedCwd}`);
         }
       }
       if ("model" in patch.workerDefaults && patch.workerDefaults.model !== undefined) {
@@ -705,16 +795,13 @@ function registerIpcHandlers(): void {
       }
     }
 
-    // 2. Merge field by field
+    // Merge field by field
     if (patch.workerDefaults) {
       if (patch.workerDefaults.provider !== undefined) {
         settings.workerDefaults.provider = patch.workerDefaults.provider;
       }
       if (patch.workerDefaults.autonomy !== undefined) {
         settings.workerDefaults.autonomy = patch.workerDefaults.autonomy;
-      }
-      if (resolvedCwd !== undefined) {
-        settings.workerDefaults.cwd = resolvedCwd;
       }
       if (nextWorkerModel !== undefined) {
         if (nextWorkerModel) {
@@ -737,14 +824,7 @@ function registerIpcHandlers(): void {
       }
     }
 
-    const currentBrainModel = settings.brainModel ?? null;
-    const brainModelChanged = nextBrainModel !== undefined && nextBrainModel !== currentBrainModel;
-
-    if (brainModelChanged && nextBrainModel !== undefined) {
-      applyBrainModel(nextBrainModel);
-    } else {
-      saveSettings(settings);
-    }
+    saveSettings(settings);
 
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send(IPC.SETTINGS_CHANGED, settings);
@@ -754,48 +834,204 @@ function registerIpcHandlers(): void {
   });
 
   // Brain
-  ipcMain.on(IPC.BRAIN_INPUT, (_event, data: string) => {
-    if (ptyProcess) {
-      ptyProcess.write(data);
+  ipcMain.on(IPC.BRAIN_INPUT, (_event, workspaceId: string, data: string) => {
+    const brain = brains.get(workspaceId);
+    if (brain?.pty) {
+      brain.pty.write(data);
     }
   });
 
-  ipcMain.on(IPC.BRAIN_RESIZE, (_event, cols: number, rows: number) => {
-    currentCols = cols;
-    currentRows = rows;
-    if (ptyProcess) {
+  ipcMain.on(IPC.BRAIN_RESIZE, (_event, workspaceId: string, cols: number, rows: number) => {
+    let brain = brains.get(workspaceId);
+    if (!brain) {
+      brain = {
+        pty: null,
+        session: "",
+        sessionId: null,
+        usage: undefined,
+        scrollback: "",
+        cols,
+        rows,
+        provider: "agy",
+        model: null,
+        ptyStartTime: 0,
+      };
+      brains.set(workspaceId, brain);
+    } else {
+      brain.cols = cols;
+      brain.rows = rows;
+    }
+    if (brain.pty) {
       try {
-        ptyProcess.resize(cols, rows);
+        brain.pty.resize(cols, rows);
       } catch (err) {
-        console.error("Error resizing PTY:", err);
+        console.error(`Error resizing PTY for ${workspaceId}:`, err);
       }
     }
   });
 
-  ipcMain.handle(IPC.BRAIN_INFO, async (): Promise<BrainInfo> => {
+  ipcMain.handle(IPC.BRAIN_INFO, async (_event, workspaceId: string): Promise<BrainInfo> => {
+    const brain = brains.get(workspaceId);
+    if (brain) {
+      return getBrainInfo(workspaceId);
+    }
+    try {
+      const res = await daemonFetch(routes.workspace(workspaceId));
+      if (res.ok) {
+        const ws = (await res.json()) as Workspace;
+        return getBrainInfo(workspaceId, ws);
+      }
+    } catch {}
     return {
-      model: brainModel,
-      usage: latestBrainUsage,
+      workspaceId,
+      provider: "agy",
+      model: null,
+      running: false,
     };
   });
 
-  ipcMain.handle(IPC.BRAIN_SET_MODEL, async (_event, model: string | null): Promise<BrainInfo> => {
-    let validatedModel: string | null = null;
-    if (typeof model === "string" && model.trim() !== "") {
-      const trimmed = model.trim();
-      if (!MODEL_REGEX.test(trimmed)) {
-        throw new Error("Modelo inválido");
+  ipcMain.handle(IPC.BRAIN_REPLAY, async (_event, workspaceId: string): Promise<string> => {
+    const brain = brains.get(workspaceId);
+    return brain?.scrollback ?? "";
+  });
+
+  // Workspaces
+  ipcMain.handle(IPC.WORKSPACES_LIST, async (): Promise<Workspace[]> => {
+    const res = await daemonFetch(routes.workspaces());
+    if (!res.ok) {
+      throw new Error(await extractDaemonError(res, "Não foi possível listar os workspaces"));
+    }
+    return (await res.json()) as Workspace[];
+  });
+
+  ipcMain.handle(IPC.WORKSPACES_CREATE, async (_event, payload: WorkspaceCreatePayload): Promise<Workspace> => {
+    const res = await daemonFetch(routes.workspaces(), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      throw new Error(await extractDaemonError(res, "Não foi possível criar o workspace"));
+    }
+    return (await res.json()) as Workspace;
+  });
+
+  ipcMain.handle(IPC.WORKSPACES_UPDATE, async (_event, payload: WorkspaceUpdatePayload): Promise<Workspace> => {
+    const body: Record<string, any> = {};
+    if (payload.name !== undefined) body.name = payload.name;
+    if (payload.orchestrator !== undefined) body.orchestrator = payload.orchestrator;
+
+    const res = await daemonFetch(routes.workspace(payload.workspaceId), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(await extractDaemonError(res, "Não foi possível atualizar o workspace"));
+    }
+    const updated = (await res.json()) as Workspace;
+
+    if (payload.orchestrator) {
+      const brain = brains.get(payload.workspaceId);
+      if (brain && brain.pty) {
+        const sameClaude = brain.provider === "claude" && payload.orchestrator.provider === "claude";
+        const resumeSessionId = sameClaude ? brain.sessionId : null;
+        await killBrain(payload.workspaceId);
+        await spawnBrain(updated, resumeSessionId);
+      } else if (brain) {
+        brain.provider = updated.orchestrator.provider;
+        brain.model = updated.orchestrator.model ?? null;
       }
-      validatedModel = trimmed;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC.BRAIN_INFO_CHANGED, getBrainInfo(updated.id, updated));
+      }
     }
 
-    const info = applyBrainModel(validatedModel);
+    return updated;
+  });
+
+  ipcMain.handle(IPC.WORKSPACES_DELETE, async (_event, workspaceId: string): Promise<void> => {
+    // Check before killing: the daemon refuses to delete the last workspace, and its orchestrator must survive that.
+    const before = await daemonFetch(routes.workspaces());
+    if (before.ok && ((await before.json()) as Workspace[]).length <= 1) {
+      throw new Error("Não é possível apagar o último workspace");
+    }
+    await killBrain(workspaceId);
+    brains.delete(workspaceId);
+
+    const res = await daemonFetch(routes.workspace(workspaceId), {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      throw new Error(await extractDaemonError(res, "Não foi possível excluir o workspace"));
+    }
+
+    if (settings.activeWorkspaceId === workspaceId) {
+      try {
+        const listRes = await daemonFetch(routes.workspaces());
+        if (listRes.ok) {
+          const remaining = (await listRes.json()) as Workspace[];
+          if (remaining.length > 0) {
+            const nextActive = remaining[0];
+            settings.activeWorkspaceId = nextActive.id;
+            saveSettings(settings);
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send(IPC.WORKSPACE_ACTIVE_CHANGED, nextActive.id);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Failed to update active workspace after delete:", err);
+      }
+    }
+  });
+
+  ipcMain.handle(IPC.WORKSPACE_GET_ACTIVE, async (): Promise<string> => {
+    try {
+      const listRes = await daemonFetch(routes.workspaces());
+      if (listRes.ok) {
+        const list = (await listRes.json()) as Workspace[];
+        if (list.length > 0) {
+          if (settings.activeWorkspaceId && list.some((w) => w.id === settings.activeWorkspaceId)) {
+            return settings.activeWorkspaceId;
+          }
+          const fallback = list[0].id;
+          settings.activeWorkspaceId = fallback;
+          saveSettings(settings);
+          return fallback;
+        }
+      }
+    } catch {}
+    return settings.activeWorkspaceId || "geral";
+  });
+
+  ipcMain.handle(IPC.WORKSPACE_SET_ACTIVE, async (_event, workspaceId: string): Promise<void> => {
+    const listRes = await daemonFetch(routes.workspaces());
+    if (!listRes.ok) {
+      throw new Error(await extractDaemonError(listRes, "Não foi possível validar o workspace"));
+    }
+    const list = (await listRes.json()) as Workspace[];
+    const ws = list.find((w) => w.id === workspaceId);
+    if (!ws) {
+      throw new Error(`Workspace não encontrado: ${workspaceId}`);
+    }
+
+    settings.activeWorkspaceId = ws.id;
+    saveSettings(settings);
+
+    const brain = getOrCreateBrain(ws);
+    if (!brain.pty) {
+      await spawnBrain(ws);
+    }
+    if (brain.pty && brain.cols && brain.rows) {
+      try {
+        brain.pty.resize(brain.cols, brain.rows);
+      } catch {}
+    }
 
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(IPC.SETTINGS_CHANGED, settings);
+      mainWindow.webContents.send(IPC.WORKSPACE_ACTIVE_CHANGED, ws.id);
     }
-
-    return info;
   });
 
   // Daemon details
@@ -806,65 +1042,60 @@ function registerIpcHandlers(): void {
     return {
       port: daemonInfo.port,
       dataDir: sinapseDir(),
-      brainDir: brainCwd(),
-      notesDir: path.join(sinapseDir(), "notes"),
       ownsDaemon,
     };
   });
 
   // Models
   ipcMain.handle(IPC.MODELS_LIST, async (): Promise<ModelCatalog> => {
-    const res = await daemonFetch("/models");
+    const res = await daemonFetch(routes.models());
     if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Failed to list models: ${res.status} ${errText}`);
+      throw new Error(await extractDaemonError(res, `Não foi possível listar os modelos: ${res.status}`));
     }
     return (await res.json()) as ModelCatalog;
   });
 
   // Workers
-  ipcMain.handle(IPC.WORKER_LIST, async () => {
-    const response = await daemonFetch("/agents", { method: "GET" });
+  ipcMain.handle(IPC.WORKER_LIST, async (_event, workspaceId: string): Promise<AgentState[]> => {
+    const response = await daemonFetch(routes.agents(workspaceId), { method: "GET" });
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to list workers: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível listar os workers: ${response.status}`));
     }
-    return await response.json();
+    return (await response.json()) as AgentState[];
   });
 
-  ipcMain.handle(IPC.WORKER_SPAWN, async (_event, payload: WorkerSpawnPayload) => {
-    const cwd =
-      payload.cwd && payload.cwd.trim() !== ""
-        ? path.resolve(payload.cwd)
-        : (process.env.HOME || process.cwd());
-
+  ipcMain.handle(IPC.WORKER_SPAWN, async (_event, payload: WorkerSpawnPayload): Promise<AgentState> => {
     const body: Record<string, any> = {
-      ...payload,
-      cwd,
+      name: payload.name,
+      provider: payload.provider,
+      role: payload.role,
       autonomy: payload.autonomy || "edit",
     };
+    if (payload.cwd && payload.cwd.trim() !== "") {
+      body.cwd = path.resolve(payload.cwd);
+    }
     if (payload.model) {
       body.model = payload.model;
     }
 
-    const response = await daemonFetch("/agents", {
+    const response = await daemonFetch(routes.agents(payload.workspaceId), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        [AUTHOR_HEADER]: USER_AUTHOR,
       },
       body: JSON.stringify(body),
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to spawn worker: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível criar o worker: ${response.status}`));
     }
 
-    return await response.json();
+    return (await response.json()) as AgentState;
   });
 
   ipcMain.handle(IPC.WORKER_UPDATE, async (_event, payload: WorkerUpdatePayload): Promise<AgentState> => {
-    const response = await daemonFetch(`/agents/${encodeURIComponent(payload.name)}`, {
+    const response = await daemonFetch(routes.agent(payload.workspaceId, payload.agent), {
       method: "PATCH",
       headers: {
         "Content-Type": "application/json",
@@ -873,16 +1104,14 @@ function registerIpcHandlers(): void {
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(errText || `Failed to update worker: ${response.status}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível atualizar o worker: ${response.status}`));
     }
 
     return (await response.json()) as AgentState;
   });
 
-  ipcMain.handle(IPC.WORKER_ASK, async (_event, payload: WorkerAskPayload) => {
-    const url = `/agents/${encodeURIComponent(payload.name)}/ask`;
-    const response = await daemonFetch(url, {
+  ipcMain.handle(IPC.WORKER_ASK, async (_event, payload: WorkerAskPayload): Promise<{ turnId: string }> => {
+    const response = await daemonFetch(routes.agentAsk(payload.workspaceId, payload.agent), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -891,76 +1120,69 @@ function registerIpcHandlers(): void {
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to ask worker ${payload.name}: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível enviar mensagem ao worker: ${response.status}`));
     }
 
     return (await response.json()) as { turnId: string };
   });
 
-  ipcMain.handle(IPC.WORKER_STOP, async (_event, name: string) => {
-    const url = `/agents/${encodeURIComponent(name)}/stop`;
-    const response = await daemonFetch(url, {
+  ipcMain.handle(IPC.WORKER_STOP, async (_event, workspaceId: string, agent: string): Promise<any> => {
+    const response = await daemonFetch(routes.agentStop(workspaceId, agent), {
       method: "POST",
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to stop worker ${name}: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível parar o worker: ${response.status}`));
     }
 
     return await response.json();
   });
 
-  ipcMain.handle(IPC.WORKER_DELETE, async (_event, name: string): Promise<void> => {
-    const response = await daemonFetch(`/agents/${encodeURIComponent(name)}`, { method: "DELETE" });
+  ipcMain.handle(IPC.WORKER_DELETE, async (_event, workspaceId: string, agent: string): Promise<void> => {
+    const response = await daemonFetch(routes.agent(workspaceId, agent), { method: "DELETE" });
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Não foi possível excluir o worker ${name}: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível excluir o worker: ${response.status}`));
     }
   });
 
   // Notes
-  ipcMain.handle(IPC.NOTES_LIST, async (): Promise<NoteSummary[]> => {
-    const response = await daemonFetch("/notes", { method: "GET" });
+  ipcMain.handle(IPC.NOTES_LIST, async (_event, workspaceId: string): Promise<NoteSummary[]> => {
+    const response = await daemonFetch(routes.notes(workspaceId), { method: "GET" });
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to list notes: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível listar as notas: ${response.status}`));
     }
     return (await response.json()) as NoteSummary[];
   });
 
-  ipcMain.handle(IPC.NOTE_READ, async (_event, name: string): Promise<Note> => {
-    const response = await daemonFetch(`/notes/${encodeURIComponent(name)}`, { method: "GET" });
+  ipcMain.handle(IPC.NOTE_READ, async (_event, workspaceId: string, name: string): Promise<Note> => {
+    const response = await daemonFetch(routes.note(workspaceId, name), { method: "GET" });
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to read note ${name}: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível ler a nota: ${response.status}`));
     }
     return (await response.json()) as Note;
   });
 
   ipcMain.handle(IPC.NOTE_WRITE, async (_event, payload: NoteWritePayload): Promise<Note> => {
-    const response = await daemonFetch(`/notes/${encodeURIComponent(payload.name)}`, {
+    const response = await daemonFetch(routes.note(payload.workspaceId, payload.name), {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
+        [AUTHOR_HEADER]: USER_AUTHOR,
       },
       body: JSON.stringify({ content: payload.content }),
     });
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to write note ${payload.name}: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível salvar a nota: ${response.status}`));
     }
     return (await response.json()) as Note;
   });
 
-  ipcMain.handle(IPC.NOTE_DELETE, async (_event, name: string): Promise<boolean> => {
-    const response = await daemonFetch(`/notes/${encodeURIComponent(name)}`, {
+  ipcMain.handle(IPC.NOTE_DELETE, async (_event, workspaceId: string, name: string): Promise<boolean> => {
+    const response = await daemonFetch(routes.note(workspaceId, name), {
       method: "DELETE",
     });
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Failed to delete note ${name}: ${response.status} ${errText}`);
+      throw new Error(await extractDaemonError(response, `Não foi possível excluir a nota: ${response.status}`));
     }
     return true;
   });
@@ -977,19 +1199,48 @@ function registerIpcHandlers(): void {
     }
   });
 
-  ipcMain.handle(IPC.APP_OPEN_FOLDER, async (_event, key: FolderKey): Promise<void> => {
+  ipcMain.handle(IPC.APP_OPEN_FOLDER, async (_event, key: FolderKey, workspaceId?: string): Promise<void> => {
     let targetDir: string;
     if (key === "dados") {
       targetDir = sinapseDir();
-    } else if (key === "cerebro") {
-      targetDir = brainCwd();
+    } else if (key === "projeto") {
+      if (!workspaceId) {
+        throw new Error("workspaceId é necessário para abrir a pasta do projeto");
+      }
+      const res = await daemonFetch(routes.workspace(workspaceId));
+      if (!res.ok) {
+        throw new Error(await extractDaemonError(res, "Workspace não encontrado"));
+      }
+      const ws = (await res.json()) as Workspace;
+      targetDir = ws.folder;
+    } else if (key === "orquestrador") {
+      if (!workspaceId) {
+        throw new Error("workspaceId é necessário para abrir a pasta do orquestrador");
+      }
+      targetDir = brainDir(workspaceId);
     } else if (key === "notas") {
-      targetDir = path.join(sinapseDir(), "notes");
+      if (!workspaceId) {
+        throw new Error("workspaceId é necessário para abrir a pasta de notas");
+      }
+      targetDir = path.join(sinapseDir(), "workspaces", workspaceId, "notes");
     } else {
       throw new Error(`Pasta inválida: ${String(key)}`);
     }
-    fs.mkdirSync(targetDir, { recursive: true });
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
     await shell.openPath(targetDir);
+  });
+
+  ipcMain.handle(IPC.APP_PICK_FOLDER, async (): Promise<string | null> => {
+    if (!mainWindow) return null;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (result.canceled || result.filePaths.length === 0) {
+      return null;
+    }
+    return result.filePaths[0];
   });
 }
 
@@ -999,7 +1250,7 @@ async function findRunningDaemon(): Promise<DaemonInfo | null> {
     const raw = fs.readFileSync(path.join(sinapseDir(), "daemon.json"), "utf8");
     const { port, token } = JSON.parse(raw);
     if (!port || !token) return null;
-    const res = await fetch(`http://127.0.0.1:${port}/agents`, {
+    const res = await fetch(`http://127.0.0.1:${port}${routes.health()}`, {
       headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(1000),
     });
@@ -1011,7 +1262,6 @@ async function findRunningDaemon(): Promise<DaemonInfo | null> {
 
 async function init(): Promise<void> {
   settings = loadSettings();
-  brainModel = settings.brainModel ?? null;
 
   try {
     const running = await findRunningDaemon();
@@ -1031,7 +1281,27 @@ async function init(): Promise<void> {
 
   registerIpcHandlers();
   createWindow();
-  spawnClaudePTY(brainModel, null);
+
+  // On startup, after the daemon is ready, start only the active workspace's brain.
+  if (daemonInfo) {
+    try {
+      const listRes = await daemonFetch(routes.workspaces());
+      if (listRes.ok) {
+        const list = (await listRes.json()) as Workspace[];
+        if (list.length > 0) {
+          let activeWs = list.find((w) => w.id === settings.activeWorkspaceId);
+          if (!activeWs) {
+            activeWs = list[0];
+            settings.activeWorkspaceId = activeWs.id;
+            saveSettings(settings);
+          }
+          await spawnBrain(activeWs);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to initialize active workspace brain:", err);
+    }
+  }
 
   if (brainUsageTimer) {
     clearInterval(brainUsageTimer);
@@ -1092,5 +1362,6 @@ app.on("before-quit", (event) => {
   }
   const timeout = new Promise((resolve) => setTimeout(resolve, 3000));
   const daemonDone = ownsDaemon ? shutdownDaemon() : Promise.resolve();
-  Promise.race([Promise.all([killBrain(), daemonDone]), timeout]).finally(() => app.quit());
+  const killAllBrains = Promise.all(Array.from(brains.keys()).map((wsId) => killBrain(wsId)));
+  Promise.race([Promise.all([killAllBrains, daemonDone]), timeout]).finally(() => app.quit());
 });

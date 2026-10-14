@@ -5,26 +5,49 @@ import type {
   DaemonDetails,
   Autonomy,
 } from "../../shared/ipc";
-import type { ContextUsage } from "@sinapse/core";
+import type { ContextUsage, Workspace } from "@sinapse/core";
 import { ModelSelect } from "./ModelSelect";
 import { ContextMeter } from "./ContextMeter";
 
 export interface SettingsScreenProps {
   onClose: () => void;
+  activeWorkspaceId: string;
+  workspaces: Workspace[];
+  onWorkspaceUpdated?: (ws: Workspace) => void;
 }
 
-type SettingsSection = "cerebro" | "workers" | "daemon" | "aparencia";
+type SettingsSection = "orquestrador" | "workers" | "daemon" | "aparencia";
 
-export function SettingsScreen({ onClose }: SettingsScreenProps) {
-  const [activeSection, setActiveSection] = useState<SettingsSection>("cerebro");
+function abbreviateFolder(folder: string): string {
+  if (!folder) return "";
+  return folder.replace(/^\/(home|Users)\/[^/]+/, "~");
+}
+
+export function SettingsScreen({
+  onClose,
+  activeWorkspaceId,
+  workspaces,
+  onWorkspaceUpdated,
+}: SettingsScreenProps) {
+  const [activeSection, setActiveSection] = useState<SettingsSection>("orquestrador");
   const [settings, setSettings] = useState<DesktopSettings | null>(null);
 
-  // Status message
+  // Status messages
   const [savedNotice, setSavedNotice] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const savedTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Brain section details
+  // Active workspace state
+  const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) || null;
+  const [nameInput, setNameInput] = useState(activeWorkspace?.name || "");
+
+  useEffect(() => {
+    if (activeWorkspace?.name) {
+      setNameInput(activeWorkspace.name);
+    }
+  }, [activeWorkspace?.name]);
+
+  // Orchestrator details
   const [brainUsage, setBrainUsage] = useState<ContextUsage | undefined>(undefined);
   const [resolvedBrainModel, setResolvedBrainModel] = useState<string | null>(null);
 
@@ -32,35 +55,46 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
   const [daemonDetails, setDaemonDetails] = useState<DaemonDetails | null>(null);
   const [daemonConnected, setDaemonConnected] = useState<boolean>(true);
 
-  // Workers folder local input
-  const [folderInput, setFolderInput] = useState("");
+  const triggerSavedNotice = () => {
+    setSavedNotice(true);
+    if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
+    savedTimerRef.current = setTimeout(() => {
+      setSavedNotice(false);
+    }, 2000);
+  };
 
   // Load settings and listeners
   useEffect(() => {
     window.sinapse?.settings?.get().then((s) => {
       setSettings(s);
-      setFolderInput(s.workerDefaults.cwd || "");
     });
 
     const unsubSettings = window.sinapse?.settings?.onChanged((s) => {
       setSettings(s);
     });
 
-    // Brain info
-    window.sinapse?.brain?.getInfo().then((info) => {
-      if (info) {
-        setBrainUsage(info.usage);
-        setResolvedBrainModel(info.usage?.model ?? info.model ?? null);
+    // Brain info for active workspace
+    if (activeWorkspaceId) {
+      window.sinapse?.brain?.getInfo(activeWorkspaceId).then((info) => {
+        if (info) {
+          setBrainUsage(info.usage);
+          setResolvedBrainModel(info.usage?.model ?? info.model ?? null);
+        }
+      });
+    }
+
+    const unsubUsage = window.sinapse?.brain?.onUsage((wsId, u) => {
+      if (wsId === activeWorkspaceId) {
+        setBrainUsage(u);
+        if (u.model) setResolvedBrainModel(u.model);
       }
     });
 
-    const unsubUsage = window.sinapse?.brain?.onUsage((u) => {
-      setBrainUsage(u);
-      if (u.model) setResolvedBrainModel(u.model);
-    });
-
     const unsubInfo = window.sinapse?.brain?.onInfoChanged((info) => {
-      setResolvedBrainModel(info.model ?? null);
+      if (info.workspaceId === activeWorkspaceId) {
+        setResolvedBrainModel(info.model ?? null);
+        if (info.usage !== undefined) setBrainUsage(info.usage);
+      }
     });
 
     // Daemon details & status
@@ -77,14 +111,7 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
       if (unsubStatus) unsubStatus();
       if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
     };
-  }, []);
-
-  // Update folder input when settings change externally
-  useEffect(() => {
-    if (settings?.workerDefaults?.cwd !== undefined) {
-      setFolderInput(settings.workerDefaults.cwd);
-    }
-  }, [settings?.workerDefaults?.cwd]);
+  }, [activeWorkspaceId]);
 
   // Handle escape to close
   useEffect(() => {
@@ -105,35 +132,100 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
       if (updated) {
         setSettings(updated);
       }
-      setSavedNotice(true);
-      if (savedTimerRef.current) clearTimeout(savedTimerRef.current);
-      savedTimerRef.current = setTimeout(() => {
-        setSavedNotice(false);
-      }, 2000);
+      triggerSavedNotice();
     } catch (err: any) {
       console.error("Erro ao salvar configurações:", err);
       setErrorMessage(err?.message || "Erro ao salvar alterações");
     }
   };
 
-  const handleBrainModelChange = async (newModel: string | null) => {
+  const handleNameSave = async () => {
+    const trimmed = nameInput.trim();
+    if (!trimmed || !activeWorkspace || trimmed === activeWorkspace.name) return;
+
+    setErrorMessage(null);
+    try {
+      const updated = await window.sinapse?.workspaces?.update({
+        workspaceId: activeWorkspace.id,
+        name: trimmed,
+      });
+      if (updated) {
+        onWorkspaceUpdated?.(updated);
+        triggerSavedNotice();
+      }
+    } catch (err: any) {
+      console.error("Erro ao atualizar nome do workspace:", err);
+      setErrorMessage(err?.message || "Erro ao atualizar nome");
+      setNameInput(activeWorkspace.name);
+    }
+  };
+
+  const handleProviderChange = async (newProvider: "claude" | "agy") => {
+    if (!activeWorkspace) return;
+    const currentProvider = activeWorkspace.orchestrator?.provider ?? "claude";
+    if (newProvider === currentProvider) return;
+
     const confirmed = window.confirm(
-      "Trocar o modelo reinicia o terminal do cérebro. A conversa continua. Continuar?"
+      "Trocar o orquestrador reinicia o terminal deste workspace e começa uma conversa nova. Continuar?"
     );
     if (!confirmed) return;
 
-    await savePatch({
-      brainModel: newModel === "" ? null : newModel,
-    });
-  };
-
-  const handleWorkerFolderSave = () => {
-    if (folderInput !== settings?.workerDefaults?.cwd) {
-      savePatch({
-        workerDefaults: { cwd: folderInput },
+    setErrorMessage(null);
+    try {
+      const updated = await window.sinapse?.workspaces?.update({
+        workspaceId: activeWorkspace.id,
+        orchestrator: {
+          provider: newProvider,
+          model: undefined,
+        },
       });
+      if (updated) {
+        onWorkspaceUpdated?.(updated);
+        triggerSavedNotice();
+      }
+    } catch (err: any) {
+      console.error("Erro ao alterar orquestrador:", err);
+      setErrorMessage(err?.message || "Erro ao alterar orquestrador");
     }
   };
+
+  const handleModelChange = async (newModel: string | null) => {
+    if (!activeWorkspace) return;
+    const currentProvider = activeWorkspace.orchestrator?.provider ?? "claude";
+    const currentModel = activeWorkspace.orchestrator?.model ?? null;
+    const normalizedNew = newModel?.trim() ? newModel.trim() : null;
+
+    if (normalizedNew === currentModel) return;
+
+    const confirmMsg =
+      currentProvider === "claude"
+        ? "Trocar o modelo reinicia o terminal deste workspace e retoma a conversa. Continuar?"
+        : "Trocar o modelo reinicia o terminal deste workspace. Continuar?";
+
+    const confirmed = window.confirm(confirmMsg);
+    if (!confirmed) return;
+
+    setErrorMessage(null);
+    try {
+      const updated = await window.sinapse?.workspaces?.update({
+        workspaceId: activeWorkspace.id,
+        orchestrator: {
+          provider: currentProvider,
+          model: normalizedNew || undefined,
+        },
+      });
+      if (updated) {
+        onWorkspaceUpdated?.(updated);
+        triggerSavedNotice();
+      }
+    } catch (err: any) {
+      console.error("Erro ao alterar modelo:", err);
+      setErrorMessage(err?.message || "Erro ao alterar modelo");
+    }
+  };
+
+  const currentProvider = activeWorkspace?.orchestrator?.provider ?? "claude";
+  const currentModel = activeWorkspace?.orchestrator?.model ?? null;
 
   return (
     <div
@@ -170,11 +262,11 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
             <button
               type="button"
               className={`settings-nav-btn ${
-                activeSection === "cerebro" ? "active" : ""
+                activeSection === "orquestrador" ? "active" : ""
               }`}
-              onClick={() => setActiveSection("cerebro")}
+              onClick={() => setActiveSection("orquestrador")}
             >
-              Cérebro
+              Orquestrador
             </button>
             <button
               type="button"
@@ -207,55 +299,144 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
 
           {/* Section Content */}
           <div className="settings-content">
-            {/* 1. Cérebro */}
-            {activeSection === "cerebro" && (
+            {/* 1. Orquestrador (para o workspace ativo) */}
+            {activeSection === "orquestrador" && (
               <div className="settings-section">
-                <div className="settings-row">
-                  <div className="settings-field-info">
-                    <label className="settings-label" htmlFor="brain-model-select">
-                      Modelo do Cérebro
-                    </label>
-                    <p className="settings-description">
-                      Define o modelo Claude utilizado pelo cérebro orquestrador.
-                    </p>
-                  </div>
-                  <div className="settings-field-control">
-                    <ModelSelect
-                      id="brain-model-select"
-                      provider="claude"
-                      value={settings?.brainModel ?? null}
-                      resolvedModel={resolvedBrainModel ?? undefined}
-                      onChange={handleBrainModelChange}
-                      className="settings-select-control"
-                    />
-                  </div>
-                </div>
+                {activeWorkspace ? (
+                  <>
+                    <div className="settings-row">
+                      <div className="settings-field-info">
+                        <label className="settings-label" htmlFor="workspace-name-setting">
+                          Nome do workspace
+                        </label>
+                        <p className="settings-description">
+                          Nome de exibição deste workspace. Salvo ao sair ou pressionar Enter.
+                        </p>
+                      </div>
+                      <div className="settings-field-control">
+                        <input
+                          id="workspace-name-setting"
+                          type="text"
+                          value={nameInput}
+                          onChange={(e) => setNameInput(e.target.value)}
+                          onBlur={handleNameSave}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              handleNameSave();
+                            }
+                          }}
+                          className="settings-input"
+                        />
+                      </div>
+                    </div>
 
-                <div className="settings-row">
-                  <div className="settings-field-info">
-                    <span className="settings-label">Modelo resolvido</span>
-                    <p className="settings-description">
-                      Modelo em execução atualmente na sessão do cérebro.
-                    </p>
-                  </div>
-                  <div className="settings-field-control">
-                    <span className="settings-badge-mono">
-                      {resolvedBrainModel ?? "padrão"}
-                    </span>
-                  </div>
-                </div>
+                    <div className="settings-row">
+                      <div className="settings-field-info">
+                        <span className="settings-label">Pasta do projeto</span>
+                        <p className="settings-description">
+                          Diretório raiz do projeto vinculado a este workspace.
+                        </p>
+                      </div>
+                      <div className="settings-field-control settings-folder-control">
+                        <span className="settings-badge-mono" title={activeWorkspace.folder}>
+                          {abbreviateFolder(activeWorkspace.folder)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            window.sinapse?.app?.openFolder("projeto", activeWorkspace.id)
+                          }
+                          className="settings-action-btn"
+                        >
+                          Abrir
+                        </button>
+                      </div>
+                    </div>
 
-                <div className="settings-row">
-                  <div className="settings-field-info">
-                    <span className="settings-label">Janela de contexto</span>
-                    <p className="settings-description">
-                      Consumo de tokens e uso do contexto do cérebro.
-                    </p>
-                  </div>
-                  <div className="settings-field-control settings-meter-wrapper">
-                    <ContextMeter usage={brainUsage} />
-                  </div>
-                </div>
+                    <div className="settings-row">
+                      <div className="settings-field-info">
+                        <label className="settings-label">Provedor do orquestrador</label>
+                        <p className="settings-description">
+                          Claude Code ou AGY para o terminal orquestrador deste workspace.
+                        </p>
+                      </div>
+                      <div className="settings-field-control">
+                        <div className="segmented-control">
+                          <button
+                            type="button"
+                            className={`segmented-btn ${
+                              currentProvider === "claude" ? "active" : ""
+                            }`}
+                            onClick={() => handleProviderChange("claude")}
+                          >
+                            Claude Code
+                          </button>
+                          <button
+                            type="button"
+                            className={`segmented-btn ${
+                              currentProvider === "agy" ? "active" : ""
+                            }`}
+                            onClick={() => handleProviderChange("agy")}
+                          >
+                            AGY
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="settings-row">
+                      <div className="settings-field-info">
+                        <label className="settings-label" htmlFor="orchestrator-model-select">
+                          Modelo do orquestrador
+                        </label>
+                        <p className="settings-description">
+                          Modelo LLM configurado para este orquestrador.
+                        </p>
+                      </div>
+                      <div className="settings-field-control">
+                        <ModelSelect
+                          id="orchestrator-model-select"
+                          provider={currentProvider}
+                          value={currentModel}
+                          resolvedModel={resolvedBrainModel ?? undefined}
+                          onChange={handleModelChange}
+                          className="settings-select-control"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="settings-row">
+                      <div className="settings-field-info">
+                        <span className="settings-label">Modelo resolvido</span>
+                        <p className="settings-description">
+                          Modelo em execução atualmente na sessão do orquestrador.
+                        </p>
+                      </div>
+                      <div className="settings-field-control">
+                        <span className="settings-badge-mono">
+                          {resolvedBrainModel ?? "padrão"}
+                        </span>
+                      </div>
+                    </div>
+
+                    {currentProvider === "claude" && (
+                      <div className="settings-row">
+                        <div className="settings-field-info">
+                          <span className="settings-label">Janela de contexto</span>
+                          <p className="settings-description">
+                            Consumo de tokens e uso do contexto do orquestrador.
+                          </p>
+                        </div>
+                        <div className="settings-field-control settings-meter-wrapper">
+                          <ContextMeter usage={brainUsage} />
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="settings-text">Nenhum workspace ativo selecionado.</div>
+                )}
               </div>
             )}
 
@@ -362,38 +543,10 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
                       {settings?.workerDefaults?.autonomy === "read" &&
                         "Somente leitura: Executa comandos e consultas sem modificar arquivos."}
                       {settings?.workerDefaults?.autonomy === "edit" &&
-                        "Editar (padrão): Pode ler e editar arquivos no diretório de trabalho."}
+                        "Editar (padrão): Pode ler e editar arquivos no diretório do workspace."}
                       {settings?.workerDefaults?.autonomy === "full" &&
                         "Total: Acesso irrestrito ao sistema dentro do escopo do worker."}
                     </div>
-                  </div>
-                </div>
-
-                <div className="settings-row">
-                  <div className="settings-field-info">
-                    <label className="settings-label" htmlFor="settings-worker-cwd">
-                      Pasta de trabalho padrão
-                    </label>
-                    <p className="settings-description">
-                      Diretório raiz inicial para execução dos workers.
-                    </p>
-                  </div>
-                  <div className="settings-field-control">
-                    <input
-                      id="settings-worker-cwd"
-                      type="text"
-                      value={folderInput}
-                      onChange={(e) => setFolderInput(e.target.value)}
-                      onBlur={handleWorkerFolderSave}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          handleWorkerFolderSave();
-                        }
-                      }}
-                      placeholder="/caminho/absoluto"
-                      className="settings-input settings-input-mono"
-                    />
                   </div>
                 </div>
               </div>
@@ -450,7 +603,7 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
                 <div className="settings-table-row">
                   <div className="settings-dir-label">Dados</div>
                   <div className="settings-dir-path" title={daemonDetails?.dataDir}>
-                    {daemonDetails?.dataDir ?? "—"}
+                    {daemonDetails?.dataDir ? abbreviateFolder(daemonDetails.dataDir) : "—"}
                   </div>
                   <button
                     type="button"
@@ -461,33 +614,41 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
                   </button>
                 </div>
 
-                <div className="settings-table-row">
-                  <div className="settings-dir-label">Cérebro</div>
-                  <div className="settings-dir-path" title={daemonDetails?.brainDir}>
-                    {daemonDetails?.brainDir ?? "—"}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => window.sinapse?.app?.openFolder("cerebro")}
-                    className="settings-action-btn"
-                  >
-                    Abrir
-                  </button>
-                </div>
+                {activeWorkspace && (
+                  <>
+                    <div className="settings-table-row">
+                      <div className="settings-dir-label">Orquestrador</div>
+                      <div className="settings-dir-path">
+                        Sessão do orquestrador ({activeWorkspace.name})
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          window.sinapse?.app?.openFolder("orquestrador", activeWorkspace.id)
+                        }
+                        className="settings-action-btn"
+                      >
+                        Abrir
+                      </button>
+                    </div>
 
-                <div className="settings-table-row">
-                  <div className="settings-dir-label">Notas</div>
-                  <div className="settings-dir-path" title={daemonDetails?.notesDir}>
-                    {daemonDetails?.notesDir ?? "—"}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => window.sinapse?.app?.openFolder("notas")}
-                    className="settings-action-btn"
-                  >
-                    Abrir
-                  </button>
-                </div>
+                    <div className="settings-table-row">
+                      <div className="settings-dir-label">Notas</div>
+                      <div className="settings-dir-path">
+                        Notas do workspace ({activeWorkspace.name})
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          window.sinapse?.app?.openFolder("notas", activeWorkspace.id)
+                        }
+                        className="settings-action-btn"
+                      >
+                        Abrir
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             )}
 
@@ -579,7 +740,7 @@ export function SettingsScreen({ onClose }: SettingsScreenProps) {
                       Tamanho da fonte do terminal
                     </label>
                     <p className="settings-description">
-                      Tamanho em pixels do terminal do cérebro (10px a 22px).
+                      Tamanho em pixels do terminal do orquestrador (10px a 22px).
                     </p>
                   </div>
                   <div className="settings-field-control settings-range-control">

@@ -5,4 +5,5 @@ export { start as startDaemon, shutdown as shutdownDaemon } from "./daemon/serve
 export { agentEnv, killTree, sweepEnvMarker } from "./process.js";
 export { estimateContextWindow } from "./context.js";
 export { sinapseDir } from "./paths.js";
+export { routes, AUTHOR_HEADER, ORCHESTRATOR_AUTHOR, USER_AUTHOR, ENV } from "./routes.js";
 

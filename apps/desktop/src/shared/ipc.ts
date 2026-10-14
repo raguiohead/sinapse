@@ -1,16 +1,25 @@
-import type { ContextUsage } from "@sinapse/core";
+import type { ContextUsage, OrchestratorConfig } from "@sinapse/core";
 
 export const IPC = {
+  // Orchestrator ("brain") terminals — one per workspace, all calls carry the workspaceId.
   BRAIN_DATA: "brain:data",
   BRAIN_RESIZE: "brain:resize",
   BRAIN_INPUT: "brain:input",
   BRAIN_INFO: "brain:info",
-  BRAIN_SET_MODEL: "brain:set-model",
+  BRAIN_REPLAY: "brain:replay",
   BRAIN_USAGE: "brain:usage",
   BRAIN_INFO_CHANGED: "brain:info-changed",
   DAEMON_INFO: "daemon:info",
   DAEMON_EVENT: "daemon:event",
   DAEMON_STATUS: "daemon:status",
+  DAEMON_DETAILS: "daemon:details",
+  WORKSPACES_LIST: "workspaces:list",
+  WORKSPACES_CREATE: "workspaces:create",
+  WORKSPACES_UPDATE: "workspaces:update",
+  WORKSPACES_DELETE: "workspaces:delete",
+  WORKSPACE_GET_ACTIVE: "workspace:get-active",
+  WORKSPACE_SET_ACTIVE: "workspace:set-active",
+  WORKSPACE_ACTIVE_CHANGED: "workspace:active-changed",
   WORKER_ASK: "worker:ask",
   WORKER_SPAWN: "worker:spawn",
   WORKER_LIST: "worker:list",
@@ -24,6 +33,7 @@ export const IPC = {
   NOTE_DELETE: "note:delete",
   APP_OPEN_EXTERNAL: "app:open-external",
   APP_OPEN_FOLDER: "app:open-folder",
+  APP_PICK_FOLDER: "app:pick-folder",
   SETTINGS_GET: "settings:get",
   SETTINGS_SET: "settings:set",
   SETTINGS_CHANGED: "settings:changed",
@@ -32,18 +42,16 @@ export const IPC = {
   WINDOW_CLOSE: "window:close",
   WINDOW_MAXIMIZED: "window:maximized",
   WINDOW_IS_MAXIMIZED: "window:is-maximized",
-  DAEMON_DETAILS: "daemon:details",
 } as const;
 
 export type Autonomy = "read" | "edit" | "full";
 
+/** New workers default to the active workspace's folder; there is no global default folder. */
 export interface WorkerDefaults {
   provider: "claude" | "agy";
   /** Undefined = provider default. */
   model?: string;
   autonomy: Autonomy;
-  /** Absolute path. */
-  cwd: string;
 }
 
 export interface AppearanceSettings {
@@ -53,32 +61,25 @@ export interface AppearanceSettings {
   terminalFontSize: number;
 }
 
-/** Persisted in <sinapseDir>/desktop.json. */
+/** Persisted in <sinapseDir>/desktop.json. The orchestrator model lives in each workspace, not here. */
 export interface DesktopSettings {
-  /** Undefined = account default. */
-  brainModel?: string;
+  activeWorkspaceId?: string;
   workerDefaults: WorkerDefaults;
   appearance: AppearanceSettings;
 }
 
-/**
- * settings:set payload: any subset; nested objects merge field by field.
- * brainModel: null clears it (account default); a changed brainModel restarts the brain (resuming its session).
- */
+/** settings:set payload: any subset; nested objects merge field by field. Use workspace:set-active for the active workspace. */
 export interface DesktopSettingsPatch {
-  brainModel?: string | null;
   workerDefaults?: Partial<WorkerDefaults> & { model?: string | null };
   appearance?: Partial<AppearanceSettings>;
 }
 
-/** Only these known folders can be opened; the renderer never sends a path. */
-export type FolderKey = "dados" | "cerebro" | "notas";
+/** Only these known folders can be opened; the renderer never sends a path. Main resolves them from the registry. */
+export type FolderKey = "dados" | "projeto" | "orquestrador" | "notas";
 
 export interface DaemonDetails {
   port: number;
   dataDir: string;
-  brainDir: string;
-  notesDir: string;
   /** False when the app reuses a daemon started by the CLI. */
   ownsDaemon: boolean;
 }
@@ -88,14 +89,32 @@ export interface DaemonInfo {
   token: string;
 }
 
-export interface WorkerAskPayload {
+export interface WorkspaceCreatePayload {
   name: string;
+  /** Absolute path chosen by the user (app:pick-folder or typed); main/daemon validate it exists. */
+  folder: string;
+  orchestrator: OrchestratorConfig;
+}
+
+export interface WorkspaceUpdatePayload {
+  workspaceId: string;
+  name?: string;
+  /** Changing it restarts that workspace's orchestrator (Claude → Claude resumes its session; a provider change starts fresh). */
+  orchestrator?: OrchestratorConfig;
+}
+
+/** `agent` accepts the agentId (preferred from the canvas) or the name. */
+export interface WorkerAskPayload {
+  workspaceId: string;
+  agent: string;
   prompt: string;
 }
 
 export interface WorkerSpawnPayload {
+  workspaceId: string;
   name: string;
   provider: "claude" | "agy";
+  /** Defaults to the workspace folder when omitted. */
   cwd?: string;
   role: string;
   autonomy: Autonomy;
@@ -103,16 +122,23 @@ export interface WorkerSpawnPayload {
 }
 
 export interface WorkerUpdatePayload {
-  name: string;
+  workspaceId: string;
+  agent: string;
   model: string | null;
 }
 
 export interface NoteWritePayload {
+  workspaceId: string;
   name: string;
   content: string;
 }
 
 export interface BrainInfo {
+  workspaceId: string;
+  provider: "claude" | "agy";
+  /** Requested model; null = provider default. */
   model: string | null;
+  /** Claude only (read from its transcript); AGY has no usage. */
   usage?: ContextUsage;
+  running: boolean;
 }

@@ -2,7 +2,33 @@ export type Provider = "claude" | "codex" | "agy";
 export type AgentStatus = "idle" | "thinking" | "done" | "error" | "interrupted";
 export type Autonomy = "read" | "edit" | "full";
 
+/**
+ * Who created or changed something: "orquestrador" (the workspace's orchestrator), "usuario" (the canvas or a
+ * terminal without SINAPSE_AGENT_ID) or a worker's agentId. Comes from the X-Sinapse-Agent header (self-declared;
+ * the daemon is local and token-protected).
+ */
+export type Author = string;
+
+export interface OrchestratorConfig {
+  provider: "claude" | "agy";
+  /** Undefined = provider default. */
+  model?: string;
+}
+
+export interface Workspace {
+  /** /^[a-z0-9][a-z0-9_-]{0,63}$/ — used in paths. "geral" is the migrated default workspace. */
+  id: string;
+  /** Display name, 1–60 chars, unique case-insensitively. */
+  name: string;
+  /** Absolute path of the project folder. Fixed after creation; Sinapse never writes into it. */
+  folder: string;
+  orchestrator: OrchestratorConfig;
+  createdAt: number;
+}
+
 export interface AgentConfig {
+  workspaceId: string;
+  /** Unique within its workspace. */
   name: string;
   provider: Provider;
   cwd: string;
@@ -30,6 +56,7 @@ export interface AgentState extends AgentConfig {
   currentTurnId?: string;
   lastError?: string;
   usage?: ContextUsage;
+  createdBy?: Author;
 }
 
 export interface TurnEvent {
@@ -56,6 +83,8 @@ export interface AdapterRunOptions {
   autonomy: Autonomy;
   model?: string;
   timeoutMs?: number;
+  /** Extra env for the turn (SINAPSE_WORKSPACE, SINAPSE_AGENT_ID), applied on top of agentEnv(). */
+  env?: Record<string, string>;
 }
 
 export interface Adapter {
@@ -73,11 +102,16 @@ export interface ModelOption {
 export type ModelCatalog = Record<"claude" | "agy", ModelOption[]>;
 
 export interface NoteSummary {
+  workspaceId: string;
   /** File name without ".md"; only [a-z0-9-_] (lowercase), max 64 chars. */
   name: string;
   /** First "# " heading, or the name. */
   title: string;
   updatedAt: number;
+  /** Undefined when the note was created outside Sinapse. */
+  createdBy?: Author;
+  /** Other authors that wrote or appended later (no duplicates, excludes createdBy). */
+  contributors: Author[];
 }
 
 export interface Note extends NoteSummary {
@@ -85,12 +119,31 @@ export interface Note extends NoteSummary {
 }
 
 export type DaemonEvent =
-  | { kind: "agent_spawned"; agent: AgentState }
-  | { kind: "agent_updated"; agent: AgentState }
-  | { kind: "turn_started"; agentId: string; agentName: string; turnId: string; prompt: string }
-  | { kind: "turn_event"; agentId: string; agentName: string; turnId: string; event: TurnEvent }
+  | { kind: "workspace_created"; workspace: Workspace }
+  | { kind: "workspace_updated"; workspace: Workspace }
+  | { kind: "workspace_deleted"; workspaceId: string }
+  | { kind: "agent_spawned"; workspaceId: string; agent: AgentState }
+  | { kind: "agent_updated"; workspaceId: string; agent: AgentState }
+  | { kind: "agent_deleted"; workspaceId: string; agentId: string; agentName: string }
+  | {
+      kind: "turn_started";
+      workspaceId: string;
+      agentId: string;
+      agentName: string;
+      turnId: string;
+      prompt: string;
+    }
+  | {
+      kind: "turn_event";
+      workspaceId: string;
+      agentId: string;
+      agentName: string;
+      turnId: string;
+      event: TurnEvent;
+    }
   | {
       kind: "turn_finished";
+      workspaceId: string;
       agentId: string;
       agentName: string;
       turnId: string;
@@ -99,11 +152,12 @@ export type DaemonEvent =
       error?: string;
       usage?: ContextUsage;
     }
-  | { kind: "note_changed"; note: NoteSummary }
-  | { kind: "note_deleted"; name: string }
-  | { kind: "agent_deleted"; agentId: string; agentName: string };
+  /** `by`: who made this change (undefined for changes made outside Sinapse, seen by the file watcher). */
+  | { kind: "note_changed"; workspaceId: string; note: NoteSummary; by?: Author }
+  | { kind: "note_deleted"; workspaceId: string; name: string };
 
 export interface DaemonState {
+  workspaces: Record<string, Workspace>;
   agents: Record<string, AgentState>;
   port: number;
   token: string;

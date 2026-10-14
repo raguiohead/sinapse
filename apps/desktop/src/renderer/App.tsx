@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type FormEvent } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   ReactFlow,
   Background,
@@ -14,14 +14,17 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import type { DaemonEvent, AgentStatus } from "@sinapse/core";
+import type { DesktopSettings } from "../shared/ipc";
 
 import { BrainNode } from "./nodes/BrainNode";
 import { WorkerNode } from "./nodes/WorkerNode";
 import { NoteNode } from "./nodes/NoteNode";
 import { SynapseEdge } from "./edges/SynapseEdge";
-import { HeaderBar } from "./components/HeaderBar";
-import { ModelSelect } from "./components/ModelSelect";
-import type { WorkerSpawnPayload } from "../shared/ipc";
+import { TitleBar } from "./components/TitleBar";
+import { ContextMenu } from "./components/ContextMenu";
+import { NewWorkerDialog } from "./components/NewWorkerDialog";
+import { NewNoteDialog } from "./components/NewNoteDialog";
+import { SettingsScreen } from "./components/SettingsScreen";
 
 const nodeTypes = {
   brain: BrainNode,
@@ -43,8 +46,6 @@ const initialNodes: Node[] = [
 ];
 
 const initialEdges: Edge[] = [];
-
-const NOTE_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function AutoFit({
   workerCount,
@@ -101,21 +102,15 @@ export function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
 
   const [daemonConnected, setDaemonConnected] = useState(false);
+  const [settings, setSettings] = useState<DesktopSettings | null>(null);
 
-  // Worker spawn toolbar state
-  const [isWorkerToolbarOpen, setIsWorkerToolbarOpen] = useState(false);
-  const [name, setName] = useState("");
-  const [provider, setProvider] = useState<"claude" | "agy">("claude");
-  const [role, setRole] = useState("");
-  const [spawnModel, setSpawnModel] = useState<string | null>(null);
-  const [isSpawning, setIsSpawning] = useState(false);
-  const [workerErrorMessage, setWorkerErrorMessage] = useState<string | null>(null);
-
-  // Note creation toolbar state
-  const [isNoteToolbarOpen, setIsNoteToolbarOpen] = useState(false);
-  const [newNoteName, setNewNoteName] = useState("");
-  const [isCreatingNote, setIsCreatingNote] = useState(false);
-  const [noteErrorMessage, setNoteErrorMessage] = useState<string | null>(null);
+  // Modals and context menu state
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(
+    null
+  );
+  const [isNewWorkerDialogOpen, setIsNewWorkerDialogOpen] = useState(false);
+  const [isNewNoteDialogOpen, setIsNewNoteDialogOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   // Per-agent state tracking: status, log string, lastPrompt
   const agentStateMapRef = useRef<
@@ -124,6 +119,43 @@ export function App() {
 
   // Track active pulse timers per edge
   const edgeTimersRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
+
+  // Load settings once and apply motion dataset
+  useEffect(() => {
+    window.sinapse?.settings?.get().then((s) => {
+      if (s) {
+        setSettings(s);
+        if (s.appearance?.motion) {
+          document.documentElement.dataset.motion = s.appearance.motion;
+        }
+      }
+    });
+
+    const unsub = window.sinapse?.settings?.onChanged((s) => {
+      if (s) {
+        setSettings(s);
+        if (s.appearance?.motion) {
+          document.documentElement.dataset.motion = s.appearance.motion;
+        }
+      }
+    });
+
+    return () => {
+      if (unsub) unsub();
+    };
+  }, []);
+
+  // Global shortcut Ctrl+, (or Cmd+, on Mac) to open settings
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === ",") {
+        e.preventDefault();
+        setIsSettingsOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -622,67 +654,10 @@ export function App() {
     };
   }, [syncExistingWorkers, syncNotes, handleDaemonEvent]);
 
-  const handleSpawn = async (e: FormEvent) => {
+  const handlePaneContextMenu = useCallback((e: React.MouseEvent | MouseEvent) => {
     e.preventDefault();
-    const workerName = name.trim();
-    if (!workerName || isSpawning) return;
-
-    setIsSpawning(true);
-    setWorkerErrorMessage(null);
-
-    try {
-      const payload: WorkerSpawnPayload = {
-        name: workerName,
-        provider,
-        cwd: "",
-        role: role.trim() || "Agente worker",
-        autonomy: "edit" as const,
-        ...(spawnModel ? { model: spawnModel } : {}),
-      };
-
-      await window.sinapse?.workers?.spawn(payload);
-
-      setName("");
-      setRole("");
-      setSpawnModel(null);
-      setIsWorkerToolbarOpen(false);
-    } catch (err: any) {
-      console.error("Erro ao criar worker:", err);
-      setWorkerErrorMessage(err?.message || "Erro ao criar worker");
-    } finally {
-      setIsSpawning(false);
-    }
-  };
-
-  const handleCreateNote = async (e: FormEvent) => {
-    e.preventDefault();
-    const raw = newNoteName.toLowerCase().trim();
-    if (!raw || isCreatingNote) return;
-
-    if (!NOTE_NAME_REGEX.test(raw)) {
-      setNoteErrorMessage(
-        "Nome inválido. Use 1 a 64 caracteres: letras minúsculas, números, - ou _, começando por letra ou número."
-      );
-      return;
-    }
-
-    setIsCreatingNote(true);
-    setNoteErrorMessage(null);
-
-    try {
-      await window.sinapse?.notes?.write({
-        name: raw,
-        content: `# ${raw}\n\n`,
-      });
-      setNewNoteName("");
-      setIsNoteToolbarOpen(false);
-    } catch (err: any) {
-      console.error("Erro ao criar nota:", err);
-      setNoteErrorMessage(err?.message || "Erro ao criar nota");
-    } finally {
-      setIsCreatingNote(false);
-    }
-  };
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  }, []);
 
   const activeCount = nodes.filter(
     (n) => n.type === "worker" && n.data?.status === "thinking"
@@ -693,167 +668,72 @@ export function App() {
 
   return (
     <div className="canvas-container">
-      {/* Top-left Header Bar */}
-      <HeaderBar connected={daemonConnected} activeCount={activeCount} />
+      {/* Top 40px Chromatic Title Bar */}
+      <TitleBar
+        connected={daemonConnected}
+        activeCount={activeCount}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        chromaticBar={settings?.appearance?.chromaticBar ?? "animada"}
+      />
 
-      {/* Floating Toolbar at Top-Right */}
-      <div className="spawn-toolbar-container">
-        <div className="toolbar-pills-row">
-          <button
-            type="button"
-            onClick={() => {
-              setIsWorkerToolbarOpen(!isWorkerToolbarOpen);
-              setIsNoteToolbarOpen(false);
-            }}
-            className={`toolbar-pill-btn ${isWorkerToolbarOpen ? "pill-active" : ""}`}
-          >
-            <span className="pill-plus">+</span> worker
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setIsNoteToolbarOpen(!isNoteToolbarOpen);
-              setIsWorkerToolbarOpen(false);
-            }}
-            className={`toolbar-pill-btn ${isNoteToolbarOpen ? "pill-active" : ""}`}
-          >
-            <span className="pill-plus">+</span> nota
-          </button>
-        </div>
-
-        {/* Worker Creation Panel */}
-        {isWorkerToolbarOpen && (
-          <div className="spawn-toolbar-panel">
-            <div className="toolbar-header">
-              <span className="toolbar-title">+ Novo Worker</span>
-              <button
-                type="button"
-                onClick={() => setIsWorkerToolbarOpen(false)}
-                className="toolbar-close-btn"
-                title="Fechar"
-              >
-                ✕
-              </button>
-            </div>
-            <form onSubmit={handleSpawn} className="toolbar-form">
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Nome do worker (ex: revisor)"
-                className="toolbar-input"
-                required
-                autoFocus
-              />
-
-              <select
-                value={provider}
-                onChange={(e) => {
-                  setProvider(e.target.value as "claude" | "agy");
-                  setSpawnModel(null);
-                }}
-                className="toolbar-select"
-              >
-                <option value="claude">Claude</option>
-                <option value="agy">AGY (Gemini 3.8 Flash)</option>
-              </select>
-
-              <ModelSelect
-                provider={provider}
-                value={spawnModel}
-                onChange={(m) => setSpawnModel(m)}
-                className="toolbar-model-select"
-              />
-
-              <input
-                type="text"
-                value={role}
-                onChange={(e) => setRole(e.target.value)}
-                placeholder="Função (ex: Revisor de código)"
-                className="toolbar-input"
-              />
-
-              <div className="toolbar-actions">
-                <button
-                  type="submit"
-                  disabled={isSpawning || !name.trim()}
-                  className="toolbar-spawn-btn"
-                >
-                  {isSpawning ? "Criando..." : "+ Criar"}
-                </button>
-              </div>
-            </form>
-            {workerErrorMessage && (
-              <div className="toolbar-error">{workerErrorMessage}</div>
-            )}
-          </div>
-        )}
-
-        {/* Note Creation Panel */}
-        {isNoteToolbarOpen && (
-          <div className="spawn-toolbar-panel">
-            <div className="toolbar-header">
-              <span className="toolbar-title">+ Nova Nota</span>
-              <button
-                type="button"
-                onClick={() => setIsNoteToolbarOpen(false)}
-                className="toolbar-close-btn"
-                title="Fechar"
-              >
-                ✕
-              </button>
-            </div>
-            <form onSubmit={handleCreateNote} className="toolbar-form">
-              <input
-                type="text"
-                value={newNoteName}
-                onChange={(e) => {
-                  setNewNoteName(e.target.value.toLowerCase());
-                  setNoteErrorMessage(null);
-                }}
-                placeholder="identificador-da-nota"
-                className="toolbar-input"
-                required
-                autoFocus
-              />
-              <div className="toolbar-hint">
-                Apenas letras minúsculas, números, - e _ (máx. 64)
-              </div>
-              <div className="toolbar-actions">
-                <button
-                  type="submit"
-                  disabled={isCreatingNote || !newNoteName.trim()}
-                  className="toolbar-spawn-btn"
-                >
-                  {isCreatingNote ? "Criando..." : "+ Criar"}
-                </button>
-              </div>
-            </form>
-            {noteErrorMessage && (
-              <div className="toolbar-error">{noteErrorMessage}</div>
-            )}
-          </div>
-        )}
+      {/* ReactFlow Canvas container takes remaining viewport below title bar */}
+      <div className="flow-canvas-wrapper">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          onPaneContextMenu={handlePaneContextMenu}
+          onPaneClick={() => setContextMenu(null)}
+          onMoveStart={() => setContextMenu(null)}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          proOptions={{ hideAttribution: true }}
+          fitView
+          fitViewOptions={{ padding: 0.2 }}
+          minZoom={0.2}
+          maxZoom={2}
+        >
+          <Background color="#151a28" gap={22} size={1.5} />
+          <Controls className="flow-controls" />
+          <AutoFit workerCount={workerCount} noteCount={noteCount} />
+        </ReactFlow>
       </div>
 
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
-        nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
-        proOptions={{ hideAttribution: true }}
-        fitView
-        fitViewOptions={{ padding: 0.2 }}
-        minZoom={0.2}
-        maxZoom={2}
-      >
-        <Background color="#151a28" gap={22} size={1.5} />
-        <Controls className="flow-controls" />
-        <AutoFit workerCount={workerCount} noteCount={noteCount} />
-      </ReactFlow>
+      {/* Context Menu */}
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          onNewWorker={() => setIsNewWorkerDialogOpen(true)}
+          onNewNote={() => setIsNewNoteDialogOpen(true)}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+        />
+      )}
+
+      {/* New Worker Dialog */}
+      {isNewWorkerDialogOpen && (
+        <NewWorkerDialog
+          defaults={settings?.workerDefaults}
+          onClose={() => setIsNewWorkerDialogOpen(false)}
+        />
+      )}
+
+      {/* New Note Dialog */}
+      {isNewNoteDialogOpen && (
+        <NewNoteDialog
+          onClose={() => setIsNewNoteDialogOpen(false)}
+        />
+      )}
+
+      {/* Settings Screen */}
+      {isSettingsOpen && (
+        <SettingsScreen
+          onClose={() => setIsSettingsOpen(false)}
+        />
+      )}
     </div>
   );
 }

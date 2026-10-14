@@ -13,6 +13,10 @@ import type {
   WorkerUpdatePayload,
   NoteWritePayload,
   BrainInfo,
+  DesktopSettings,
+  DesktopSettingsPatch,
+  FolderKey,
+  DaemonDetails,
 } from "../shared/ipc.js";
 
 export interface SinapseBridge {
@@ -29,6 +33,20 @@ export interface SinapseBridge {
     onInfo: (cb: (info: DaemonInfo) => void) => () => void;
     onEvent: (cb: (e: DaemonEvent) => void) => () => void;
     onStatus: (cb: (s: { connected: boolean }) => void) => () => void;
+    details: () => Promise<DaemonDetails>;
+  };
+  settings: {
+    get: () => Promise<DesktopSettings>;
+    /** Resolves with the full saved settings; rejects with a Portuguese message on invalid input. */
+    set: (patch: DesktopSettingsPatch) => Promise<DesktopSettings>;
+    onChanged: (cb: (settings: DesktopSettings) => void) => () => void;
+  };
+  windowControls: {
+    minimize: () => void;
+    toggleMaximize: () => void;
+    close: () => void;
+    isMaximized: () => Promise<boolean>;
+    onMaximizedChanged: (cb: (maximized: boolean) => void) => () => void;
   };
   workers: {
     list: () => Promise<AgentState[]>;
@@ -48,6 +66,7 @@ export interface SinapseBridge {
   };
   app: {
     openExternal: (url: string) => Promise<void>;
+    openFolder: (key: FolderKey) => Promise<void>;
   };
 }
 

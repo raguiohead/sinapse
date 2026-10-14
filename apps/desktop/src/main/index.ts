@@ -22,6 +22,10 @@ import {
   type WorkerUpdatePayload,
   type NoteWritePayload,
   type BrainInfo,
+  type DesktopSettings,
+  type DesktopSettingsPatch,
+  type FolderKey,
+  type DaemonDetails,
 } from "../shared/ipc.js";
 
 const _require = createRequire(import.meta.url);
@@ -35,14 +39,31 @@ const {
   estimateContextWindow,
 }: typeof import("@sinapse/core") = _require("@sinapse/core");
 
+function getDefaultSettings(): DesktopSettings {
+  return {
+    workerDefaults: {
+      provider: "agy",
+      autonomy: "edit",
+      cwd: os.homedir(),
+    },
+    appearance: {
+      chromaticBar: "animada",
+      motion: "sistema",
+      terminalFontSize: 13,
+    },
+  };
+}
+
 let mainWindow: BrowserWindow | null = null;
 let daemonInfo: DaemonInfo | null = null;
+let ownsDaemon = false;
 let ptyProcess: IPty | null = null;
 let isDaemonConnected = false;
 let sseAbortController: AbortController | null = null;
 let reconnectTimer: NodeJS.Timeout | null = null;
 let isQuitting = false;
 
+let settings: DesktopSettings = getDefaultSettings();
 let brainModel: string | null = null;
 let latestBrainUsage: ContextUsage | undefined = undefined;
 let brainUsageTimer: NodeJS.Timeout | null = null;
@@ -106,41 +127,74 @@ function getDesktopConfigPath(): string {
   return path.join(sinapseDir(), "desktop.json");
 }
 
-function loadSavedBrainModel(): string | null {
+function loadSettings(): DesktopSettings {
+  const current = getDefaultSettings();
   try {
     const configPath = getDesktopConfigPath();
     if (fs.existsSync(configPath)) {
       const content = fs.readFileSync(configPath, "utf-8");
       const data = JSON.parse(content);
-      if (typeof data.brainModel === "string" && MODEL_REGEX.test(data.brainModel)) {
-        return data.brainModel;
+      if (data && typeof data === "object") {
+        if (typeof data.brainModel === "string" && MODEL_REGEX.test(data.brainModel.trim())) {
+          current.brainModel = data.brainModel.trim();
+        }
+        if (data.workerDefaults && typeof data.workerDefaults === "object") {
+          const wd = data.workerDefaults;
+          if (wd.provider === "claude" || wd.provider === "agy") {
+            current.workerDefaults.provider = wd.provider;
+          }
+          if (wd.autonomy === "read" || wd.autonomy === "edit" || wd.autonomy === "full") {
+            current.workerDefaults.autonomy = wd.autonomy;
+          }
+          if (typeof wd.cwd === "string" && wd.cwd.trim() !== "") {
+            try {
+              const resolved = path.resolve(wd.cwd);
+              if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+                current.workerDefaults.cwd = resolved;
+              }
+            } catch {}
+          }
+          if (typeof wd.model === "string" && MODEL_REGEX.test(wd.model.trim())) {
+            current.workerDefaults.model = wd.model.trim();
+          }
+        }
+        if (data.appearance && typeof data.appearance === "object") {
+          const appSettings = data.appearance;
+          if (
+            appSettings.chromaticBar === "animada" ||
+            appSettings.chromaticBar === "estatica" ||
+            appSettings.chromaticBar === "desligada"
+          ) {
+            current.appearance.chromaticBar = appSettings.chromaticBar;
+          }
+          if (appSettings.motion === "sistema" || appSettings.motion === "reduzido") {
+            current.appearance.motion = appSettings.motion;
+          }
+          if (
+            typeof appSettings.terminalFontSize === "number" &&
+            Number.isInteger(appSettings.terminalFontSize) &&
+            appSettings.terminalFontSize >= 10 &&
+            appSettings.terminalFontSize <= 22
+          ) {
+            current.appearance.terminalFontSize = appSettings.terminalFontSize;
+          }
+        }
       }
     }
   } catch (err) {
     console.warn("Failed to load desktop.json:", err);
   }
-  return null;
+  return current;
 }
 
-function saveBrainModel(model: string | null): void {
+function saveSettings(s: DesktopSettings): void {
   try {
     const dir = sinapseDir();
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
     const configPath = getDesktopConfigPath();
-    let data: Record<string, any> = {};
-    if (fs.existsSync(configPath)) {
-      try {
-        data = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      } catch {}
-    }
-    if (model) {
-      data.brainModel = model;
-    } else {
-      delete data.brainModel;
-    }
-    fs.writeFileSync(configPath, JSON.stringify(data, null, 2), "utf-8");
+    fs.writeFileSync(configPath, JSON.stringify(s, null, 2), "utf-8");
   } catch (err) {
     console.error("Failed to save desktop.json:", err);
   }
@@ -347,7 +401,7 @@ async function connectDaemonSSE(): Promise<void> {
 function createWindow(): BrowserWindow {
   const preloadPath = resolvePreloadPath();
 
-  mainWindow = new BrowserWindow({
+  const windowOptions: Electron.BrowserWindowConstructorOptions = {
     width: 1200,
     height: 800,
     minWidth: 800,
@@ -360,6 +414,26 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
     },
+  };
+
+  if (process.platform === "darwin") {
+    windowOptions.titleBarStyle = "hidden";
+  } else {
+    windowOptions.frame = false;
+  }
+
+  mainWindow = new BrowserWindow(windowOptions);
+
+  mainWindow.on("maximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(IPC.WINDOW_MAXIMIZED, true);
+    }
+  });
+
+  mainWindow.on("unmaximize", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(IPC.WINDOW_MAXIMIZED, false);
+    }
   });
 
   // Navigation safety: deny opening popups/new windows
@@ -463,6 +537,33 @@ function spawnClaudePTY(model?: string | null, resumeSessionId?: string | null):
   }
 }
 
+function applyBrainModel(model: string | null): BrainInfo {
+  brainModel = model;
+  if (model) {
+    settings.brainModel = model;
+  } else {
+    delete settings.brainModel;
+  }
+  saveSettings(settings);
+
+  void killBrain();
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(IPC.BRAIN_DATA, "\x1bc");
+  }
+
+  spawnClaudePTY(brainModel, brainSessionId);
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(IPC.BRAIN_INFO_CHANGED, { model: brainModel });
+  }
+
+  return {
+    model: brainModel,
+    usage: latestBrainUsage,
+  };
+}
+
 async function daemonFetch(endpoint: string, init?: RequestInit): Promise<Response> {
   if (!daemonInfo) {
     throw new Error("Sinapse daemon is not ready");
@@ -477,6 +578,182 @@ async function daemonFetch(endpoint: string, init?: RequestInit): Promise<Respon
 }
 
 function registerIpcHandlers(): void {
+  // Window controls
+  ipcMain.on(IPC.WINDOW_MINIMIZE, () => {
+    mainWindow?.minimize();
+  });
+
+  ipcMain.on(IPC.WINDOW_TOGGLE_MAXIMIZE, () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow.maximize();
+    }
+  });
+
+  ipcMain.on(IPC.WINDOW_CLOSE, () => {
+    mainWindow?.close();
+  });
+
+  ipcMain.handle(IPC.WINDOW_IS_MAXIMIZED, (): boolean => {
+    return mainWindow?.isMaximized() ?? false;
+  });
+
+  // Settings
+  ipcMain.handle(IPC.SETTINGS_GET, async (): Promise<DesktopSettings> => {
+    return settings;
+  });
+
+  ipcMain.handle(IPC.SETTINGS_SET, async (_event, patch: DesktopSettingsPatch): Promise<DesktopSettings> => {
+    if (!patch || typeof patch !== "object") {
+      throw new Error("Configurações inválidas");
+    }
+
+    // 1. Validate everything before applying anything
+    let nextBrainModel: string | null | undefined = undefined;
+    if ("brainModel" in patch && patch.brainModel !== undefined) {
+      if (patch.brainModel === null || (typeof patch.brainModel === "string" && patch.brainModel.trim() === "")) {
+        nextBrainModel = null;
+      } else if (typeof patch.brainModel === "string" && MODEL_REGEX.test(patch.brainModel.trim())) {
+        nextBrainModel = patch.brainModel.trim();
+      } else {
+        throw new Error("Modelo inválido");
+      }
+    }
+
+    let resolvedCwd: string | undefined = undefined;
+    let nextWorkerModel: string | null | undefined = undefined;
+    if (patch.workerDefaults !== undefined) {
+      if (!patch.workerDefaults || typeof patch.workerDefaults !== "object") {
+        throw new Error("Configurações do worker inválidas");
+      }
+      if (patch.workerDefaults.provider !== undefined) {
+        if (patch.workerDefaults.provider !== "claude" && patch.workerDefaults.provider !== "agy") {
+          throw new Error("Provedor inválido: deve ser 'claude' ou 'agy'");
+        }
+      }
+      if (patch.workerDefaults.autonomy !== undefined) {
+        if (
+          patch.workerDefaults.autonomy !== "read" &&
+          patch.workerDefaults.autonomy !== "edit" &&
+          patch.workerDefaults.autonomy !== "full"
+        ) {
+          throw new Error("Autonomia inválida: deve ser 'read', 'edit' ou 'full'");
+        }
+      }
+      if (patch.workerDefaults.cwd !== undefined) {
+        if (typeof patch.workerDefaults.cwd !== "string" || !patch.workerDefaults.cwd.trim()) {
+          throw new Error("Pasta inválida");
+        }
+        resolvedCwd = path.resolve(patch.workerDefaults.cwd);
+        try {
+          if (!fs.existsSync(resolvedCwd) || !fs.statSync(resolvedCwd).isDirectory()) {
+            throw new Error(`Pasta não encontrada: ${resolvedCwd}`);
+          }
+        } catch (err: any) {
+          if (err.message && err.message.startsWith("Pasta não encontrada:")) {
+            throw err;
+          }
+          throw new Error(`Pasta não encontrada: ${resolvedCwd}`);
+        }
+      }
+      if ("model" in patch.workerDefaults && patch.workerDefaults.model !== undefined) {
+        if (
+          patch.workerDefaults.model === null ||
+          (typeof patch.workerDefaults.model === "string" && patch.workerDefaults.model.trim() === "")
+        ) {
+          nextWorkerModel = null;
+        } else if (
+          typeof patch.workerDefaults.model === "string" &&
+          MODEL_REGEX.test(patch.workerDefaults.model.trim())
+        ) {
+          nextWorkerModel = patch.workerDefaults.model.trim();
+        } else {
+          throw new Error("Modelo inválido");
+        }
+      }
+    }
+
+    if (patch.appearance !== undefined) {
+      if (!patch.appearance || typeof patch.appearance !== "object") {
+        throw new Error("Configurações de aparência inválidas");
+      }
+      if (patch.appearance.chromaticBar !== undefined) {
+        if (
+          patch.appearance.chromaticBar !== "animada" &&
+          patch.appearance.chromaticBar !== "estatica" &&
+          patch.appearance.chromaticBar !== "desligada"
+        ) {
+          throw new Error("Barra cromática inválida: deve ser 'animada', 'estatica' ou 'desligada'");
+        }
+      }
+      if (patch.appearance.motion !== undefined) {
+        if (patch.appearance.motion !== "sistema" && patch.appearance.motion !== "reduzido") {
+          throw new Error("Configuração de movimento inválida: deve ser 'sistema' ou 'reduzido'");
+        }
+      }
+      if (patch.appearance.terminalFontSize !== undefined) {
+        if (
+          typeof patch.appearance.terminalFontSize !== "number" ||
+          !Number.isInteger(patch.appearance.terminalFontSize) ||
+          patch.appearance.terminalFontSize < 10 ||
+          patch.appearance.terminalFontSize > 22
+        ) {
+          throw new Error("Tamanho de fonte do terminal inválido: deve ser um número inteiro entre 10 e 22");
+        }
+      }
+    }
+
+    // 2. Merge field by field
+    if (patch.workerDefaults) {
+      if (patch.workerDefaults.provider !== undefined) {
+        settings.workerDefaults.provider = patch.workerDefaults.provider;
+      }
+      if (patch.workerDefaults.autonomy !== undefined) {
+        settings.workerDefaults.autonomy = patch.workerDefaults.autonomy;
+      }
+      if (resolvedCwd !== undefined) {
+        settings.workerDefaults.cwd = resolvedCwd;
+      }
+      if (nextWorkerModel !== undefined) {
+        if (nextWorkerModel) {
+          settings.workerDefaults.model = nextWorkerModel;
+        } else {
+          delete settings.workerDefaults.model;
+        }
+      }
+    }
+
+    if (patch.appearance) {
+      if (patch.appearance.chromaticBar !== undefined) {
+        settings.appearance.chromaticBar = patch.appearance.chromaticBar;
+      }
+      if (patch.appearance.motion !== undefined) {
+        settings.appearance.motion = patch.appearance.motion;
+      }
+      if (patch.appearance.terminalFontSize !== undefined) {
+        settings.appearance.terminalFontSize = patch.appearance.terminalFontSize;
+      }
+    }
+
+    const currentBrainModel = settings.brainModel ?? null;
+    const brainModelChanged = nextBrainModel !== undefined && nextBrainModel !== currentBrainModel;
+
+    if (brainModelChanged && nextBrainModel !== undefined) {
+      applyBrainModel(nextBrainModel);
+    } else {
+      saveSettings(settings);
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(IPC.SETTINGS_CHANGED, settings);
+    }
+
+    return settings;
+  });
+
+  // Brain
   ipcMain.on(IPC.BRAIN_INPUT, (_event, data: string) => {
     if (ptyProcess) {
       ptyProcess.write(data);
@@ -512,27 +789,30 @@ function registerIpcHandlers(): void {
       validatedModel = trimmed;
     }
 
-    brainModel = validatedModel;
-    saveBrainModel(validatedModel);
-
-    void killBrain();
+    const info = applyBrainModel(validatedModel);
 
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(IPC.BRAIN_DATA, "\x1bc");
+      mainWindow.webContents.send(IPC.SETTINGS_CHANGED, settings);
     }
 
-    spawnClaudePTY(brainModel, brainSessionId);
+    return info;
+  });
 
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send(IPC.BRAIN_INFO_CHANGED, { model: brainModel });
+  // Daemon details
+  ipcMain.handle(IPC.DAEMON_DETAILS, async (): Promise<DaemonDetails> => {
+    if (!daemonInfo) {
+      throw new Error("Sinapse daemon is not ready");
     }
-
     return {
-      model: brainModel,
-      usage: latestBrainUsage,
+      port: daemonInfo.port,
+      dataDir: sinapseDir(),
+      brainDir: brainCwd(),
+      notesDir: path.join(sinapseDir(), "notes"),
+      ownsDaemon,
     };
   });
 
+  // Models
   ipcMain.handle(IPC.MODELS_LIST, async (): Promise<ModelCatalog> => {
     const res = await daemonFetch("/models");
     if (!res.ok) {
@@ -542,6 +822,7 @@ function registerIpcHandlers(): void {
     return (await res.json()) as ModelCatalog;
   });
 
+  // Workers
   ipcMain.handle(IPC.WORKER_LIST, async () => {
     const response = await daemonFetch("/agents", { method: "GET" });
     if (!response.ok) {
@@ -631,6 +912,7 @@ function registerIpcHandlers(): void {
     return await response.json();
   });
 
+  // Notes
   ipcMain.handle(IPC.NOTES_LIST, async (): Promise<NoteSummary[]> => {
     const response = await daemonFetch("/notes", { method: "GET" });
     if (!response.ok) {
@@ -675,6 +957,7 @@ function registerIpcHandlers(): void {
     return true;
   });
 
+  // App
   ipcMain.handle(IPC.APP_OPEN_EXTERNAL, async (_event, url: string): Promise<void> => {
     try {
       const parsed = new URL(url);
@@ -685,9 +968,22 @@ function registerIpcHandlers(): void {
       console.warn("Invalid external URL:", url, err);
     }
   });
-}
 
-let ownsDaemon = false;
+  ipcMain.handle(IPC.APP_OPEN_FOLDER, async (_event, key: FolderKey): Promise<void> => {
+    let targetDir: string;
+    if (key === "dados") {
+      targetDir = sinapseDir();
+    } else if (key === "cerebro") {
+      targetDir = brainCwd();
+    } else if (key === "notas") {
+      targetDir = path.join(sinapseDir(), "notes");
+    } else {
+      throw new Error(`Pasta inválida: ${String(key)}`);
+    }
+    fs.mkdirSync(targetDir, { recursive: true });
+    await shell.openPath(targetDir);
+  });
+}
 
 // A daemon started by the CLI may already serve this data dir; a second one would overwrite its state.json.
 async function findRunningDaemon(): Promise<DaemonInfo | null> {
@@ -706,7 +1002,8 @@ async function findRunningDaemon(): Promise<DaemonInfo | null> {
 }
 
 async function init(): Promise<void> {
-  brainModel = loadSavedBrainModel();
+  settings = loadSettings();
+  brainModel = settings.brainModel ?? null;
 
   try {
     const running = await findRunningDaemon();

@@ -15,6 +15,10 @@ import {
   type WorkerUpdatePayload,
   type NoteWritePayload,
   type BrainInfo,
+  type DesktopSettings,
+  type DesktopSettingsPatch,
+  type FolderKey,
+  type DaemonDetails,
 } from "../shared/ipc.js";
 
 const api = {
@@ -75,6 +79,45 @@ const api = {
         ipcRenderer.removeListener(IPC.DAEMON_STATUS, listener);
       };
     },
+    details: (): Promise<DaemonDetails> => {
+      return ipcRenderer.invoke(IPC.DAEMON_DETAILS);
+    },
+  },
+  settings: {
+    get: (): Promise<DesktopSettings> => {
+      return ipcRenderer.invoke(IPC.SETTINGS_GET);
+    },
+    set: (patch: DesktopSettingsPatch): Promise<DesktopSettings> => {
+      return ipcRenderer.invoke(IPC.SETTINGS_SET, patch);
+    },
+    onChanged: (cb: (settings: DesktopSettings) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, settings: DesktopSettings) => cb(settings);
+      ipcRenderer.on(IPC.SETTINGS_CHANGED, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.SETTINGS_CHANGED, listener);
+      };
+    },
+  },
+  windowControls: {
+    minimize: (): void => {
+      ipcRenderer.send(IPC.WINDOW_MINIMIZE);
+    },
+    toggleMaximize: (): void => {
+      ipcRenderer.send(IPC.WINDOW_TOGGLE_MAXIMIZE);
+    },
+    close: (): void => {
+      ipcRenderer.send(IPC.WINDOW_CLOSE);
+    },
+    isMaximized: (): Promise<boolean> => {
+      return ipcRenderer.invoke(IPC.WINDOW_IS_MAXIMIZED);
+    },
+    onMaximizedChanged: (cb: (maximized: boolean) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, maximized: boolean) => cb(maximized);
+      ipcRenderer.on(IPC.WINDOW_MAXIMIZED, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.WINDOW_MAXIMIZED, listener);
+      };
+    },
   },
   workers: {
     list: (): Promise<AgentState[]> => {
@@ -115,6 +158,9 @@ const api = {
   app: {
     openExternal: (url: string): Promise<void> => {
       return ipcRenderer.invoke(IPC.APP_OPEN_EXTERNAL, url);
+    },
+    openFolder: (key: FolderKey): Promise<void> => {
+      return ipcRenderer.invoke(IPC.APP_OPEN_FOLDER, key);
     },
   },
 };

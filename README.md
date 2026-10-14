@@ -149,10 +149,11 @@ Execute no terminal PowerShell:
 ### Interface Visual (Canvas)
 
 - **Terminal do Cérebro:** Painel interativo com o terminal do Claude Code embutido via `node-pty` e xterm.js. É nele onde você conversa com o cérebro do projeto.
-- **Botão + worker:** cria um worker pelo canvas, com nome, provedor e papel. Ele roda na sua pasta pessoal com autonomia `edit`; para escolher pasta e autonomia, use `sinapse spawn`.
+- **Barra da janela:** o app desenha a própria barra, com o status do daemon, o número de workers pensando, o botão de configurações (⚙) e os controles da janela. Uma faixa cromática na base pode ficar animada, estática ou desligada. Arraste pela barra; duplo clique maximiza.
+- **Menu de contexto:** clique com o botão direito no canvas para criar um worker ou uma nota e para abrir as configurações. O diálogo de novo worker já vem com os padrões definidos nas configurações (provedor, modelo, autonomia e pasta).
+- **Configurações** (⚙ ou `Ctrl+,`): modelo do cérebro e uso de contexto; padrões de novos workers; status do daemon e atalhos para as pastas de dados, do cérebro e de notas; aparência (barra cromática, movimento reduzido e tamanho da fonte do terminal). Cada mudança é salva na hora.
 - **Perguntar / Parar:** cada worker aceita prompts direto pelo card e permite interromper o turno em andamento.
 - **Arestas:** partículas vão do cérebro ao worker quando um turno começa e voltam na cor do provedor quando ele termina.
-- **Cabeçalho:** mostra se o daemon está conectado e quantos workers estão pensando.
 - Workers criados pelo cérebro no terminal entram no canvas sozinhos, e a câmera se reajusta.
 
 ### Comandos da CLI
@@ -180,7 +181,7 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`:
 
 Tanto no canvas quanto na CLI, é possível selecionar e alternar os modelos dos workers:
 - **Seleção no Canvas e na CLI:** utilize `--model <modelo>` no `sinapse spawn` ou consulte os modelos disponíveis via `sinapse models [claude|agy]`. Para alterar o modelo de um worker existente, utilize `sinapse model <nome> <modelo>` (ou `sinapse model <nome> padrao` para remover o modelo customizado). No canvas, o modelo pode ser escolhido na criação e modificado no card do worker.
-- **Cérebro:** o seletor no cabeçalho do terminal troca o modelo do cérebro. Ele reinicia retomando a própria sessão (`--resume` com o id dela), então a conversa continua; a escolha fica salva em `desktop.json`.
+- **Cérebro:** a seção Cérebro das configurações troca o modelo do cérebro. Ele reinicia retomando a própria sessão (`--resume` com o id dela), então a conversa continua; a escolha fica salva em `desktop.json`.
 - **Janela de contexto:**
   - O **Claude** reporta o tamanho real de sua janela de contexto diretamente pela CLI (`contextWindow`).
   - O **AGY** e o **cérebro** exibem uma estimativa da janela de contexto marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
@@ -240,7 +241,8 @@ Todos os dados de runtime do Sinapse ficam armazenados no diretório do usuário
 - `~/.sinapse/state.json`: Estado persistido dos agentes cadastrados (id, nome, provedor, diretório, status, sessionId, modelo, uso de contexto).
 - `~/.sinapse/daemon.json`: Informações do daemon em execução (`port`, `token`, `pid`).
 - `~/.sinapse/notes/`: Diretório de notas compartilhadas em Markdown (`<nome>.md`).
-- `~/.sinapse/desktop.json`: Configurações da aplicação desktop (armazena o modelo configurado para o cérebro).
+- `~/.sinapse/desktop.json`: configurações do app (modelo do cérebro, padrões de novos workers e aparência).
+- `~/.sinapse/cerebro/`: pasta de trabalho do cérebro, com o `CLAUDE.md` que descreve o papel dele.
 - `~/.sinapse/desktop.log`: Log de saída do processo de build e inicialização do Electron Desktop.
 
 > [!NOTE]

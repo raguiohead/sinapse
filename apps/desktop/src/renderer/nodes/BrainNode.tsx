@@ -4,7 +4,6 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import type { ContextUsage } from "@sinapse/core";
-import { ModelSelect } from "../components/ModelSelect";
 import { ContextMeter } from "../components/ContextMeter";
 
 export interface BrainNodeData {
@@ -22,6 +21,7 @@ export function BrainNode({ data }: NodeProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const fontSizeRef = useRef<number>(13);
 
   // Initial fetch and subscriptions for brain model and context usage
   useEffect(() => {
@@ -46,13 +46,46 @@ export function BrainNode({ data }: NodeProps) {
     };
   }, []);
 
+  // Settings subscription for terminal font size
+  useEffect(() => {
+    const applyFontSize = (size: number) => {
+      fontSizeRef.current = size;
+      const term = terminalRef.current;
+      const fitAddon = fitAddonRef.current;
+      if (!term || !fitAddon) return;
+      term.options.fontSize = size;
+      try {
+        fitAddon.fit();
+        window.sinapse?.brain?.resize(term.cols, term.rows);
+      } catch (err) {
+        // Ignored if DOM not yet measured
+      }
+    };
+
+    window.sinapse?.settings?.get().then((s) => {
+      if (s?.appearance?.terminalFontSize) {
+        applyFontSize(s.appearance.terminalFontSize);
+      }
+    });
+
+    const unsubSettings = window.sinapse?.settings?.onChanged((s) => {
+      if (s?.appearance?.terminalFontSize) {
+        applyFontSize(s.appearance.terminalFontSize);
+      }
+    });
+
+    return () => {
+      if (unsubSettings) unsubSettings();
+    };
+  }, []);
+
   // Terminal lifecycle
   useEffect(() => {
     if (!containerRef.current) return;
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
+      fontSize: fontSizeRef.current,
       lineHeight: 1.25,
       fontFamily: '"JetBrains Mono", ui-monospace, monospace',
       theme: {
@@ -115,19 +148,7 @@ export function BrainNode({ data }: NodeProps) {
     };
   }, []);
 
-  const handleModelChange = async (newModel: string | null) => {
-    const modelLabel = newModel || "padrão";
-    const confirmed = window.confirm(
-      `Reiniciar o cérebro com o modelo ${modelLabel}? A conversa continua.`
-    );
-    if (!confirmed) return;
-
-    try {
-      await window.sinapse?.brain?.setModel(newModel);
-    } catch (err) {
-      console.error("Erro ao alterar modelo do cérebro:", err);
-    }
-  };
+  const modelChipLabel = brainUsage?.model ?? brainModel ?? "padrão";
 
   return (
     <div className={`brain-node-card ${anyThinking ? "brain-breathing" : ""}`}>
@@ -171,13 +192,9 @@ export function BrainNode({ data }: NodeProps) {
 
         <div className="brain-node-controls nodrag">
           <ContextMeter usage={brainUsage} className="brain-context-meter" />
-          <ModelSelect
-            provider="claude"
-            value={brainModel}
-            resolvedModel={brainUsage?.model}
-            onChange={handleModelChange}
-            className="brain-model-select"
-          />
+          <span className="brain-model-chip" title="Modelo do cérebro">
+            {modelChipLabel}
+          </span>
         </div>
       </div>
 

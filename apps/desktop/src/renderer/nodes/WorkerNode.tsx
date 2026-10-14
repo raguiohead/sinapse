@@ -133,10 +133,7 @@ export function WorkerNode({ data }: NodeProps) {
   };
 
   return (
-    <div
-      className="worker-node-card"
-      style={{ borderLeft: `2px solid ${providerColor}` }}
-    >
+    <div className="worker-node-card">
       <Handle
         type="target"
         position={Position.Left}

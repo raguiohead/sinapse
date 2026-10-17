@@ -144,6 +144,8 @@ export interface WorkerUpdatePayload {
   model?: string | null;
   autonomy?: Autonomy;
   role?: string;
+  /** Replaces the worker's pinned notes. Omitted = unchanged. */
+  pinnedNotes?: string[];
 }
 
 export interface WorkerDiffResult {

@@ -46,6 +46,13 @@ export function NoteNode({ data }: NodeProps) {
         id="note-target"
         className="flow-handle note-handle-target"
       />
+      <Handle
+        type="source"
+        position={Position.Right}
+        id="note-pin"
+        className="flow-handle note-handle-source"
+        title="Arraste até um worker para fixar esta nota nele"
+      />
       <div className="note-node-header">
         <div className="note-header-info">
           <span className="note-title" title={nodeData.title || nodeData.name}>

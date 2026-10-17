@@ -147,6 +147,57 @@ function computeNotePosition(
   return stackBelow(brainX - 360 - 120, brainY);
 }
 
+interface PinEdgeData {
+  pulse: SynapsePulse;
+  variant: SynapseVariant;
+  noteName: string;
+  agentId: string;
+  [key: string]: unknown;
+}
+
+function isPinEdge(edge: Edge): boolean {
+  return (edge.data as Partial<PinEdgeData> | undefined)?.variant === "pin";
+}
+
+function pinEdge(noteName: string, agentId: string): Edge {
+  const source = `note-${noteName}`;
+  const target = `worker-${agentId}`;
+  const data: PinEdgeData = { pulse: "idle", variant: "pin", noteName, agentId };
+  return {
+    id: `edge-pin-${source}-${target}`,
+    source,
+    target,
+    sourceHandle: "note-pin",
+    targetHandle: "worker-target",
+    type: "synapse",
+    data,
+  };
+}
+
+/** Replaces the worker's note -> worker pin edges with one per pinned note that is on the canvas. */
+function withPinEdges(edges: Edge[], nodes: Node[], agentId: string, pinnedNotes: string[] | undefined): Edge[] {
+  const target = `worker-${agentId}`;
+  const next = edges.filter((e) => !(isPinEdge(e) && e.target === target));
+  const noteIds = new Set(nodes.filter((n) => n.type === "note").map((n) => n.id));
+  for (const noteName of pinnedNotes ?? []) {
+    if (noteIds.has(`note-${noteName}`)) next.push(pinEdge(noteName, agentId));
+  }
+  return next;
+}
+
+/** Adds the pin edges of the workers pinning `noteName`, for when that note's node (re)appears. */
+function withPinEdgesForNote(edges: Edge[], nodes: Node[], noteName: string): Edge[] {
+  const next = [...edges];
+  for (const n of nodes) {
+    if (n.type !== "worker") continue;
+    const data = n.data as unknown as WorkerNodeData;
+    if (!data.pinnedNotes?.includes(noteName)) continue;
+    const edge = pinEdge(noteName, data.id);
+    if (!next.some((e) => e.id === edge.id)) next.push(edge);
+  }
+  return next;
+}
+
 interface WorkspaceCanvasState {
   nodes: Node[];
   edges: Edge[];
@@ -595,6 +646,7 @@ export function App() {
                 usage: worker.usage,
                 worktreeBranch: worker.worktree?.branch,
                 worktreePath: worker.worktree?.path,
+                pinnedNotes: worker.pinnedNotes,
                 log: histLog,
                 lastPrompt: histPrompt,
               },
@@ -628,11 +680,14 @@ export function App() {
           });
         }
 
-        const newEdges = buildEdges(
+        let newEdges = buildEdges(
           Array.isArray(workerList) ? workerList : [],
           fullNotes,
           orchestratorProvider
         );
+        for (const worker of Array.isArray(workerList) ? workerList : []) {
+          newEdges = withPinEdges(newEdges, newNodes, worker.id, worker.pinnedNotes);
+        }
 
         agentStateMapRef.current = newAgentState;
         if (savedLayout) layoutCacheRef.current.set(wsId, savedLayout);
@@ -803,6 +858,7 @@ export function App() {
                     usage: agent.usage,
                     worktreeBranch: agent.worktree?.branch,
                     worktreePath: agent.worktree?.path,
+                    pinnedNotes: agent.pinnedNotes,
                     log: [],
                     lastPrompt: "",
                   },
@@ -843,7 +899,7 @@ export function App() {
                   );
                 }
               }
-              return nextEds;
+              return withPinEdges(nextEds, nodesRef.current, agent.id, agent.pinnedNotes);
             });
           } else {
             // Update background workspace cache
@@ -869,6 +925,7 @@ export function App() {
                     usage: agent.usage,
                     worktreeBranch: agent.worktree?.branch,
                     worktreePath: agent.worktree?.path,
+                    pinnedNotes: agent.pinnedNotes,
                     log: [],
                     lastPrompt: "",
                   },
@@ -880,6 +937,7 @@ export function App() {
                   type: "synapse",
                   data: { pulse: "idle", provider: agent.provider, variant: "default" },
                 });
+                cached.edges = withPinEdges(cached.edges, cached.nodes, agent.id, agent.pinnedNotes);
               }
             }
           }
@@ -907,11 +965,13 @@ export function App() {
                         // Authoritative: a handoff clears it.
                         usage: agent.usage,
                         status: agent.status || n.data?.status,
+                        pinnedNotes: agent.pinnedNotes,
                       },
                     }
                   : n
               )
             );
+            setEdges((eds) => withPinEdges(eds, nodesRef.current, agent.id, agent.pinnedNotes));
           } else {
             const cached = workspaceCanvasStateMapRef.current.get(wsId);
             if (cached) {
@@ -926,10 +986,12 @@ export function App() {
                         model: agent.model,
                         usage: agent.usage,
                         status: agent.status || n.data?.status,
+                        pinnedNotes: agent.pinnedNotes,
                       },
                     }
                   : n
               );
+              cached.edges = withPinEdges(cached.edges, cached.nodes, agent.id, agent.pinnedNotes);
             }
           }
           break;
@@ -1260,7 +1322,7 @@ export function App() {
                     }
                   }
 
-                  return nextEdges;
+                  return withPinEdgesForNote(nextEdges, nodesRef.current, fullNote.name);
                 });
 
                 // Pulse edge from changer to note
@@ -1399,6 +1461,21 @@ export function App() {
 
   const onConnect = useCallback(
     (connection: Connection) => {
+      const sourceNode = nodesRef.current.find((n) => n.id === connection.source);
+      const targetNode = nodesRef.current.find((n) => n.id === connection.target);
+      if (sourceNode?.type === "note" && targetNode?.type === "worker") {
+        // Note -> worker pins the note; the edge is drawn from the agent_updated that follows.
+        const noteName = String((sourceNode.data as any)?.name ?? "");
+        const worker = targetNode.data as unknown as WorkerNodeData;
+        const current = worker.pinnedNotes ?? [];
+        if (!noteName || current.includes(noteName)) return;
+        window.sinapse?.workers
+          ?.update({ workspaceId: activeWorkspaceIdRef.current, agent: worker.id, pinnedNotes: [...current, noteName] })
+          .catch((err: any) =>
+            window.alert(`Não foi possível fixar a nota "${noteName}" em "${worker.name}": ${err?.message ?? err}`)
+          );
+        return;
+      }
       setEdges((eds) =>
         addEdge(
           {
@@ -1409,6 +1486,45 @@ export function App() {
           eds
         )
       );
+    },
+    [setEdges]
+  );
+
+  // Delete/Backspace only removes selected pin edges; nodes and the other edges are managed by the daemon.
+  const handleBeforeDelete = useCallback(
+    async ({ edges: candidates }: { nodes: Node[]; edges: Edge[] }) => ({
+      nodes: [],
+      edges: candidates.filter((e) => isPinEdge(e) && e.selected),
+    }),
+    []
+  );
+
+  const onEdgesDelete = useCallback(
+    (deleted: Edge[]) => {
+      const removed = new Map<string, Set<string>>();
+      for (const e of deleted) {
+        if (!isPinEdge(e)) continue;
+        const { agentId, noteName } = e.data as PinEdgeData;
+        const names = removed.get(agentId) ?? new Set<string>();
+        names.add(noteName);
+        removed.set(agentId, names);
+      }
+      for (const [agentId, names] of removed) {
+        const workerNode = nodesRef.current.find((n) => n.id === `worker-${agentId}`);
+        if (!workerNode) continue;
+        const worker = workerNode.data as unknown as WorkerNodeData;
+        const current = worker.pinnedNotes ?? [];
+        window.sinapse?.workers
+          ?.update({
+            workspaceId: activeWorkspaceIdRef.current,
+            agent: agentId,
+            pinnedNotes: current.filter((n) => !names.has(n)),
+          })
+          .catch((err: any) => {
+            window.alert(`Não foi possível desafixar a nota de "${worker.name}": ${err?.message ?? err}`);
+            setEdges((eds) => withPinEdges(eds, nodesRef.current, agentId, current));
+          });
+      }
     },
     [setEdges]
   );
@@ -1469,13 +1585,15 @@ export function App() {
           }}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onBeforeDelete={handleBeforeDelete}
+          onEdgesDelete={onEdgesDelete}
           onPaneContextMenu={handlePaneContextMenu}
           onNodeContextMenu={handleNodeContextMenu}
           onPaneClick={() => setContextMenu(null)}
           onMoveStart={() => setContextMenu(null)}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
-          deleteKeyCode={null}
+          deleteKeyCode={["Delete", "Backspace"]}
           proOptions={{ hideAttribution: true }}
           fitView
           fitViewOptions={{ padding: 0.2 }}

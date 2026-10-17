@@ -160,7 +160,7 @@ Execute no terminal PowerShell:
 - **Excluir worker:** pela lixeira no card ou com clique direito no card. Pede confirmação; um turno em andamento é interrompido e tudo o que o worker abriu é encerrado.
 - **Redimensionar:** arraste a alça no canto inferior direito de qualquer card. O terminal do cérebro se reajusta ao novo tamanho.
 - **Notas:** "Editar" ou duplo clique abre um editor fora do canvas, em tamanho normal; `Ctrl+S` salva e Esc cancela.
-- **Arestas:** partículas vão do cérebro ao worker quando um turno começa e voltam na cor do provedor quando ele termina.
+- **Arestas:** partículas vão do cérebro ao worker quando um turno começa e voltam na cor do provedor quando ele termina. Arrastar da alça direita de uma nota até um worker fixa a nota nele (veja [Notas fixadas](#notas-fixadas)).
 - Workers criados pelo cérebro no terminal entram no canvas sozinhos, e a câmera se reajusta.
 
 ### Workspaces
@@ -191,7 +191,7 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse workspaces` | Lista os workspaces, com pasta, orquestrador e número de workers. |
 | `sinapse workspace create <nome> --folder <dir> [--orchestrator claude\|agy] [--model <m>]` | Cria um workspace. |
 | `sinapse workspace rm <nome\|id>` | Apaga um workspace (a pasta do projeto não é tocada). |
-| `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia e diretório de trabalho. |
+| `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia, notas fixadas e diretório de trabalho. |
 | `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|codex\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
 | `sinapse spawn <nome> ... --worktree` | Isola o worker numa git worktree própria (veja [Isolamento por git worktree](#isolamento-por-git-worktree)). |
 | `sinapse squad list` | Lista os presets de squad (embutidos e de `~/.sinapse/squads.json`). |
@@ -210,7 +210,9 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse note read <nome>` | Exibe o conteúdo bruto da nota especificada. |
 | `sinapse note write <nome> "<texto>"` | Cria ou sobrescreve uma nota. Use `-` no lugar do texto para ler do stdin. |
 | `sinapse note append <nome> "<texto>"` | Acrescenta ao final da nota (cria se não existir). Use `-` para ler do stdin. |
-| `sinapse note rm <nome>` | Remove permanentemente uma nota. |
+| `sinapse note rm <nome>` | Remove permanentemente uma nota (e a desafixa dos workers). |
+| `sinapse pin <worker> <nota> [nota ...]` | Fixa notas no worker: o conteúdo delas entra no prompt dele (veja [Notas fixadas](#notas-fixadas)). Também: `spawn ... --note <n1,n2>`. |
+| `sinapse unpin <worker> <nota> [nota ...]` | Desafixa notas do worker. |
 | `sinapse start` | Inicia o daemon `sinapsed` em primeiro plano (ou conecta se já estiver ativo). |
 
 ### Isolamento por git worktree
@@ -274,6 +276,16 @@ As notas representam a memória compartilhada entre o usuário, o cérebro e os 
   - Apresentadas como cards com visualização e edição direta.
   - Recebem atualizações ao vivo via eventos do daemon (`note_changed` e `note_deleted`).
   - Renderizadas em Markdown limpo, sem execução de HTML bruto.
+
+#### Notas fixadas
+
+Uma nota fixada num worker chega até ele sem que ele precise rodar `sinapse note read` (útil para workers em sandbox que não conseguem chamar a CLI):
+
+- **Fixar:** `sinapse pin <worker> <nota>`, `sinapse spawn <nome> ... --note spec,decisoes` ou, no canvas, arrastando da alça direita da nota (amarela) até o worker. A aresta fica tracejada na cor das notas e o card mostra o selo 📌 com a quantidade (passe o mouse para ver os nomes).
+- **Desafixar:** `sinapse unpin <worker> <nota>`, ou selecione a aresta tracejada no canvas e aperte Delete/Backspace. Apagar a nota também a desafixa de todos os workers.
+- **O que o worker recebe:** no primeiro turno de cada sessão (worker novo ou logo depois de um handoff), o conteúdo completo das notas fixadas vai antes do prompt. Nos turnos seguintes vai só uma linha lembrando quais notas estão fixadas, a não ser que alguma tenha mudado; nesse caso, a versão nova é reenviada.
+- **Limites:** até 10 notas por worker; no máximo 16 KB por nota e 48 KB no total por turno. O que passar disso é cortado com um aviso indicando `sinapse note read <nome>` para ler o resto. Uma nota fixada que deixou de existir é ignorada.
+- `sinapse list` e `sinapse check` mostram as notas fixadas. Fixar e desafixar funciona mesmo com o worker pensando; vale a partir do próximo turno.
 
 ### Ciclo de vida
 

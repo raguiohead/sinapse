@@ -1570,6 +1570,7 @@ function registerIpcHandlers(): void {
         ...("model" in payload ? { model: payload.model } : {}),
         ...(payload.autonomy !== undefined ? { autonomy: payload.autonomy } : {}),
         ...(payload.role !== undefined ? { role: payload.role } : {}),
+        ...(Array.isArray(payload.pinnedNotes) ? { pinnedNotes: payload.pinnedNotes } : {}),
       }),
     });
 

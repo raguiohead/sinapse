@@ -252,7 +252,7 @@ function printTable(agents: AgentState[]) {
     return;
   }
 
-  const headers = ["NAME", "PROVIDER", "MODELO", "CONTEXTO", "STATUS", "AUTONOMY", "CWD"];
+  const headers = ["NAME", "PROVIDER", "MODELO", "CONTEXTO", "STATUS", "AUTONOMY", "NOTAS", "CWD"];
   const rows = agents.map((a) => [
     a.name,
     a.provider,
@@ -260,6 +260,7 @@ function printTable(agents: AgentState[]) {
     formatContext(a.usage),
     a.status,
     a.autonomy,
+    a.pinnedNotes?.length ? a.pinnedNotes.join(",") : "-",
     a.cwd,
   ]);
 
@@ -339,6 +340,38 @@ async function listWorkspaces() {
   }
 }
 
+function parseNoteList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((n) => n.trim())
+    .filter(Boolean);
+}
+
+async function findAgent(ws: Workspace, ref: string): Promise<AgentState> {
+  const res = await apiRequest(routes.agents(ws.id));
+  if (!res.ok) await handleResponseError(res);
+  const agents = (await res.json()) as AgentState[];
+  const agent = agents.find((a) => a.id === ref || a.name === ref);
+  if (!agent) {
+    console.error(`Erro: Worker "${ref}" não encontrado no workspace "${ws.name}".`);
+    process.exit(1);
+  }
+  return agent;
+}
+
+async function setPinnedNotes(ws: Workspace, agent: AgentState, notes: string[]): Promise<AgentState> {
+  const res = await apiRequest(routes.agent(ws.id, agent.id), {
+    method: "PATCH",
+    body: JSON.stringify({ pinnedNotes: notes }),
+  });
+  if (!res.ok) await handleResponseError(res);
+  return (await res.json()) as AgentState;
+}
+
+function describePins(agent: AgentState): string {
+  return agent.pinnedNotes?.length ? agent.pinnedNotes.join(", ") : "nenhuma";
+}
+
 async function handleResponseError(res: Response): Promise<never> {
   let errMsg = `Request failed with status ${res.status}`;
   try {
@@ -416,6 +449,7 @@ Uso:
   sinapse list [--workspace <ws>]                            Lista workers do workspace
   sinapse spawn <nome> --provider <p> [--cwd <dir>] --role <r> [--autonomy edit] [--model <m>] [--workspace <ws>]
                 [--worktree]                                 Isola o worker numa git worktree (branch sinapse/<nome>)
+                [--note <n1,n2>]                             Já cria o worker com essas notas fixadas
   sinapse squad list                                         Lista presets de squad (embutidos + ~/.sinapse/squads.json)
   sinapse squad apply <preset> [--prefix <p>] [--worktree] [--workspace <ws>]
                                                              Cria os workers do preset (<prefix>-<membro>)
@@ -433,6 +467,8 @@ Uso:
   sinapse note write <nome> "<texto>"|- [--workspace <ws>]   Cria ou sobrescreve uma nota
   sinapse note append <nome> "<texto>"|- [--workspace <ws>]  Adiciona texto a uma nota existente
   sinapse note rm <nome> [--workspace <ws>]                  Remove uma nota
+  sinapse pin <worker> <nota> [nota ...] [--workspace <ws>]  Fixa notas no worker (o conteúdo vai no prompt dele)
+  sinapse unpin <worker> <nota> [nota ...] [--workspace <ws>] Desafixa notas do worker
 `);
 }
 
@@ -558,6 +594,11 @@ async function main() {
       const role = (flags.role || flags.r || "assistant") as string;
       const autonomy = (flags.autonomy || flags.a || "edit") as Autonomy;
       const model = (flags.model || flags.m) as string | undefined;
+      if (flags.note === true) {
+        console.error("Erro: --note precisa de nomes de nota separados por vírgula (ex.: --note spec,decisoes).");
+        process.exit(1);
+      }
+      const pinnedNotes = typeof flags.note === "string" ? parseNoteList(flags.note) : [];
 
       const ws = await resolveWorkspace(flags);
 
@@ -572,6 +613,7 @@ async function main() {
           autonomy,
           ...(model ? { model } : {}),
           ...(flags.worktree ? { worktree: true } : {}),
+          ...(pinnedNotes.length > 0 ? { pinnedNotes } : {}),
         }),
       });
 
@@ -584,6 +626,34 @@ async function main() {
       if (created.worktree) {
         console.log(`Worktree: ${created.worktree.path} (branch ${created.worktree.branch})`);
       }
+      if (created.pinnedNotes?.length) {
+        console.log(`Notas fixadas: ${describePins(created)}`);
+      }
+      break;
+    }
+
+    case "pin":
+    case "unpin": {
+      const name = positional[1];
+      const notes = positional.slice(2).flatMap(parseNoteList);
+      if (!name || notes.length === 0) {
+        console.error(`Erro: Worker e nota são obrigatórios. Uso: sinapse ${command} <worker> <nota> [nota ...]`);
+        process.exit(1);
+      }
+      const ws = await resolveWorkspace(flags);
+      const agent = await findAgent(ws, name);
+      const current = agent.pinnedNotes ?? [];
+      let next: string[];
+      if (command === "pin") {
+        next = [...current, ...notes.filter((n) => !current.includes(n))];
+      } else {
+        const absent = notes.filter((n) => !current.includes(n));
+        for (const n of absent) console.error(`Aviso: a nota "${n}" não estava fixada em "${agent.name}".`);
+        next = current.filter((n) => !notes.includes(n));
+      }
+      const unchanged = next.length === current.length && next.every((n, i) => n === current[i]);
+      const updated = unchanged ? agent : await setPinnedNotes(ws, agent, next);
+      console.log(`Notas fixadas em "${updated.name}": ${describePins(updated)}`);
       break;
     }
 
@@ -732,6 +802,9 @@ async function main() {
       }
       if (data.handoffNote) {
         console.log(`Handoff pendente: o próximo turno começa lendo a nota "${data.handoffNote}"`);
+      }
+      if (data.pinnedNotes?.length) {
+        console.log(`Notas fixadas: ${data.pinnedNotes.join(", ")}`);
       }
       if (data.lastError) {
         console.log(`Last Error: ${data.lastError}`);

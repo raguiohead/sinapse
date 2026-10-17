@@ -49,6 +49,60 @@ export interface ContextUsage {
   model?: string;
 }
 
+/** Isolated git worktree of a worker; its cwd lives inside `path`. */
+export interface WorktreeInfo {
+  /** Absolute path of the worktree (<data>/workspaces/<id>/worktrees/<name>). */
+  path: string;
+  /** Branch created for it: "sinapse/<name>". */
+  branch: string;
+  /** Absolute path of the main repo (git toplevel) that owns the worktree. */
+  repo: string;
+  /** Commit the branch was created from; used to tell whether the worker committed anything. */
+  base?: string;
+}
+
+/** DELETE agent response. `worktree` is present only for workers that had one. */
+export interface AgentDeleteResult {
+  ok: true;
+  worktree?: {
+    action: "removed" | "kept";
+    path: string;
+    branch: string;
+    /** Why it was kept. */
+    reason?: string;
+  };
+}
+
+export interface SquadMember {
+  /** Worker name suffix; the worker is "<prefix>-<name>". */
+  name: string;
+  provider: "claude" | "agy";
+  model?: string;
+  autonomy: Autonomy;
+  role: string;
+}
+
+export interface SquadPreset {
+  name: string;
+  description?: string;
+  members: SquadMember[];
+  source: "embutido" | "usuario";
+}
+
+/** GET /squads response. `warnings` lists invalid entries ignored in ~/.sinapse/squads.json. */
+export interface SquadCatalog {
+  presets: SquadPreset[];
+  warnings: string[];
+}
+
+/** POST squads/apply response. */
+export interface SquadApplyResult {
+  preset: string;
+  created: AgentState[];
+  skipped: { name: string; reason: string }[];
+  failed: { name: string; error: string }[];
+}
+
 export interface AgentState extends AgentConfig {
   id: string;
   status: AgentStatus;
@@ -57,6 +111,7 @@ export interface AgentState extends AgentConfig {
   lastError?: string;
   usage?: ContextUsage;
   createdBy?: Author;
+  worktree?: WorktreeInfo;
 }
 
 export interface TurnEvent {

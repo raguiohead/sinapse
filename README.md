@@ -189,11 +189,14 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse workspace rm <nome\|id>` | Apaga um workspace (a pasta do projeto não é tocada). |
 | `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia e diretório de trabalho. |
 | `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
+| `sinapse spawn <nome> ... --worktree` | Isola o worker numa git worktree própria (veja [Isolamento por git worktree](#isolamento-por-git-worktree)). |
+| `sinapse squad list` | Lista os presets de squad (embutidos e de `~/.sinapse/squads.json`). |
+| `sinapse squad apply <preset> [--prefix <p>] [--worktree]` | Cria os workers do preset, nomeados `<prefix>-<membro>` (prefixo padrão: nome do preset). Workers que já existem são pulados com aviso. |
 | `sinapse ask <nome> "<prompt>"` | Envia prompt ao worker de modo síncrono, exibindo a saída em tempo real no terminal. |
 | `sinapse ask <nome> "<prompt>" --async` | Envia prompt de modo assíncrono, retornando imediatamente o `turnId` gerado. |
 | `sinapse check <nome>` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução e últimos eventos registrados. |
 | `sinapse stop <nome>` | Interrompe imediatamente o turno em execução no worker selecionado. |
-| `sinapse rm <nome>` | Remove o worker. Um turno em andamento é interrompido antes, e a sessão do worker deixa de ser usada. |
+| `sinapse rm <nome> [--force]` | Remove o worker. Um turno em andamento é interrompido antes, e a sessão do worker deixa de ser usada. Se ele tinha worktree, ela e a branch só são apagadas quando estão limpas e sem commits novos; senão ficam mantidas e o caminho é avisado. `--force` apaga mesmo assim. |
 | `sinapse models [claude\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude e AGY. |
 | `sinapse model <nome> <modelo\|padrao>` | Altera o modelo de um worker existente (`padrao` limpa e volta ao padrão do provedor). |
 | `sinapse note list` | Lista resumos de todas as notas salvas ordenadas por data de modificação. |
@@ -202,6 +205,43 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse note append <nome> "<texto>"` | Acrescenta ao final da nota (cria se não existir). Use `-` para ler do stdin. |
 | `sinapse note rm <nome>` | Remove permanentemente uma nota. |
 | `sinapse start` | Inicia o daemon `sinapsed` em primeiro plano (ou conecta se já estiver ativo). |
+
+### Isolamento por git worktree
+
+`sinapse spawn <nome> --provider claude --worktree` (ou a caixa "Isolar em git worktree" no diálogo de novo worker) faz o daemon rodar `git worktree add -b sinapse/<nome>` em `~/.sinapse/workspaces/<id>/worktrees/<nome>` e usar essa pasta como diretório de trabalho do worker. Assim vários workers com `edit` não pisam nos mesmos arquivos.
+
+- A pasta do workspace (ou `--cwd`) precisa estar num repositório git com ao menos um commit; se não estiver, ou se a branch `sinapse/<nome>` já existir, o spawn falha com mensagem clara.
+- A worktree é um checkout limpo do `HEAD`: **`node_modules`, artefatos de build e arquivos ignorados pelo git não existem nela** (rode `npm install` etc. dentro dela, se precisar). Alterações não commitadas da pasta original também não vão junto.
+- O Sinapse nunca faz merge sozinho: integre a branch `sinapse/<nome>` manualmente.
+- `sinapse rm` remove worktree e branch apenas se a worktree está limpa e a branch não tem commits novos. Caso contrário o worker é removido, a worktree/branch são mantidas e o aviso mostra o caminho. `sinapse rm <nome> --force` apaga tudo, inclusive trabalho não commitado.
+- No canvas, o card do worker mostra a branch num selo discreto.
+
+### Presets de squad
+
+Um squad é um conjunto de workers criado de uma vez. Presets embutidos:
+
+| Preset | Membros |
+|---|---|
+| `review` | `arquiteto` (read) + `revisor` (read) |
+| `tdd` | `implementador` (edit) + `testador` (edit) |
+| `bug-hunt` | `investigador` (read) + `corretor` (edit) |
+
+`sinapse squad apply review --prefix pr42` cria `pr42-arquiteto` e `pr42-revisor`; com `--worktree`, cada um ganha sua worktree. No canvas, clique com o botão direito no fundo e escolha "Aplicar squad ▸ <preset>" (sem worktree).
+
+Presets próprios ficam em `~/.sinapse/squads.json` (um array, ou `{ "presets": [...] }`); um preset com o nome de um embutido o sobrescreve. Entradas inválidas são ignoradas, com aviso em `sinapse squad list`.
+
+```json
+[
+  {
+    "name": "docs",
+    "description": "Redator e revisor de documentação",
+    "members": [
+      { "name": "redator", "provider": "claude", "model": "sonnet", "autonomy": "edit", "role": "Escreve a documentação." },
+      { "name": "revisor", "provider": "agy", "autonomy": "read", "role": "Revisa o texto." }
+    ]
+  }
+]
+```
 
 ### Modelos e janela de contexto
 
@@ -267,6 +307,8 @@ Todos os dados de runtime do Sinapse ficam armazenados no diretório do usuário
 - `~/.sinapse/state.json`: workspaces e agentes (id, workspace, nome, provedor, pasta, status, sessão, modelo, uso de contexto, quem criou).
 - `~/.sinapse/daemon.json`: Informações do daemon em execução (`port`, `token`, `pid`).
 - `~/.sinapse/workspaces/<id>/notes/`: notas do workspace (`<nome>.md`) e `.meta.json` com a autoria.
+- `~/.sinapse/workspaces/<id>/worktrees/<nome>/`: git worktrees dos workers criados com `--worktree`.
+- `~/.sinapse/squads.json`: presets de squad do usuário (opcional).
 - `~/.sinapse/workspaces/<id>/orquestrador/`: pasta onde o orquestrador roda, com o guia (`CLAUDE.md` ou `AGENTS.md`) e, para o AGY, a skill em `.agent/skills/sinapse`.
 - `~/.sinapse/desktop.json`: configurações do app (workspace ativo, padrões de novos workers e aparência).
 - `~/.sinapse/desktop.log`: Log de saída do processo de build e inicialização do Electron Desktop.

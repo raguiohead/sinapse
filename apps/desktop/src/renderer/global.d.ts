@@ -6,8 +6,12 @@ import type {
   Note,
   AgentState,
   Workspace,
+  AgentDeleteResult,
+  SquadApplyResult,
+  SquadCatalog,
 } from "@sinapse/core";
 import type {
+  SquadApplyPayload,
   DaemonInfo,
   WorkerAskPayload,
   WorkerSpawnPayload,
@@ -72,10 +76,14 @@ export interface SinapseBridge {
     ask: (payload: WorkerAskPayload) => Promise<{ turnId: string }>;
     stop: (workspaceId: string, agent: string) => Promise<any>;
     /** Removes the worker; a running turn is interrupted first. Emits agent_deleted on the bus. */
-    delete: (workspaceId: string, agent: string) => Promise<void>;
+    delete: (workspaceId: string, agent: string) => Promise<AgentDeleteResult>;
   };
   models: {
     list: () => Promise<ModelCatalog>;
+  };
+  squads: {
+    list: () => Promise<SquadCatalog>;
+    apply: (payload: SquadApplyPayload) => Promise<SquadApplyResult>;
   };
   /** Notes written from the canvas are authored by "usuario". */
   notes: {

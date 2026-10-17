@@ -27,6 +27,7 @@ export function NewWorkerDialog({
     defaults?.autonomy ?? "edit"
   );
   const [cwd, setCwd] = useState(workspaceDefaultFolder);
+  const [worktree, setWorktree] = useState(false);
   const [isSpawning, setIsSpawning] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -58,6 +59,7 @@ export function NewWorkerDialog({
         autonomy,
         cwd: cwd.trim() || undefined,
         ...(model ? { model } : {}),
+        ...(worktree ? { worktree: true } : {}),
       };
 
       await window.sinapse?.workers?.spawn(payload);
@@ -184,6 +186,21 @@ export function NewWorkerDialog({
               placeholder="/caminho/absoluto"
               className="dialog-input dialog-input-mono"
             />
+          </div>
+
+          <div className="dialog-field">
+            <label className="dialog-checkbox-label" htmlFor="worker-worktree-input">
+              <input
+                id="worker-worktree-input"
+                type="checkbox"
+                checked={worktree}
+                onChange={(e) => setWorktree(e.target.checked)}
+              />
+              Isolar em git worktree
+            </label>
+            <div className="dialog-hint">
+              Cria a branch sinapse/&lt;nome&gt; numa pasta própria. Exige repositório git; node_modules e artefatos não vêm junto.
+            </div>
           </div>
 
           {errorMessage && <div className="dialog-error">{errorMessage}</div>}

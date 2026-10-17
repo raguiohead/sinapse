@@ -271,6 +271,7 @@ export function App() {
     y: number;
     items?: ContextMenuItem[];
   } | null>(null);
+  const [squadPresets, setSquadPresets] = useState<string[]>([]);
   const [isNewWorkerDialogOpen, setIsNewWorkerDialogOpen] = useState(false);
   const [isNewNoteDialogOpen, setIsNewNoteDialogOpen] = useState(false);
   const [isNewWorkspaceDialogOpen, setIsNewWorkspaceDialogOpen] = useState(false);
@@ -511,6 +512,8 @@ export function App() {
                 status: worker.status || "idle",
                 model: worker.model,
                 usage: worker.usage,
+                worktreeBranch: worker.worktree?.branch,
+                worktreePath: worker.worktree?.path,
                 log: "",
                 lastPrompt: "",
               },
@@ -709,6 +712,8 @@ export function App() {
                     status: agent.status || "idle",
                     model: agent.model,
                     usage: agent.usage,
+                    worktreeBranch: agent.worktree?.branch,
+                    worktreePath: agent.worktree?.path,
                     log: "",
                     lastPrompt: "",
                   },
@@ -772,6 +777,8 @@ export function App() {
                     status: agent.status || "idle",
                     model: agent.model,
                     usage: agent.usage,
+                    worktreeBranch: agent.worktree?.branch,
+                    worktreePath: agent.worktree?.path,
                     log: "",
                     lastPrompt: "",
                   },
@@ -1307,6 +1314,26 @@ export function App() {
   const handlePaneContextMenu = useCallback((e: React.MouseEvent | MouseEvent) => {
     e.preventDefault();
     setContextMenu({ x: e.clientX, y: e.clientY });
+    window.sinapse?.squads
+      ?.list()
+      .then((catalog) => setSquadPresets(catalog.presets.map((p) => p.name)))
+      .catch(() => setSquadPresets([]));
+  }, []);
+
+  const handleApplySquad = useCallback(async (preset: string) => {
+    const workspaceId = activeWorkspaceIdRef.current;
+    if (!workspaceId) return;
+    try {
+      const result = await window.sinapse?.squads?.apply({ workspaceId, preset });
+      if (!result) return;
+      const notes = [
+        ...result.skipped.map((s) => `"${s.name}" ignorado (${s.reason})`),
+        ...result.failed.map((f) => `"${f.name}" falhou: ${f.error}`),
+      ];
+      if (notes.length > 0) window.alert(`Squad "${preset}":\n${notes.join("\n")}`);
+    } catch (err: any) {
+      window.alert(`Não foi possível aplicar o squad "${preset}": ${err?.message ?? err}`);
+    }
   }, []);
 
   const activeThinkingCount = nodes.filter(
@@ -1367,6 +1394,8 @@ export function App() {
           onNewWorker={() => setIsNewWorkerDialogOpen(true)}
           onNewNote={() => setIsNewNoteDialogOpen(true)}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          squadPresets={squadPresets}
+          onApplySquad={handleApplySquad}
         />
       )}
 

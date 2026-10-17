@@ -1,4 +1,4 @@
-import type { ContextUsage, OrchestratorConfig } from "@sinapse/core";
+import type { ContextUsage, OrchestratorConfig, Provider } from "@sinapse/core";
 
 export const IPC = {
   // Orchestrator ("brain") terminals — one per workspace, all calls carry the workspaceId.
@@ -54,7 +54,7 @@ export type Autonomy = "read" | "edit" | "full";
 
 /** New workers default to the active workspace's folder; there is no global default folder. */
 export interface WorkerDefaults {
-  provider: "claude" | "agy";
+  provider: Provider;
   /** Undefined = provider default. */
   model?: string;
   autonomy: Autonomy;
@@ -119,7 +119,7 @@ export interface WorkerAskPayload {
 export interface WorkerSpawnPayload {
   workspaceId: string;
   name: string;
-  provider: "claude" | "agy";
+  provider: Provider;
   /** Defaults to the workspace folder when omitted. */
   cwd?: string;
   role: string;

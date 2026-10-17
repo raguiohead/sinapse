@@ -70,7 +70,9 @@ function parseMember(raw: unknown): SquadMember | string {
   if (!raw || typeof raw !== "object") return "membro inválido";
   const m = raw as Record<string, unknown>;
   if (typeof m.name !== "string" || !MEMBER_NAME_REGEX.test(m.name)) return "membro sem name válido";
-  if (m.provider !== "claude" && m.provider !== "agy") return `membro "${m.name}": provider deve ser claude ou agy`;
+  if (m.provider !== "claude" && m.provider !== "codex" && m.provider !== "agy") {
+    return `membro "${m.name}": provider deve ser claude, codex ou agy`;
+  }
   if (m.autonomy !== "read" && m.autonomy !== "edit" && m.autonomy !== "full") {
     return `membro "${m.name}": autonomy deve ser read, edit ou full`;
   }

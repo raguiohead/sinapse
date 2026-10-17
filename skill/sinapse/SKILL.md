@@ -1,6 +1,6 @@
 ---
 name: sinapse
-description: Delegar trabalho para workers de outros provedores (AGY/Gemini, outros Claudes) pelo orquestrador Sinapse. Use quando a tarefa for operacional, pesada em tokens, paralelizável, ou quando uma segunda opinião de outro modelo ajudar (revisão cruzada). Requer a CLI `sinapse` no PATH.
+description: Delegar trabalho para workers de outros provedores (AGY/Gemini, OpenAI Codex, outros Claudes) pelo orquestrador Sinapse. Use quando a tarefa for operacional, pesada em tokens, paralelizável, ou quando uma segunda opinião de outro modelo ajudar (revisão cruzada). Requer a CLI `sinapse` no PATH.
 ---
 
 # Sinapse — delegação para workers
@@ -21,7 +21,7 @@ Você é o **cérebro**. Os workers rodam turnos headless com sessão persistent
 ```bash
 sinapse workspaces                       # lista workspaces do daemon
 sinapse list                             # lista workers do workspace atual
-sinapse spawn <nome> --provider agy|claude [--cwd <dir>] --role "<papel>" [--autonomy read|edit|full] [--model <modelo>]
+sinapse spawn <nome> --provider agy|codex|claude [--cwd <dir>] --role "<papel>" [--autonomy read|edit|full] [--model <modelo>]
 sinapse spawn <nome> ... --worktree      # isola o worker numa git worktree (branch sinapse/<nome>); exige repo git
 sinapse squad list                       # presets de squad (review, tdd, bug-hunt + ~/.sinapse/squads.json)
 sinapse squad apply <preset> [--prefix <p>] [--worktree]   # cria os workers <prefix>-<membro>; pula os existentes
@@ -33,7 +33,7 @@ sinapse check <nome> [--full]            # status, fila e últimos eventos (--fu
 sinapse stop <nome>                      # cancela o turno atual E descarta a fila
 sinapse handoff <nome> [--note <nota>]   # resumo → nota handoff-<nome>, sessão zerada, próximo turno lê a nota
 sinapse rm <nome> [--force]              # remove o worker (perde a sessão); só se o usuário pedir ou o worker não servir mais
-sinapse models [claude|agy]              # lista modelos disponíveis
+sinapse models [claude|codex|agy]              # lista modelos disponíveis
 sinapse model <nome> <modelo|padrao>     # altera o modelo do worker (padrao limpa)
 sinapse note list                        # lista notas
 sinapse note read <nome>                 # lê o conteúdo bruto da nota
@@ -49,9 +49,9 @@ sinapse note rm <nome>                   # remove nota
 
 ## Modelos
 
-- Use `--model <modelo>` no `sinapse spawn` ou consulte os disponíveis com `sinapse models agy` (ou `claude`).
+- Use `--model <modelo>` no `sinapse spawn` ou consulte os disponíveis com `sinapse models [claude|codex|agy]`.
 - Para alterar o modelo de um worker existente, use `sinapse model <nome> <modelo>` (ou `padrao` para restaurar o padrão do provedor).
-- **Diretrizes de seleção**: use `gemini-3.8-flash-*` para trabalho mecânico, boilerplate, scaffolding, CSS, testes e tarefas volumosas; use Claude Opus/Sonnet (via provider `claude`) para raciocínio refinado e tarefas com alto peso de julgamento.
+- **Diretrizes de seleção**: use `gemini-3.8-flash-*` (provider `agy`) para trabalho mecânico, boilerplate, scaffolding, CSS, testes e tarefas volumosas; use `gpt-5.3-codex`/`o3` (provider `codex`) para segunda opinião de engenharia, refatoração focada e depuração; use Claude Opus/Sonnet (provider `claude`) para raciocínio refinado e tarefas com alto peso de julgamento.
 - O comando `sinapse list` exibe o uso de contexto de cada worker (ex: `38k/200k 19%` ou com `≈` quando estimado).
 - **Handoff aos ~80%**: quando o contexto do worker passar de ~80% da janela, rode `sinapse handoff <nome>` (com o worker ocioso). O worker resume o trabalho na nota `handoff-<nome>`, a sessão é zerada (nome, papel, modelo, autonomia e pasta continuam) e o próximo turno começa lendo a nota. Não crie um worker novo para isso.
 

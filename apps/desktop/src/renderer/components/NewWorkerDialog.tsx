@@ -1,4 +1,5 @@
 import { useState, useEffect, type FormEvent } from "react";
+import type { Provider } from "@sinapse/core";
 import type { WorkerDefaults, Autonomy, WorkerSpawnPayload } from "../../shared/ipc";
 import { ModelSelect } from "./ModelSelect";
 
@@ -18,7 +19,7 @@ export function NewWorkerDialog({
   onSuccess,
 }: NewWorkerDialogProps) {
   const [name, setName] = useState("");
-  const [provider, setProvider] = useState<"claude" | "agy">(
+  const [provider, setProvider] = useState<Provider>(
     defaults?.provider ?? "claude"
   );
   const [model, setModel] = useState<string | null>(defaults?.model ?? null);
@@ -120,12 +121,13 @@ export function NewWorkerDialog({
                 id="worker-provider-select"
                 value={provider}
                 onChange={(e) => {
-                  setProvider(e.target.value as "claude" | "agy");
+                  setProvider(e.target.value as Provider);
                   setModel(null);
                 }}
                 className="dialog-select"
               >
                 <option value="claude">Claude</option>
+                <option value="codex">Codex (OpenAI)</option>
                 <option value="agy">AGY (Gemini 3.8 Flash)</option>
               </select>
             </div>

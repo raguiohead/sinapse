@@ -426,7 +426,7 @@ Uso:
   sinapse stop <nome> [--workspace <ws>]                     Interrompe o turno ativo e esvazia a fila
   sinapse handoff <nome> [--note <nota>] [--workspace <ws>]  Resume o trabalho numa nota e zera a sessão do worker
   sinapse rm <nome> [--force] [--workspace <ws>]             Remove o worker (--force apaga worktree/branch mesmo com trabalho nela)
-  sinapse models [claude|agy]                                Lista catálogo de modelos
+  sinapse models [claude|codex|agy]                          Lista catálogo de modelos
   sinapse model <nome> <modelo|padrao> [--workspace <ws>]    Altera o modelo de um worker
   sinapse note list [--workspace <ws>]                       Lista notas do workspace
   sinapse note read <nome> [--workspace <ws>]                Exibe o conteúdo da nota
@@ -544,9 +544,13 @@ async function main() {
         process.exit(1);
       }
 
-      const provider = (flags.provider || flags.p) as Provider;
+      const provider = ((flags.provider || flags.p || "") as string).toLowerCase() as Provider;
       if (!provider) {
-        console.error("Erro: --provider é obrigatório (ex: claude, agy)");
+        console.error("Erro: --provider é obrigatório (claude, codex ou agy)");
+        process.exit(1);
+      }
+      if (provider !== "claude" && provider !== "codex" && provider !== "agy") {
+        console.error(`Erro: Provedor inválido: "${provider}". Use "claude", "codex" ou "agy".`);
         process.exit(1);
       }
 
@@ -885,13 +889,17 @@ async function main() {
       if (!provider) {
         printGroup("Claude", catalog.claude || []);
         console.log("");
+        printGroup("Codex", catalog.codex || []);
+        console.log("");
         printGroup("AGY", catalog.agy || []);
       } else if (provider === "claude") {
         printGroup("Claude", catalog.claude || []);
+      } else if (provider === "codex") {
+        printGroup("Codex", catalog.codex || []);
       } else if (provider === "agy") {
         printGroup("AGY", catalog.agy || []);
       } else {
-        console.error(`Provedor desconhecido: "${provider}". Use "claude" ou "agy".`);
+        console.error(`Provedor desconhecido: "${provider}". Use "claude", "codex" ou "agy".`);
         process.exit(1);
       }
       break;

@@ -34,7 +34,7 @@ export interface AgentConfig {
   cwd: string;
   role: string;
   autonomy: Autonomy;
-  /** Model requested for this agent. Undefined = provider default (account default for Claude, gemini-3.8-flash-high for AGY). */
+  /** Model requested for this agent. Undefined = provider default (account default for Claude/Codex, gemini-3.8-flash-high for AGY). */
   model?: string;
 }
 
@@ -242,7 +242,7 @@ export interface ModelOption {
 }
 
 /** GET /models response. */
-export type ModelCatalog = Record<"claude" | "agy", ModelOption[]>;
+export type ModelCatalog = Record<Provider, ModelOption[]>;
 
 export interface NoteSummary {
   workspaceId: string;

@@ -17,7 +17,7 @@ export async function getModelCatalog(): Promise<ModelCatalog> {
       } catch (err) {
         console.error("Erro ao carregar catálogo de modelos:", err);
       }
-      return { claude: [], agy: [] };
+      return { claude: [], codex: [], agy: [] };
     })().finally(() => {
       catalogPromise = null;
     });
@@ -52,7 +52,8 @@ export function ModelSelect({
     }
   }, []);
 
-  const providerKey = provider === "agy" ? "agy" : "claude";
+  const providerKey: Provider =
+    provider === "agy" ? "agy" : provider === "codex" ? "codex" : "claude";
   const options: ModelOption[] = catalog?.[providerKey] || [];
   const selectedValue = value ?? "";
 

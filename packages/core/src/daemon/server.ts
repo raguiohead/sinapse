@@ -13,6 +13,7 @@ import { loadSquadCatalog } from "../squads.js";
 import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { randomUUID } from "node:crypto";
 import type {
+  Adapter,
   AgentConfig,
   AgentDeleteResult,
   AgentState,
@@ -44,6 +45,7 @@ import type {
 import { AUTHOR_HEADER, ENV, USER_AUTHOR } from "../routes.js";
 import { ClaudeAdapter } from "../adapters/claude.js";
 import { AgyAdapter } from "../adapters/agy.js";
+import { CodexAdapter } from "../adapters/codex.js";
 import { estimateContextWindow } from "../context.js";
 import { handoffPreamble, withPreamble } from "../prompt.js";
 
@@ -338,6 +340,17 @@ const CLAUDE_MODELS: ModelOption[] = [
   { id: "haiku", label: "Haiku" },
 ];
 
+const CODEX_MODELS: ModelOption[] = [
+  { id: "gpt-5.3-codex", label: "GPT-5.3 Codex (mais recente)" },
+  { id: "gpt-5.2-codex", label: "GPT-5.2 Codex" },
+  { id: "gpt-5.1-codex-max", label: "GPT-5.1 Codex Max" },
+  { id: "gpt-5.1-codex-mini", label: "GPT-5.1 Codex Mini" },
+  { id: "gpt-5-codex", label: "GPT-5 Codex" },
+  { id: "o3", label: "o3" },
+  { id: "o4-mini", label: "o4-mini" },
+  { id: "codex-mini-latest", label: "Codex Mini" },
+];
+
 const FALLBACK_AGY_MODELS: ModelOption[] = [
   { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)" },
 ];
@@ -473,7 +486,7 @@ function setupNotesWatcher(): () => void {
 
 interface ActiveTurnSession {
   turnId: string;
-  adapter: ClaudeAdapter | AgyAdapter;
+  adapter: Adapter;
   events: TurnEvent[];
   stopped: boolean;
   /** Don't start the next queued prompt when this turn ends (a handoff resets the session first). */
@@ -698,10 +711,12 @@ async function writeDaemonFile(port: number, token: string): Promise<void> {
   await writePrivate(getDaemonFile(), JSON.stringify({ port, token, pid: process.pid }, null, 2));
 }
 
-function createAdapter(provider: Provider): ClaudeAdapter | AgyAdapter {
+function createAdapter(provider: Provider): Adapter {
   switch (provider) {
     case "claude":
       return new ClaudeAdapter();
+    case "codex":
+      return new CodexAdapter();
     case "agy":
       return new AgyAdapter();
     default:
@@ -1094,6 +1109,7 @@ export async function start(
     const agy = await fetchAgyModels();
     return {
       claude: CLAUDE_MODELS,
+      codex: CODEX_MODELS,
       agy,
     };
   });

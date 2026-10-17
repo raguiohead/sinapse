@@ -470,6 +470,21 @@ export function SettingsScreen({
                       <button
                         type="button"
                         className={`segmented-btn ${
+                          settings?.workerDefaults?.provider === "codex"
+                            ? "active"
+                            : ""
+                        }`}
+                        onClick={() =>
+                          savePatch({
+                            workerDefaults: { provider: "codex", model: undefined },
+                          })
+                        }
+                      >
+                        Codex (OpenAI)
+                      </button>
+                      <button
+                        type="button"
+                        className={`segmented-btn ${
                           settings?.workerDefaults?.provider === "agy" ? "active" : ""
                         }`}
                         onClick={() =>

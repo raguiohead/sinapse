@@ -24,12 +24,14 @@ export interface WorkerNodeData {
 function getProviderColor(p: string): string {
   if (p === "agy") return "var(--agy)";
   if (p === "claude") return "var(--claude)";
+  if (p === "codex") return "var(--codex)";
   return "var(--accent-b)";
 }
 
 function getProviderInitial(p: string): string {
   if (p === "agy") return "G";
   if (p === "claude") return "C";
+  if (p === "codex") return "X";
   return p.charAt(0).toUpperCase();
 }
 

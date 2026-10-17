@@ -15,10 +15,10 @@ São quatro peças. O app desktop abre o Claude Code interativo num terminal emb
      CLI `sinapse` ──── HTTP + token ────▶  daemon `sinapsed`  (127.0.0.1)
                                                    │
                                      adapters headless, sessão persistente
-                                          ┌────────┴────────┐
-                                          ▼                 ▼
-                                    worker Claude      worker AGY
-                                     (claude -p)        (agy -p)
+                                  ┌───────────────────┼───────────────────┐
+                                  ▼                   ▼                   ▼
+                            worker Claude       worker Codex         worker AGY
+                             (claude -p)      (codex exec --json)     (agy -p)
 ```
 
 ## Requisitos
@@ -29,11 +29,12 @@ São quatro peças. O app desktop abre o Claude Code interativo num terminal emb
 | Git | Git instalado | Git instalado |
 | Claude Code CLI | `claude` instalado e autenticado | Instalador **NATIVO** (`claude.exe` no PATH, não pacote npm) |
 | AGY CLI | `agy` instalado e autenticado | `agy.exe` no PATH |
+| OpenAI Codex CLI (opcional, para workers `codex`) | `codex` instalado e autenticado no PATH | Executável `codex` no PATH |
 | Compilador C++ (opcional) | `build-essential python3` | Visual Studio Build Tools (Desktop development with C++) |
 
 > [!IMPORTANT]
 > **Por que executáveis nativos no Windows?**
-> O prompt de cada turno é passado como argumento ao CLI do worker. Se esse argumento passasse pelo `cmd.exe` (o que acontece com os atalhos `.cmd` que o npm instala), aspas e caracteres especiais do prompt quebrariam o comando ou seriam interpretados como comandos. Com `claude.exe` e `agy.exe` no PATH, o Sinapse cria o processo diretamente, sem shell, e o Node faz o escape correto dos argumentos.
+> O prompt de cada turno é passado ao CLI do worker (via argumento no `agy` ou `stdin` no `claude`/`codex`). Se a chamada passasse pelo `cmd.exe` (o que acontece com os atalhos `.cmd` que o npm instala), aspas e caracteres especiais quebrariam o comando ou seriam interpretados como comandos. Com os executáveis nativos no PATH, o Sinapse cria o processo diretamente, sem shell, e o Node faz o escape correto dos argumentos.
 >
 > O pacote `node-pty` normalmente já fornece binários pré-compilados. Se o ambiente exigir compilação de código nativo, as ferramentas de compilação acima serão necessárias.
 
@@ -188,7 +189,7 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse workspace create <nome> --folder <dir> [--orchestrator claude\|agy] [--model <m>]` | Cria um workspace. |
 | `sinapse workspace rm <nome\|id>` | Apaga um workspace (a pasta do projeto não é tocada). |
 | `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia e diretório de trabalho. |
-| `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
+| `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|codex\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
 | `sinapse spawn <nome> ... --worktree` | Isola o worker numa git worktree própria (veja [Isolamento por git worktree](#isolamento-por-git-worktree)). |
 | `sinapse squad list` | Lista os presets de squad (embutidos e de `~/.sinapse/squads.json`). |
 | `sinapse squad apply <preset> [--prefix <p>] [--worktree]` | Cria os workers do preset, nomeados `<prefix>-<membro>` (prefixo padrão: nome do preset). Workers que já existem são pulados com aviso. |
@@ -200,7 +201,7 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse stop <nome>` | Interrompe o turno em execução e descarta os prompts da fila (a saída informa quantos). |
 | `sinapse handoff <nome> [--note <nota>]` | Pede ao worker um resumo estruturado (objetivo, estado, decisões, arquivos, pendências), salva na nota `handoff-<nome>` (ou `--note`), zera a sessão e mantém nome, papel, modelo, autonomia e pasta. O próximo turno começa lendo a nota. |
 | `sinapse rm <nome> [--force]` | Remove o worker. Um turno em andamento é interrompido antes, e a sessão do worker deixa de ser usada. Se ele tinha worktree, ela e a branch só são apagadas quando estão limpas e sem commits novos; senão ficam mantidas e o caminho é avisado. `--force` apaga mesmo assim. |
-| `sinapse models [claude\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude e AGY. |
+| `sinapse models [claude\|codex\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude, Codex e AGY. |
 | `sinapse model <nome> <modelo\|padrao>` | Altera o modelo de um worker existente (`padrao` limpa e volta ao padrão do provedor). |
 | `sinapse note list` | Lista resumos de todas as notas salvas ordenadas por data de modificação. |
 | `sinapse note read <nome>` | Exibe o conteúdo bruto da nota especificada. |
@@ -249,11 +250,11 @@ Presets próprios ficam em `~/.sinapse/squads.json` (um array, ou `{ "presets": 
 ### Modelos e janela de contexto
 
 Tanto no canvas quanto na CLI, é possível selecionar e alternar os modelos dos workers:
-- **Seleção no Canvas e na CLI:** utilize `--model <modelo>` no `sinapse spawn` ou consulte os modelos disponíveis via `sinapse models [claude|agy]`. Para alterar o modelo de um worker existente, utilize `sinapse model <nome> <modelo>` (ou `sinapse model <nome> padrao` para remover o modelo customizado). No canvas, o modelo pode ser escolhido na criação e modificado no card do worker.
+- **Seleção no Canvas e na CLI:** utilize `--model <modelo>` no `sinapse spawn` ou consulte os modelos disponíveis via `sinapse models [claude|codex|agy]`. Para alterar o modelo de um worker existente, utilize `sinapse model <nome> <modelo>` (ou `sinapse model <nome> padrao` para remover o modelo customizado). No canvas, o modelo pode ser escolhido na criação e modificado no card do worker.
 - **Orquestrador:** a seção "Orquestrador" das configurações troca o agente e o modelo do workspace ativo (veja Workspaces).
 - **Janela de contexto:**
   - O **Claude** reporta o tamanho real de sua janela de contexto diretamente pela CLI (`contextWindow`).
-  - O **AGY** e o **orquestrador** exibem uma estimativa da janela de contexto marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
+  - O **Codex**, o **AGY** e o **orquestrador** exibem a janela reportada pela CLI (quando disponível) ou uma estimativa marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
   - O uso de contexto do **orquestrador Claude** é lido a partir do transcript de sessão do Claude Code; o orquestrador AGY mostra só o modelo.
 - **Handoff:** quando um worker passa de 80% da janela, o card mostra um botão "Handoff" (o mesmo que `sinapse handoff <nome>`). O resumo vira a nota `handoff-<nome>`, a sessão recomeça do zero e o primeiro turno seguinte é instruído a ler essa nota.
 
@@ -281,11 +282,11 @@ As notas representam a memória compartilhada entre o usuário, o cérebro e os 
 
 O parâmetro `--autonomy` ajusta as permissões passadas aos executáveis dos adapters:
 
-| Nível | Flag Claude (`claude`) | Flag AGY (`agy`) | Comportamento |
-|---|---|---|---|
-| `read` | `--permission-mode plan` | `--mode plan` | Modo somente leitura/planejamento. Não altera arquivos. |
-| `edit` *(padrão)* | `--permission-mode acceptEdits` | `--mode accept-edits` | Permite criação e edição de arquivos do projeto sem confirmações repetitivas. |
-| `full` | *(sem restrições)* | *(sem restrições)* | Execução total irrestrita (usar apenas sob pedido explícito). |
+| Nível | Flag Claude (`claude`) | Flag Codex (`codex`) | Flag AGY (`agy`) | Comportamento |
+|---|---|---|---|---|
+| `read` | `--permission-mode plan` | `--sandbox read-only` | `--mode plan` | Modo somente leitura/planejamento. Não altera arquivos. |
+| `edit` *(padrão)* | `--permission-mode acceptEdits` | `--sandbox workspace-write` | `--mode accept-edits` | Permite criação e edição de arquivos do projeto sem confirmações repetitivas. |
+| `full` | *(sem restrições)* | `--dangerously-bypass-approvals-and-sandbox` | *(sem restrições)* | Execução total irrestrita (usar apenas sob pedido explícito). |
 
 ### Exemplo de Delegação pelo Cérebro
 
@@ -333,7 +334,7 @@ sinapse/
 │       ├── build/             # Ícones (icon.svg, icon.png, icon.ico)
 │       └── src/               # Processo principal (main), preload e renderer
 ├── packages/
-│   ├── core/                  # Daemon Fastify, adapters (claude, agy), gerenciamento de processos
+│   ├── core/                  # Daemon Fastify, adapters (claude, codex, agy), gerenciamento de processos
 │   └── cli/                   # CLI sinapse executável
 ├── scripts/                   # Scripts de inicialização e instalação de atalhos (Linux / Windows)
 │   ├── install-shortcut.sh    # Instalação de atalho e ícone (.desktop) no Linux
@@ -350,7 +351,6 @@ sinapse/
 ## Limitações conhecidas
 
 - **Versão do Electron:** o projeto fixa o Electron 35. A partir do 36 (GTK4), o app fecha ao iniciar em sistemas Linux que também carregam GTK3, com o erro "GTK 2/3 symbols detected".
-- **Adapter Codex:** O adapter para OpenAI Codex ainda não foi implementado.
 - **Persistência de logs:** O histórico detalhado de eventos de turnos de workers é mantido em memória e não é persistido após o encerramento do daemon.
 - **Fila em memória:** prompts enfileirados com `--queue` se perdem se o daemon reiniciar. `wait` e `check --full` mostram só a resposta do último turno; numa fila com vários prompts, as respostas anteriores ficam apenas no canvas.
 - **Confiança por workspace:** cada orquestrador roda na sua própria pasta, então o Claude Code ou o AGY pede confiança uma vez por workspace novo.

@@ -76,7 +76,7 @@ export interface AgentDeleteResult {
 export interface SquadMember {
   /** Worker name suffix; the worker is "<prefix>-<name>". */
   name: string;
-  provider: "claude" | "agy";
+  provider: Provider;
   model?: string;
   autonomy: Autonomy;
   role: string;

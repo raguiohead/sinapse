@@ -16,6 +16,7 @@ export interface WorkerNodeData {
   /** Branch/path of the worker's git worktree, when it has one. */
   worktreeBranch?: string;
   worktreePath?: string;
+  pinnedNotes?: string[];
   log?: string;
   lastPrompt?: string;
   deleteError?: string;
@@ -279,6 +280,14 @@ export function WorkerNode({ data }: NodeProps) {
                 title={`Worktree isolada: ${nodeData.worktreePath ?? ""}`}
               >
                 ⎇ {nodeData.worktreeBranch}
+              </span>
+            )}
+            {nodeData.pinnedNotes && nodeData.pinnedNotes.length > 0 && (
+              <span
+                className="worker-pin-badge"
+                title={`Notas fixadas: ${nodeData.pinnedNotes.join(", ")}`}
+              >
+                📌 {nodeData.pinnedNotes.length}
               </span>
             )}
           </div>

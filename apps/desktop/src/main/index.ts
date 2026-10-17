@@ -1523,7 +1523,10 @@ function registerIpcHandlers(): void {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: payload.model }),
+      body: JSON.stringify({
+        ...(payload.model !== undefined ? { model: payload.model } : {}),
+        ...(Array.isArray(payload.pinnedNotes) ? { pinnedNotes: payload.pinnedNotes } : {}),
+      }),
     });
 
     if (!response.ok) {

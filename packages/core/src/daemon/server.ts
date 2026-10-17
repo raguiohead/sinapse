@@ -47,7 +47,7 @@ import { ClaudeAdapter } from "../adapters/claude.js";
 import { AgyAdapter } from "../adapters/agy.js";
 import { CodexAdapter } from "../adapters/codex.js";
 import { estimateContextWindow } from "../context.js";
-import { handoffPreamble, withPreamble } from "../prompt.js";
+import { handoffPreamble, pinnedNotesPreamble, withPreamble, type PinnedNoteInput } from "../prompt.js";
 
 const WS_ID_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const NOTE_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -189,6 +189,96 @@ function validateModel(input: unknown): { valid: true; model?: string } | { vali
 
 function isValidNoteName(name: string): boolean {
   return NOTE_NAME_REGEX.test(name);
+}
+
+const MAX_PINNED_NOTES = 10;
+
+/** Validates a pinnedNotes list (null = none): trimmed, deduplicated, at most MAX_PINNED_NOTES. */
+function normalizePinnedNotes(input: unknown): { ok: true; notes: string[] } | { ok: false; error: string } {
+  if (input === null) return { ok: true, notes: [] };
+  if (!Array.isArray(input)) {
+    return { ok: false, error: "pinnedNotes deve ser uma lista de nomes de nota" };
+  }
+  const notes: string[] = [];
+  for (const raw of input) {
+    const name = typeof raw === "string" ? raw.trim() : "";
+    if (!isValidNoteName(name)) {
+      return { ok: false, error: `Nome de nota inválido: ${String(raw)} (use minúsculas, números, - e _)` };
+    }
+    if (!notes.includes(name)) notes.push(name);
+  }
+  if (notes.length > MAX_PINNED_NOTES) {
+    return { ok: false, error: `No máximo ${MAX_PINNED_NOTES} notas fixadas por worker` };
+  }
+  return { ok: true, notes };
+}
+
+async function missingNotes(workspaceId: string, names: string[]): Promise<string[]> {
+  const notesDir = getWorkspaceNotesDir(workspaceId);
+  const missing: string[] = [];
+  for (const name of names) {
+    const exists = await fs.stat(path.join(notesDir, `${name}.md`)).then(() => true).catch(() => false);
+    if (!exists) missing.push(name);
+  }
+  return missing;
+}
+
+/** Sets the agent's pinned notes, dropping the injection records of the notes no longer pinned. */
+function setPinnedNotes(agent: AgentState, notes: string[]): void {
+  if (notes.length === 0) {
+    delete agent.pinnedNotes;
+    delete agent.pinnedNoteSeen;
+    return;
+  }
+  agent.pinnedNotes = notes;
+  if (agent.pinnedNoteSeen) {
+    agent.pinnedNoteSeen = Object.fromEntries(
+      Object.entries(agent.pinnedNoteSeen).filter(([name]) => notes.includes(name))
+    );
+  }
+}
+
+/**
+ * Pinned-notes preamble for the next turn: full content on a fresh session or when the note changed since it was
+ * last injected, a reminder otherwise. `seen` is what pinnedNoteSeen becomes if the turn succeeds. Never throws.
+ */
+async function pinnedNotesForTurn(
+  agent: AgentState,
+  fresh: boolean
+): Promise<{ text?: string; seen: Record<string, number> } | undefined> {
+  const pinned = agent.pinnedNotes ?? [];
+  if (pinned.length === 0) return undefined;
+  try {
+    const previous: Record<string, number> = fresh ? {} : agent.pinnedNoteSeen ?? {};
+    const notesDir = getWorkspaceNotesDir(agent.workspaceId);
+    const inputs: PinnedNoteInput[] = [];
+    const mtimes: Record<string, number> = {};
+    for (const name of pinned) {
+      if (!isValidNoteName(name)) continue;
+      const filePath = path.join(notesDir, `${name}.md`);
+      try {
+        const stat = await fs.stat(filePath);
+        mtimes[name] = stat.mtimeMs;
+        if (previous[name] === stat.mtimeMs) {
+          inputs.push({ name });
+        } else {
+          inputs.push({ name, content: await fs.readFile(filePath, "utf-8") });
+        }
+      } catch {
+        // The pinned note no longer exists: skip it.
+      }
+    }
+    const { text, delivered } = pinnedNotesPreamble(inputs);
+    const seen: Record<string, number> = {};
+    for (const input of inputs) {
+      // Notes left out by the total cap stay unseen, so a later turn delivers them.
+      if (input.content === undefined || delivered.includes(input.name)) seen[input.name] = mtimes[input.name];
+    }
+    return { text, seen };
+  } catch (err) {
+    console.error("Falha ao montar as notas fixadas:", err);
+    return undefined;
+  }
 }
 
 function extractTitle(name: string, content: string): string {
@@ -734,11 +824,17 @@ async function executeTurn(
   const adapter = session.adapter;
   let turnResult: TurnResult | undefined;
 
-  // After a handoff the session is fresh: the first turn starts by reading the handoff note.
-  const fullPrompt =
-    agent.handoffNote && !agent.sessionId ? withPreamble(prompt, [handoffPreamble(agent.handoffNote)]) : prompt;
-
   try {
+    const fresh = !agent.sessionId;
+    // Only handoffs hold the queue; their summary turn doesn't need the pinned notes.
+    const pins = session.holdQueue ? undefined : await pinnedNotesForTurn(agent, fresh);
+    if (session.stopped) return undefined;
+    // After a handoff the session is fresh: the first turn starts by reading the handoff note.
+    const fullPrompt = withPreamble(prompt, [
+      agent.handoffNote && fresh ? handoffPreamble(agent.handoffNote) : undefined,
+      pins?.text,
+    ]);
+
     const gen = adapter.runTurn({
       prompt: fullPrompt,
       cwd: agent.cwd,
@@ -781,6 +877,15 @@ async function executeTurn(
       if (turnResult?.sessionId) {
         agent.sessionId = turnResult.sessionId;
         delete agent.handoffNote;
+      }
+      if (pins) {
+        // Notes pinned or unpinned during the turn: the new ones get injected next time.
+        const pinned = agent.pinnedNotes ?? [];
+        agent.pinnedNoteSeen = Object.fromEntries(
+          Object.entries(pins.seen).filter(([name]) => pinned.includes(name))
+        );
+      } else if (!agent.pinnedNotes?.length) {
+        delete agent.pinnedNoteSeen;
       }
       if (turnResult?.usage) {
         agent.usage = turnResult.usage;
@@ -929,6 +1034,7 @@ async function finishHandoff(
     // Keeps name, role, model, autonomy and cwd; only the conversation goes away.
     delete agent.sessionId;
     delete agent.usage;
+    delete agent.pinnedNoteSeen;
     agent.handoffNote = note;
     outcome = { ...outcome, ok: true };
   } catch (err: any) {
@@ -996,6 +1102,19 @@ async function spawnAgent(
     };
   }
 
+  let pinnedNotes: string[] = [];
+  if (input.pinnedNotes !== undefined) {
+    const pins = normalizePinnedNotes(input.pinnedNotes);
+    if (!pins.ok) {
+      return { ok: false, status: 400, error: pins.error };
+    }
+    const missing = await missingNotes(ws.id, pins.notes);
+    if (missing.length > 0) {
+      return { ok: false, status: 404, error: `Nota não encontrada: ${missing.join(", ")}` };
+    }
+    pinnedNotes = pins.notes;
+  }
+
   let cwd = input.cwd && typeof input.cwd === "string" && input.cwd.trim()
     ? path.resolve(input.cwd.trim())
     : ws.folder;
@@ -1025,6 +1144,7 @@ async function spawnAgent(
     createdBy: author,
     ...(modelVal.model ? { model: modelVal.model } : {}),
     ...(worktree ? { worktree } : {}),
+    ...(pinnedNotes.length > 0 ? { pinnedNotes } : {}),
   };
 
   state.agents[agentId] = newAgent;
@@ -1387,18 +1507,35 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
-    if (agent.status === "thinking") {
-      return reply.status(409).send({ error: "Agent is currently busy (status is thinking)" });
-    }
-
     const body = request.body as {
       model?: string | null;
       role?: string;
       autonomy?: Autonomy;
+      pinnedNotes?: unknown;
     } | undefined;
 
     if (!body || typeof body !== "object") {
       return reply.status(400).send({ error: "Invalid request body" });
+    }
+
+    // Pinned notes only take effect on the next turn, so they can change while the worker thinks.
+    const onlyPins = Object.keys(body).every((key) => key === "pinnedNotes");
+    if (agent.status === "thinking" && !onlyPins) {
+      return reply.status(409).send({ error: "Agent is currently busy (status is thinking)" });
+    }
+
+    let pinnedNotes: string[] | undefined;
+    if (body.pinnedNotes !== undefined) {
+      const pins = normalizePinnedNotes(body.pinnedNotes);
+      if (!pins.ok) {
+        return reply.status(400).send({ error: pins.error });
+      }
+      const added = pins.notes.filter((n) => !agent.pinnedNotes?.includes(n));
+      const missing = await missingNotes(ws.id, added);
+      if (missing.length > 0) {
+        return reply.status(404).send({ error: `Nota não encontrada: ${missing.join(", ")}` });
+      }
+      pinnedNotes = pins.notes;
     }
 
     if (body.role !== undefined) {
@@ -1434,6 +1571,10 @@ export async function start(
           }
         }
       }
+    }
+
+    if (pinnedNotes) {
+      setPinnedNotes(agent, pinnedNotes);
     }
 
     await saveState();
@@ -1527,6 +1668,7 @@ export async function start(
       lastError: agent.lastError,
       handoffNote: agent.handoffNote,
       lastHandoff: lastHandoffs.get(agent.id),
+      ...(agent.pinnedNotes?.length ? { pinnedNotes: agent.pinnedNotes } : {}),
     };
     return check;
   });
@@ -1890,6 +2032,17 @@ export async function start(
     if (meta[name]) {
       delete meta[name];
       await saveNotesMeta(ws.id, meta);
+    }
+
+    const pinnedBy = Object.values(state.agents).filter(
+      (a) => a.workspaceId === ws.id && a.pinnedNotes?.includes(name)
+    );
+    for (const a of pinnedBy) {
+      setPinnedNotes(a, (a.pinnedNotes ?? []).filter((n) => n !== name));
+      broadcast({ kind: "agent_updated", workspaceId: ws.id, agent: a });
+    }
+    if (pinnedBy.length > 0) {
+      await saveState();
     }
 
     broadcast({ kind: "note_deleted", workspaceId: ws.id, name });

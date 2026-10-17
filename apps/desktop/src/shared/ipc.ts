@@ -139,7 +139,10 @@ export interface SquadApplyPayload {
 export interface WorkerUpdatePayload {
   workspaceId: string;
   agent: string;
-  model: string | null;
+  /** Omitted = unchanged; null = provider default. */
+  model?: string | null;
+  /** Replaces the worker's pinned notes. Omitted = unchanged. */
+  pinnedNotes?: string[];
 }
 
 export interface NoteWritePayload {

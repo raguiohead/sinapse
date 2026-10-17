@@ -17,9 +17,9 @@ export const routes = {
   /** POST {preset, prefix?, worktree?} -> SquadApplyResult */
   squadApply: (ws: string) => `/workspaces/${seg(ws)}/squads/apply`,
 
-  /** GET list | POST spawn (AgentConfig without workspaceId, plus worktree?: boolean) */
+  /** GET list | POST spawn (AgentConfig without workspaceId, plus worktree?: boolean; pinnedNotes must exist) */
   agents: (ws: string) => `/workspaces/${seg(ws)}/agents`,
-  /** PATCH {model?, role?, autonomy?} | DELETE [?force=1] -> AgentDeleteResult (a worktree with uncommitted work or new commits is kept unless forced) */
+  /** PATCH {model?, role?, autonomy?, pinnedNotes?} (pinnedNotes alone is accepted while thinking) | DELETE [?force=1] -> AgentDeleteResult (a worktree with uncommitted work or new commits is kept unless forced) */
   agent: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}`,
   /** POST {prompt, async?, queue?}; queue implies async and enqueues when busy (202 AskResponse) instead of 409 */
   agentAsk: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/ask`,

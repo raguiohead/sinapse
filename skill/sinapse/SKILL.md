@@ -40,6 +40,9 @@ sinapse note read <nome>                 # lê o conteúdo bruto da nota
 sinapse note write <nome> "<texto>"|-        # cria/sobrescreve; "-" lê do stdin
 sinapse note append <nome> "<texto>"|-       # adiciona ao fim; "-" lê do stdin
 sinapse note rm <nome>                   # remove nota
+sinapse pin <worker> <nota> [nota ...]   # fixa notas: o conteúdo entra no prompt do worker
+sinapse unpin <worker> <nota> [nota ...] # desafixa
+sinapse spawn <nome> ... --note <n1,n2>  # cria o worker já com notas fixadas
 ```
 
 - Worktree: use `--worktree` quando vários workers com `edit` mexerem no mesmo repo. A worktree nasce sem `node_modules`/artefatos. O `rm` mantém worktree/branch que tenham trabalho (e avisa o caminho); nunca use `--force` sem o usuário pedir, e nunca faça merge sem ele autorizar.
@@ -62,6 +65,7 @@ sinapse note rm <nome>                   # remove nota
 - Use notas para planos de ataque, handoffs entre workers e consolidação de resultados.
 - Nomes de notas devem seguir o padrão minúsculo com hífens (`lowercase-with-hyphens`, ex: `plano-migracao`, `handoff-refactor`).
 - **Instrução aos workers**: em vez de colar blocos extensos de contexto diretamente nos prompts, oriente os workers a ler a nota relevante (`sinapse note read <nome>`).
+- **Notas fixadas (`pin`)**: quando um worker precisa de uma nota durante todo o trabalho (spec, plano, decisões, convenções), fixe-a com `sinapse pin <worker> <nota>` (ou `spawn ... --note`) em vez de pedir que ele a leia. É o caminho certo para workers que podem não conseguir rodar a CLI (Claude com `edit`, em sandbox). O daemon injeta o conteúdo no primeiro turno da sessão e de novo sempre que a nota mudar; nos demais turnos manda só um lembrete. Limites: 10 notas por worker, 16 KB por nota, 48 KB no total (o excesso é cortado com aviso). Para notas de uso pontual, prefira `note read`. Desafixe com `sinapse unpin` quando a nota deixar de ser relevante; `list` e `check` mostram o que está fixado.
  
 ## Workspaces
 

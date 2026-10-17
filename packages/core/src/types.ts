@@ -36,6 +36,8 @@ export interface AgentConfig {
   autonomy: Autonomy;
   /** Model requested for this agent. Undefined = provider default (account default for Claude/Codex, gemini-3.8-flash-high for AGY). */
   model?: string;
+  /** Workspace notes whose content the daemon injects into this agent's prompts (max 10). */
+  pinnedNotes?: string[];
 }
 
 export interface ContextUsage {
@@ -114,6 +116,8 @@ export interface AgentState extends AgentConfig {
   /** Set by a handoff: the session was reset and the next turn is told to read this note first. Cleared once that turn succeeds. */
   handoffNote?: string;
   worktree?: WorktreeInfo;
+  /** Pinned note name -> mtime of the version already injected into the current session. Cleared with the session. */
+  pinnedNoteSeen?: Record<string, number>;
 }
 
 export interface TurnEvent {
@@ -213,6 +217,7 @@ export interface CheckResponse {
   lastError?: string;
   handoffNote?: string;
   lastHandoff?: HandoffOutcome;
+  pinnedNotes?: string[];
 }
 
 /** One worker in a POST wait response. */

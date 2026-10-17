@@ -806,7 +806,8 @@ export function App() {
                         ...n.data,
                         role: agent.role,
                         model: agent.model,
-                        usage: agent.usage ?? n.data?.usage,
+                        // Authoritative: a handoff clears it.
+                        usage: agent.usage,
                         status: agent.status || n.data?.status,
                       },
                     }
@@ -824,7 +825,7 @@ export function App() {
                         ...n.data,
                         role: agent.role,
                         model: agent.model,
-                        usage: agent.usage ?? n.data?.usage,
+                        usage: agent.usage,
                         status: agent.status || n.data?.status,
                       },
                     }

@@ -26,6 +26,7 @@ export const IPC = {
   WORKER_STOP: "worker:stop",
   WORKER_UPDATE: "worker:update",
   WORKER_DELETE: "worker:delete",
+  WORKER_HANDOFF: "worker:handoff",
   MODELS_LIST: "models:list",
   NOTES_LIST: "notes:list",
   NOTE_READ: "note:read",

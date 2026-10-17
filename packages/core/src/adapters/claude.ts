@@ -4,6 +4,7 @@ import type { Adapter, AdapterRunOptions, ContextUsage, Provider, TurnEvent, Tur
 import { randomUUID } from "node:crypto";
 import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { estimateContextWindow } from "../context.js";
+import { rolePreamble } from "../prompt.js";
 
 export class ClaudeAdapter implements Adapter {
   readonly provider: Provider = "claude";
@@ -20,6 +21,9 @@ export class ClaudeAdapter implements Adapter {
     }
     if (options.sessionId) {
       args.push("--resume", options.sessionId);
+    }
+    if (options.role?.trim()) {
+      args.push("--append-system-prompt", rolePreamble(options.role.trim()));
     }
     if (options.autonomy === "read") {
       args.push("--permission-mode", "plan");

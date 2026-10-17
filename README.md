@@ -191,8 +191,11 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
 | `sinapse ask <nome> "<prompt>"` | Envia prompt ao worker de modo síncrono, exibindo a saída em tempo real no terminal. |
 | `sinapse ask <nome> "<prompt>" --async` | Envia prompt de modo assíncrono, retornando imediatamente o `turnId` gerado. |
-| `sinapse check <nome>` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução e últimos eventos registrados. |
-| `sinapse stop <nome>` | Interrompe imediatamente o turno em execução no worker selecionado. |
+| `sinapse ask <nome> "<prompt>" --queue` | Como `--async`, mas se o worker estiver ocupado o prompt entra numa fila (em memória) e roda quando o turno atual terminar. Sem `--queue`, um worker ocupado recusa o prompt. |
+| `sinapse wait <n1> [n2 ...] [--any] [--timeout <seg>]` | Bloqueia até todos os workers (ou o primeiro, com `--any`) terminarem o turno e a fila. Imprime, para cada um, o status, o contexto e o texto completo da última resposta. Sai com código 2 em timeout e 1 se algum worker terminou em erro. |
+| `sinapse check <nome> [--full]` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução, tamanho da fila e últimos eventos registrados. Com `--full`, imprime o texto completo da última resposta no lugar dos eventos. |
+| `sinapse stop <nome>` | Interrompe o turno em execução e descarta os prompts da fila (a saída informa quantos). |
+| `sinapse handoff <nome> [--note <nota>]` | Pede ao worker um resumo estruturado (objetivo, estado, decisões, arquivos, pendências), salva na nota `handoff-<nome>` (ou `--note`), zera a sessão e mantém nome, papel, modelo, autonomia e pasta. O próximo turno começa lendo a nota. |
 | `sinapse rm <nome>` | Remove o worker. Um turno em andamento é interrompido antes, e a sessão do worker deixa de ser usada. |
 | `sinapse models [claude\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude e AGY. |
 | `sinapse model <nome> <modelo\|padrao>` | Altera o modelo de um worker existente (`padrao` limpa e volta ao padrão do provedor). |
@@ -212,6 +215,11 @@ Tanto no canvas quanto na CLI, é possível selecionar e alternar os modelos dos
   - O **Claude** reporta o tamanho real de sua janela de contexto diretamente pela CLI (`contextWindow`).
   - O **AGY** e o **orquestrador** exibem uma estimativa da janela de contexto marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
   - O uso de contexto do **orquestrador Claude** é lido a partir do transcript de sessão do Claude Code; o orquestrador AGY mostra só o modelo.
+- **Handoff:** quando um worker passa de 80% da janela, o card mostra um botão "Handoff" (o mesmo que `sinapse handoff <nome>`). O resumo vira a nota `handoff-<nome>`, a sessão recomeça do zero e o primeiro turno seguinte é instruído a ler essa nota.
+
+### Papel do worker
+
+O `--role` do `spawn` chega ao modelo em todo turno: no Claude como `--append-system-prompt` ("Seu papel neste time: …"); no AGY, que não tem essa opção, como prefixo do primeiro prompt da sessão.
 
 ### Notas
 
@@ -255,9 +263,9 @@ Quando o Claude Code atua como cérebro usando o skill do Sinapse:
    ```bash
    sinapse ask tester "Implemente a suíte de testes unitários para os adapters em packages/core" --async
    ```
-4. O cérebro continua trabalhando em outra tarefa e acompanha periodicamente o status:
+4. O cérebro continua trabalhando em outra tarefa e, quando precisa do resultado, espera o worker (sem polling) e recebe a resposta completa:
    ```bash
-   sinapse check tester
+   sinapse wait tester --timeout 900
    ```
 
 ## Onde ficam os dados
@@ -302,6 +310,7 @@ sinapse/
 - **Versão do Electron:** o projeto fixa o Electron 35. A partir do 36 (GTK4), o app fecha ao iniciar em sistemas Linux que também carregam GTK3, com o erro "GTK 2/3 symbols detected".
 - **Adapter Codex:** O adapter para OpenAI Codex ainda não foi implementado.
 - **Persistência de logs:** O histórico detalhado de eventos de turnos de workers é mantido em memória e não é persistido após o encerramento do daemon.
+- **Fila em memória:** prompts enfileirados com `--queue` se perdem se o daemon reiniciar. `wait` e `check --full` mostram só a resposta do último turno; numa fila com vários prompts, as respostas anteriores ficam apenas no canvas.
 - **Confiança por workspace:** cada orquestrador roda na sua própria pasta, então o Claude Code ou o AGY pede confiança uma vez por workspace novo.
 - **Orquestrador AGY:** ao abrir, o AGY às vezes mostra um aviso de novidades que precisa ser fechado com Esc antes de digitar. Ele não informa o uso de contexto, então o card mostra só o modelo.
 - **Pasta antiga `~/.sinapse/cerebro`:** depois da atualização para workspaces, ela não é mais usada (o orquestrador do Geral começa numa sessão nova). Pode ser apagada.

@@ -13,6 +13,7 @@ import type {
   NoteSummary,
   Note,
   AgentState,
+  HandoffResponse,
   Workspace,
 } from "@sinapse/core";
 import {
@@ -1144,6 +1145,21 @@ function registerIpcHandlers(): void {
       throw new Error(await extractDaemonError(response, `Não foi possível excluir o worker: ${response.status}`));
     }
   });
+
+  ipcMain.handle(
+    IPC.WORKER_HANDOFF,
+    async (_event, workspaceId: string, agent: string): Promise<HandoffResponse> => {
+      const response = await daemonFetch(routes.agentHandoff(workspaceId, agent), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        throw new Error(await extractDaemonError(response, `Não foi possível iniciar o handoff: ${response.status}`));
+      }
+      return (await response.json()) as HandoffResponse;
+    }
+  );
 
   // Notes
   ipcMain.handle(IPC.NOTES_LIST, async (_event, workspaceId: string): Promise<NoteSummary[]> => {

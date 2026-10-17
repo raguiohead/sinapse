@@ -3,7 +3,12 @@ import type { ContextUsage } from "@sinapse/core";
 export interface ContextMeterProps {
   usage?: ContextUsage;
   className?: string;
+  /** When set, a "Handoff" button appears once usage reaches HANDOFF_THRESHOLD. */
+  onHandoff?: () => void;
+  handoffDisabled?: boolean;
 }
+
+const HANDOFF_THRESHOLD = 0.8;
 
 function formatTokens(count: number): string {
   if (count >= 1_000_000) {
@@ -23,7 +28,7 @@ function getBarColor(ratio: number): string {
   return "var(--error)";
 }
 
-export function ContextMeter({ usage, className = "" }: ContextMeterProps) {
+export function ContextMeter({ usage, className = "", onHandoff, handoffDisabled }: ContextMeterProps) {
   if (!usage || typeof usage.usedTokens !== "number") {
     return (
       <div className={`context-meter ${className}`} title="Sem uso de contexto registrado">
@@ -68,6 +73,17 @@ export function ContextMeter({ usage, className = "" }: ContextMeterProps) {
         />
       </div>
       <span className="context-meter-label">{label}</span>
+      {onHandoff && ratio >= HANDOFF_THRESHOLD && (
+        <button
+          type="button"
+          onClick={onHandoff}
+          disabled={handoffDisabled}
+          className="context-meter-handoff nodrag"
+          title="Resumir o trabalho numa nota e recomeçar a sessão do worker a partir dela"
+        >
+          Handoff
+        </button>
+      )}
     </div>
   );
 }

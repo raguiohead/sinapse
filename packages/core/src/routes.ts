@@ -16,12 +16,16 @@ export const routes = {
   agents: (ws: string) => `/workspaces/${seg(ws)}/agents`,
   /** PATCH {model?, role?, autonomy?} | DELETE */
   agent: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}`,
-  /** POST {prompt, async?} */
+  /** POST {prompt, async?, queue?}; queue implies async and enqueues when busy (202 AskResponse) instead of 409 */
   agentAsk: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/ask`,
-  /** GET */
+  /** GET CheckResponse */
   agentCheck: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/check`,
-  /** POST */
+  /** POST: cancels the running turn and clears the queue (StopResponse) */
   agentStop: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/stop`,
+  /** POST {note?}: summary turn → note, then resets the session (202 HandoffResponse) */
+  agentHandoff: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/handoff`,
+  /** POST {agents, any?, timeoutMs?}: long-poll until the workers are no longer busy (WaitResponse; timeoutMs capped at 60s) */
+  wait: (ws: string) => `/workspaces/${seg(ws)}/wait`,
 
   /** GET list */
   notes: (ws: string) => `/workspaces/${seg(ws)}/notes`,

@@ -57,6 +57,8 @@ export interface AgentState extends AgentConfig {
   lastError?: string;
   usage?: ContextUsage;
   createdBy?: Author;
+  /** Set by a handoff: the session was reset and the next turn is told to read this note first. Cleared once that turn succeeds. */
+  handoffNote?: string;
 }
 
 export interface TurnEvent {
@@ -82,6 +84,8 @@ export interface AdapterRunOptions {
   sessionId?: string;
   autonomy: Autonomy;
   model?: string;
+  /** The agent's role in the team. Claude gets it as an appended system prompt every turn; AGY as a prompt prefix on the first turn. */
+  role?: string;
   timeoutMs?: number;
   /** Extra env for the turn (SINAPSE_WORKSPACE, SINAPSE_AGENT_ID), applied on top of agentEnv(). */
   env?: Record<string, string>;
@@ -91,6 +95,79 @@ export interface Adapter {
   readonly provider: Provider;
   runTurn(options: AdapterRunOptions): AsyncGenerator<TurnEvent, TurnResult>;
   stop(pid: number): Promise<void>;
+}
+
+/** POST ask response for async/queued asks. "queued": the worker was busy and the prompt waits in its in-memory queue. */
+export interface AskResponse {
+  turnId: string;
+  status: "started" | "queued";
+  /** 1-based position in the queue when status is "queued". */
+  position?: number;
+}
+
+/** POST stop response. */
+export interface StopResponse {
+  ok: true;
+  status: AgentStatus;
+  /** True when a running turn was cancelled. */
+  interrupted: boolean;
+  /** Queued prompts that were discarded. */
+  clearedQueue: number;
+}
+
+/** Outcome of the last handoff of a worker (kept in memory by the daemon). */
+export interface HandoffOutcome {
+  turnId: string;
+  note: string;
+  ok: boolean;
+  error?: string;
+  finishedAt: number;
+}
+
+/** POST handoff response: the summary turn runs in the background; follow it with wait/check. */
+export interface HandoffResponse {
+  turnId: string;
+  note: string;
+}
+
+/** GET check response. */
+export interface CheckResponse {
+  agentId: string;
+  name: string;
+  status: AgentStatus;
+  model?: string;
+  usage?: ContextUsage;
+  turnId?: string;
+  /** Events of the running turn, or of the last finished one. */
+  events: TurnEvent[];
+  /** Concatenated "text" events of those same events (partial while thinking). */
+  text: string;
+  /** Prompts waiting in the queue. */
+  queued: number;
+  lastError?: string;
+  handoffNote?: string;
+  lastHandoff?: HandoffOutcome;
+}
+
+/** One worker in a POST wait response. */
+export interface WaitResult {
+  agentId: string;
+  name: string;
+  /** "removed" when the worker was deleted while waiting. */
+  status: AgentStatus | "removed";
+  /** Still thinking, with queued prompts, or finishing a handoff. */
+  busy: boolean;
+  queued: number;
+  usage?: ContextUsage;
+  /** Full text of the last finished turn (empty while busy). */
+  text: string;
+  lastError?: string;
+}
+
+/** POST wait response. `done` = the condition (all, or any with `any`) was met before this request's timeout. */
+export interface WaitResponse {
+  done: boolean;
+  results: WaitResult[];
 }
 
 export interface ModelOption {

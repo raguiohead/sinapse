@@ -78,6 +78,8 @@ export function WorkerNode({ data }: NodeProps) {
   const [isUpdatingModel, setIsUpdatingModel] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [isStartingHandoff, setIsStartingHandoff] = useState(false);
+  const [handoffError, setHandoffError] = useState<string | null>(null);
 
   const outputRef = useRef<HTMLDivElement | null>(null);
 
@@ -146,6 +148,22 @@ export function WorkerNode({ data }: NodeProps) {
       console.error("Erro ao enviar prompt ao worker:", err);
     } finally {
       setIsSubmitting(false);
+    }
+  };
+
+  const handleHandoff = async () => {
+    const message = `Fazer handoff de "${workerName}"? Ele resume o trabalho numa nota, a sessão é zerada e o próximo turno começa lendo essa nota.`;
+    if (!window.confirm(message)) return;
+
+    setIsStartingHandoff(true);
+    setHandoffError(null);
+    try {
+      await window.sinapse?.workers?.handoff(workspaceId, agentId);
+    } catch (err: any) {
+      console.error("Erro ao iniciar handoff:", err);
+      setHandoffError(err?.message || "Falha ao iniciar handoff");
+    } finally {
+      setIsStartingHandoff(false);
     }
   };
 
@@ -295,7 +313,18 @@ export function WorkerNode({ data }: NodeProps) {
         {role}
       </div>
 
-      <ContextMeter usage={nodeData.usage} className="worker-context-meter" />
+      <ContextMeter
+        usage={nodeData.usage}
+        className="worker-context-meter"
+        onHandoff={handleHandoff}
+        handoffDisabled={isThinking || isStartingHandoff}
+      />
+
+      {handoffError && (
+        <div className="worker-delete-error" role="alert">
+          {handoffError}
+        </div>
+      )}
 
       <div className="worker-output-area nodrag nowheel" ref={outputRef}>
         {log ? (

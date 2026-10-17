@@ -13,24 +13,32 @@ import { randomUUID } from "node:crypto";
 import type {
   AgentConfig,
   AgentState,
+  AskResponse,
   Author,
   Autonomy,
+  CheckResponse,
   DaemonEvent,
   DaemonState,
+  HandoffOutcome,
+  HandoffResponse,
   ModelCatalog,
   ModelOption,
   Note,
   NoteSummary,
   OrchestratorConfig,
   Provider,
+  StopResponse,
   TurnEvent,
   TurnResult,
+  WaitResponse,
+  WaitResult,
   Workspace,
 } from "../types.js";
 import { AUTHOR_HEADER, ENV, USER_AUTHOR } from "../routes.js";
 import { ClaudeAdapter } from "../adapters/claude.js";
 import { AgyAdapter } from "../adapters/agy.js";
 import { estimateContextWindow } from "../context.js";
+import { handoffPreamble, withPreamble } from "../prompt.js";
 
 const WS_ID_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const NOTE_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -193,6 +201,40 @@ async function writeNoteAtomic(
   };
 }
 
+/** Writes the note and records `author` as its creator (new note) or a contributor (existing note). */
+async function saveNote(
+  workspaceId: string,
+  name: string,
+  content: string,
+  author: Author
+): Promise<NoteSummary> {
+  const filePath = path.join(getWorkspaceNotesDir(workspaceId), `${name}.md`);
+  const exists = await fs.stat(filePath).then(() => true).catch(() => false);
+  const { stat, title } = await writeNoteAtomic(workspaceId, name, content);
+
+  const meta = await getNotesMeta(workspaceId);
+  if (!exists) {
+    meta[name] = { createdBy: author, contributors: [] };
+  } else {
+    if (!meta[name]) {
+      meta[name] = { contributors: [] };
+    }
+    if (author !== meta[name].createdBy && !meta[name].contributors.includes(author)) {
+      meta[name].contributors.push(author);
+    }
+  }
+  await saveNotesMeta(workspaceId, meta);
+
+  return {
+    workspaceId,
+    name,
+    title,
+    updatedAt: stat.mtimeMs,
+    createdBy: meta[name].createdBy,
+    contributors: meta[name].contributors,
+  };
+}
+
 const CLAUDE_MODELS: ModelOption[] = [
   { id: "fable", label: "Fable (mais recente)" },
   { id: "opus", label: "Opus" },
@@ -338,7 +380,34 @@ interface ActiveTurnSession {
   adapter: ClaudeAdapter | AgyAdapter;
   events: TurnEvent[];
   stopped: boolean;
+  /** Don't start the next queued prompt when this turn ends (a handoff resets the session first). */
+  holdQueue: boolean;
 }
+
+interface QueuedTurn {
+  turnId: string;
+  prompt: string;
+}
+
+const HANDOFF_PROMPT_SECTIONS = [
+  "## Objetivo",
+  "## Estado atual",
+  "## Decisões (e por quê)",
+  "## Arquivos relevantes (caminhos absolutos e o que mudou em cada um)",
+  "## Pendências e próximos passos",
+];
+
+function handoffPrompt(agentName: string): string {
+  return `O Sinapse vai encerrar esta sessão e abrir uma nova para você, porque o contexto está cheio. Escreva agora um handoff para o seu eu futuro, que não verá esta conversa.
+
+Responda SOMENTE com o markdown abaixo, sem usar ferramentas e sem escrever arquivos. Seja específico e completo; prefira listas.
+
+# Handoff — ${agentName}
+${HANDOFF_PROMPT_SECTIONS.join("\n")}`;
+}
+
+/** Wait (long-poll) requests are capped so no HTTP client timeout fires; the CLI re-issues them until its own deadline. */
+const WAIT_MAX_MS = 60_000;
 
 const state: DaemonState = {
   workspaces: {},
@@ -349,10 +418,48 @@ const state: DaemonState = {
 
 const activeTurns = new Map<string, ActiveTurnSession>();
 const agentRecentEvents = new Map<string, TurnEvent[]>();
+/** Prompts asked with queue: true while the worker was busy; in memory only (lost when the daemon restarts). */
+const turnQueues = new Map<string, QueuedTurn[]>();
+const handoffsInProgress = new Set<string>();
+const lastHandoffs = new Map<string, HandoffOutcome>();
+/** Re-evaluated by pending wait requests whenever a turn ends, a queue changes or a handoff finishes. */
+const turnWaiters = new Set<() => void>();
 const subscribers = new Set<(event: DaemonEvent) => void>();
 
 function broadcast(event: DaemonEvent): void {
   for (const send of subscribers) send(event);
+}
+
+function notifyWaiters(): void {
+  for (const check of [...turnWaiters]) check();
+}
+
+function queueLength(agentId: string): number {
+  return turnQueues.get(agentId)?.length ?? 0;
+}
+
+function clearQueue(agentId: string): number {
+  const cleared = queueLength(agentId);
+  turnQueues.delete(agentId);
+  return cleared;
+}
+
+/** Thinking, with prompts waiting, or between the handoff turn and the session reset. */
+function isBusy(agent: AgentState): boolean {
+  return agent.status === "thinking" || handoffsInProgress.has(agent.id) || queueLength(agent.id) > 0;
+}
+
+/** Claude emits whole text blocks (one per message); AGY emits deltas. */
+function turnText(agent: AgentState, events: TurnEvent[]): string {
+  const separator = agent.provider === "agy" ? "" : "\n\n";
+  return events
+    .filter((e) => e.type === "text")
+    .map((e) => e.data)
+    .join(separator);
+}
+
+function isCurrentAgent(agent: AgentState): boolean {
+  return state.agents[agent.id] === agent;
 }
 
 function findWorkspace(idOrName: string): Workspace | undefined {
@@ -510,17 +617,22 @@ async function executeTurn(
   prompt: string,
   session: ActiveTurnSession,
   onEvent?: (event: TurnEvent) => void
-): Promise<void> {
+): Promise<TurnResult | undefined> {
   const adapter = session.adapter;
   let turnResult: TurnResult | undefined;
 
+  // After a handoff the session is fresh: the first turn starts by reading the handoff note.
+  const fullPrompt =
+    agent.handoffNote && !agent.sessionId ? withPreamble(prompt, [handoffPreamble(agent.handoffNote)]) : prompt;
+
   try {
     const gen = adapter.runTurn({
-      prompt,
+      prompt: fullPrompt,
       cwd: agent.cwd,
       sessionId: agent.sessionId,
       autonomy: agent.autonomy,
       model: agent.model,
+      role: agent.role,
       env: {
         [ENV.workspace]: agent.workspaceId,
         [ENV.agentId]: agent.id,
@@ -555,6 +667,7 @@ async function executeTurn(
       agent.status = "done";
       if (turnResult?.sessionId) {
         agent.sessionId = turnResult.sessionId;
+        delete agent.handoffNote;
       }
       if (turnResult?.usage) {
         agent.usage = turnResult.usage;
@@ -576,9 +689,13 @@ async function executeTurn(
       }
     }
   } finally {
-    agent.currentTurnId = undefined;
-    agentRecentEvents.set(agent.id, [...session.events]);
-    activeTurns.delete(agent.id);
+    // A stopped turn was already detached by stop/delete, and a newer turn may own the slot by now.
+    const isCurrent = activeTurns.get(agent.id) === session;
+    if (isCurrent) {
+      agent.currentTurnId = undefined;
+      agentRecentEvents.set(agent.id, [...session.events]);
+      activeTurns.delete(agent.id);
+    }
     broadcast({
       kind: "turn_finished",
       workspaceId: agent.workspaceId,
@@ -590,8 +707,145 @@ async function executeTurn(
       error: agent.lastError,
       usage: turnResult?.usage,
     });
+    if (isCurrent && !session.holdQueue) {
+      drainQueue(agent);
+    }
+    notifyWaiters();
     await saveState();
   }
+  return turnResult;
+}
+
+/** Marks the agent busy, announces the turn and runs it. Throws (before any state change) for unsupported providers. */
+function startTurn(
+  agent: AgentState,
+  prompt: string,
+  options: { turnId?: string; onEvent?: (event: TurnEvent) => void; holdQueue?: boolean } = {}
+): { turnId: string; done: Promise<TurnResult | undefined> } {
+  const adapter = createAdapter(agent.provider);
+  const turnId = options.turnId ?? nanoid();
+  agent.status = "thinking";
+  agent.currentTurnId = turnId;
+  agent.lastError = undefined;
+
+  const session: ActiveTurnSession = {
+    turnId,
+    adapter,
+    events: [],
+    stopped: false,
+    holdQueue: options.holdQueue ?? false,
+  };
+  activeTurns.set(agent.id, session);
+  saveState().catch(console.error);
+  broadcast({
+    kind: "turn_started",
+    workspaceId: agent.workspaceId,
+    agentId: agent.id,
+    agentName: agent.name,
+    turnId,
+    prompt,
+  });
+
+  return { turnId, done: executeTurn(agent, turnId, prompt, session, options.onEvent) };
+}
+
+/** Starts the next queued prompt, if the agent still exists and is free. */
+function drainQueue(agent: AgentState): void {
+  if (!isCurrentAgent(agent) || activeTurns.has(agent.id) || handoffsInProgress.has(agent.id)) {
+    return;
+  }
+  const queue = turnQueues.get(agent.id);
+  const next = queue?.shift();
+  if (queue && queue.length === 0) {
+    turnQueues.delete(agent.id);
+  }
+  if (!next) return;
+
+  try {
+    startTurn(agent, next.prompt, { turnId: next.turnId }).done.catch(console.error);
+  } catch (err: any) {
+    // The provider can't run turns at all, so the rest of the queue would fail the same way.
+    const dropped = clearQueue(agent.id);
+    agent.status = "error";
+    agent.lastError = `Fila descartada (${dropped + 1} prompt(s)): ${err?.message || String(err)}`;
+    broadcast({ kind: "agent_updated", workspaceId: agent.workspaceId, agent });
+    saveState().catch(console.error);
+  }
+}
+
+/** Second half of a handoff: saves the summary as a note and resets the session, then releases the queue. */
+async function finishHandoff(
+  agent: AgentState,
+  turnId: string,
+  note: string,
+  done: Promise<TurnResult | undefined>
+): Promise<void> {
+  let outcome: HandoffOutcome = { turnId, note, ok: false, finishedAt: 0 };
+  try {
+    const result = await done;
+    if (!isCurrentAgent(agent)) return;
+    if (agent.status !== "done") {
+      // executeTurn already recorded the error or the interruption.
+      outcome.error = agent.lastError ?? `turno terminou com status ${agent.status}`;
+      return;
+    }
+
+    const text = result?.text?.trim() || turnText(agent, agentRecentEvents.get(agent.id) ?? []).trim();
+    if (!text) {
+      throw new Error("o worker não devolveu o resumo");
+    }
+    const content = `${text.startsWith("# ") ? text : `# Handoff — ${agent.name}\n\n${text}`}\n`;
+    if (Buffer.byteLength(content, "utf-8") > 1024 * 1024) {
+      throw new Error("o resumo excede o limite de 1 MB de uma nota");
+    }
+
+    const summary = await saveNote(agent.workspaceId, note, content, agent.id);
+    broadcast({ kind: "note_changed", workspaceId: agent.workspaceId, note: summary, by: agent.id });
+
+    // Keeps name, role, model, autonomy and cwd; only the conversation goes away.
+    delete agent.sessionId;
+    delete agent.usage;
+    agent.handoffNote = note;
+    outcome = { ...outcome, ok: true };
+  } catch (err: any) {
+    outcome.error = err?.message || String(err);
+    if (isCurrentAgent(agent)) {
+      agent.status = "error";
+      agent.lastError = `Handoff falhou: ${outcome.error}`;
+    }
+  } finally {
+    handoffsInProgress.delete(agent.id);
+    if (isCurrentAgent(agent)) {
+      lastHandoffs.set(agent.id, { ...outcome, finishedAt: Date.now() });
+      broadcast({ kind: "agent_updated", workspaceId: agent.workspaceId, agent });
+      drainQueue(agent);
+    }
+    notifyWaiters();
+    await saveState().catch(console.error);
+  }
+}
+
+function handoffNoteName(agent: AgentState): string {
+  const slug = slugifyWorkspaceName(agent.name) || agent.id.toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  return `handoff-${slug}`.slice(0, 64).replace(/[-_]+$/, "");
+}
+
+function waitResult(agentId: string, name: string): WaitResult {
+  const agent = state.agents[agentId];
+  if (!agent) {
+    return { agentId, name, status: "removed", busy: false, queued: 0, text: "" };
+  }
+  const busy = isBusy(agent);
+  return {
+    agentId,
+    name: agent.name,
+    status: agent.status,
+    busy,
+    queued: queueLength(agent.id),
+    usage: agent.usage,
+    text: busy ? "" : turnText(agent, agentRecentEvents.get(agent.id) ?? []),
+    lastError: agent.lastError,
+  };
 }
 
 export async function start(
@@ -822,6 +1076,8 @@ export async function start(
 
     const wsAgents = Object.values(state.agents).filter((a) => a.workspaceId === ws.id);
     for (const a of wsAgents) {
+      clearQueue(a.id);
+      lastHandoffs.delete(a.id);
       const session = activeTurns.get(a.id);
       if (session) {
         session.stopped = true;
@@ -848,6 +1104,7 @@ export async function start(
 
     await saveState();
     broadcast({ kind: "workspace_deleted", workspaceId: ws.id });
+    notifyWaiters();
 
     return { ok: true };
   });
@@ -1002,47 +1259,40 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
-    const body = request.body as { prompt?: string; async?: boolean } | undefined;
+    const body = request.body as { prompt?: string; async?: boolean; queue?: boolean } | undefined;
     if (!body || typeof body.prompt !== "string" || !body.prompt.trim()) {
       return reply.status(400).send({ error: "Prompt is required" });
     }
+    const prompt = body.prompt;
+    const queue = body.queue === true;
 
-    if (agent.status === "thinking") {
-      return reply.status(409).send({ error: "Agent is currently busy (queue limit of 1)" });
+    if (isBusy(agent)) {
+      if (!queue) {
+        return reply.status(409).send({
+          error: "Agent is currently busy (use queue: true / --queue to enqueue)",
+        });
+      }
+      const turnId = nanoid();
+      const pending = turnQueues.get(agent.id) ?? [];
+      pending.push({ turnId, prompt });
+      turnQueues.set(agent.id, pending);
+      const queued: AskResponse = { turnId, status: "queued", position: pending.length };
+      return reply.status(202).send(queued);
     }
 
-    let adapter: ClaudeAdapter | AgyAdapter;
+    let turn: { turnId: string; done: Promise<TurnResult | undefined> };
     try {
-      adapter = createAdapter(agent.provider);
+      turn = startTurn(agent, prompt, {
+        onEvent: body.async || queue ? undefined : (event) => reply.raw.write(JSON.stringify(event) + "\n"),
+      });
     } catch (err: any) {
       return reply.status(400).send({ error: err.message });
     }
 
-    const turnId = nanoid();
-    agent.status = "thinking";
-    agent.currentTurnId = turnId;
-    agent.lastError = undefined;
-    await saveState();
-
-    const session: ActiveTurnSession = {
-      turnId,
-      adapter,
-      events: [],
-      stopped: false,
-    };
-    activeTurns.set(agent.id, session);
-    broadcast({
-      kind: "turn_started",
-      workspaceId: ws.id,
-      agentId: agent.id,
-      agentName: agent.name,
-      turnId,
-      prompt: body.prompt,
-    });
-
-    if (body.async) {
-      executeTurn(agent, turnId, body.prompt, session).catch(console.error);
-      return reply.status(202).send({ turnId });
+    if (body.async || queue) {
+      turn.done.catch(console.error);
+      const started: AskResponse = { turnId: turn.turnId, status: "started" };
+      return reply.status(202).send(started);
     }
 
     reply.raw.writeHead(200, {
@@ -1052,11 +1302,8 @@ export async function start(
       "Connection": "keep-alive",
     });
 
-    const onEvent = (event: TurnEvent) => {
-      reply.raw.write(JSON.stringify(event) + "\n");
-    };
-
-    await executeTurn(agent, turnId, body.prompt, session, onEvent);
+    // Events only arrive after the adapter's first await, so the head above is always written before them.
+    await turn.done;
     reply.raw.end();
   });
 
@@ -1074,7 +1321,7 @@ export async function start(
     const session = activeTurns.get(agent.id);
     const events = session ? session.events : agentRecentEvents.get(agent.id) ?? [];
 
-    return {
+    const check: CheckResponse = {
       agentId: agent.id,
       name: agent.name,
       status: agent.status,
@@ -1082,8 +1329,114 @@ export async function start(
       usage: agent.usage,
       turnId: agent.currentTurnId,
       events,
+      text: turnText(agent, events),
+      queued: queueLength(agent.id),
       lastError: agent.lastError,
+      handoffNote: agent.handoffNote,
+      lastHandoff: lastHandoffs.get(agent.id),
     };
+    return check;
+  });
+
+  fastify.post("/workspaces/:ws/agents/:agent/handoff", async (request, reply) => {
+    const { ws: wsParam, agent: agentParam } = request.params as { ws: string; agent: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
+    }
+    const agent = findAgentInWorkspace(ws, agentParam);
+    if (!agent) {
+      return reply.status(404).send({ error: "Worker não encontrado" });
+    }
+
+    const body = request.body as { note?: unknown } | undefined;
+    let note = handoffNoteName(agent);
+    if (body && body.note !== undefined && body.note !== null && body.note !== "") {
+      if (typeof body.note !== "string" || !isValidNoteName(body.note.trim())) {
+        return reply.status(400).send({ error: "Nome da nota inválido (use minúsculas, números, - e _)" });
+      }
+      note = body.note.trim();
+    }
+
+    if (isBusy(agent)) {
+      return reply.status(409).send({ error: "Worker ocupado: espere o turno (e a fila) terminar antes do handoff" });
+    }
+    if (!agent.sessionId) {
+      return reply.status(409).send({ error: "Worker não tem sessão para resumir" });
+    }
+
+    let turn: { turnId: string; done: Promise<TurnResult | undefined> };
+    try {
+      turn = startTurn(agent, handoffPrompt(agent.name), { holdQueue: true });
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
+    }
+    handoffsInProgress.add(agent.id);
+    finishHandoff(agent, turn.turnId, note, turn.done).catch(console.error);
+
+    const response: HandoffResponse = { turnId: turn.turnId, note };
+    return reply.status(202).send(response);
+  });
+
+  fastify.post("/workspaces/:ws/wait", async (request, reply) => {
+    const { ws: wsParam } = request.params as { ws: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
+    }
+
+    const body = request.body as { agents?: unknown; any?: unknown; timeoutMs?: unknown } | undefined;
+    if (!body || !Array.isArray(body.agents) || body.agents.length === 0) {
+      return reply.status(400).send({ error: "Informe ao menos um worker em agents" });
+    }
+    const targets: Array<{ id: string; name: string }> = [];
+    for (const ref of body.agents) {
+      if (typeof ref !== "string" || !ref.trim()) {
+        return reply.status(400).send({ error: "agents deve conter ids ou nomes de workers" });
+      }
+      const agent = findAgentInWorkspace(ws, ref.trim());
+      if (!agent) {
+        return reply.status(404).send({ error: `Worker não encontrado: ${ref}` });
+      }
+      if (!targets.some((t) => t.id === agent.id)) {
+        targets.push({ id: agent.id, name: agent.name });
+      }
+    }
+
+    const any = body.any === true;
+    const requested = typeof body.timeoutMs === "number" && Number.isFinite(body.timeoutMs) ? body.timeoutMs : WAIT_MAX_MS;
+    const timeoutMs = Math.min(Math.max(0, requested), WAIT_MAX_MS);
+
+    const settled = (id: string) => {
+      const agent = state.agents[id];
+      return !agent || !isBusy(agent);
+    };
+    const satisfied = () => (any ? targets.some((t) => settled(t.id)) : targets.every((t) => settled(t.id)));
+
+    if (!satisfied() && timeoutMs > 0) {
+      await new Promise<void>((resolve) => {
+        let timer: NodeJS.Timeout | undefined;
+        const finish = () => {
+          if (timer) clearTimeout(timer);
+          turnWaiters.delete(check);
+          reply.raw.off("close", finish);
+          resolve();
+        };
+        const check = () => {
+          if (satisfied()) finish();
+        };
+        timer = setTimeout(finish, timeoutMs);
+        turnWaiters.add(check);
+        // The client gave up (Ctrl+C): stop waiting.
+        reply.raw.once("close", finish);
+      });
+    }
+
+    const response: WaitResponse = {
+      done: satisfied(),
+      results: targets.map((t) => waitResult(t.id, t.name)),
+    };
+    return response;
   });
 
   fastify.post("/workspaces/:ws/agents/:agent/stop", async (request, reply) => {
@@ -1097,6 +1450,8 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
+    // Clear first so the ending turn doesn't start the next queued prompt.
+    const clearedQueue = clearQueue(agent.id);
     const session = activeTurns.get(agent.id);
     if (session) {
       session.stopped = true;
@@ -1110,8 +1465,15 @@ export async function start(
     agent.status = "interrupted";
     agent.currentTurnId = undefined;
     await saveState();
+    notifyWaiters();
 
-    return { ok: true, status: agent.status };
+    const response: StopResponse = {
+      ok: true,
+      status: agent.status,
+      interrupted: Boolean(session),
+      clearedQueue,
+    };
+    return response;
   });
 
   fastify.delete("/workspaces/:ws/agents/:agent", async (request, reply) => {
@@ -1125,6 +1487,7 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
+    clearQueue(agent.id);
     const session = activeTurns.get(agent.id);
     if (session) {
       session.stopped = true;
@@ -1136,8 +1499,10 @@ export async function start(
 
     delete state.agents[agent.id];
     agentRecentEvents.delete(agent.id);
+    lastHandoffs.delete(agent.id);
     await saveState();
     broadcast({ kind: "agent_deleted", workspaceId: ws.id, agentId: agent.id, agentName: agent.name });
+    notifyWaiters();
 
     return { ok: true };
   });
@@ -1233,38 +1598,8 @@ export async function start(
       return reply.status(413).send({ error: "Conteúdo excede o limite de 1 MB" });
     }
 
-    const filePath = path.join(getWorkspaceNotesDir(ws.id), `${name}.md`);
-    let exists = false;
-    try {
-      await fs.stat(filePath);
-      exists = true;
-    } catch {}
-
     const author = getAuthor(request);
-    const { stat, title } = await writeNoteAtomic(ws.id, name, body.content);
-
-    const meta = await getNotesMeta(ws.id);
-    if (!exists) {
-      meta[name] = { createdBy: author, contributors: [] };
-    } else {
-      if (!meta[name]) {
-        meta[name] = { contributors: [] };
-      }
-      if (author !== meta[name].createdBy && !meta[name].contributors.includes(author)) {
-        meta[name].contributors.push(author);
-      }
-    }
-    await saveNotesMeta(ws.id, meta);
-
-    const summary: NoteSummary = {
-      workspaceId: ws.id,
-      name,
-      title,
-      updatedAt: stat.mtimeMs,
-      createdBy: meta[name].createdBy,
-      contributors: meta[name].contributors,
-    };
-
+    const summary = await saveNote(ws.id, name, body.content, author);
     broadcast({ kind: "note_changed", workspaceId: ws.id, note: summary, by: author });
     return summary;
   });
@@ -1285,10 +1620,8 @@ export async function start(
 
     const filePath = path.join(getWorkspaceNotesDir(ws.id), `${name}.md`);
     let combinedContent = body.content;
-    let exists = false;
     try {
       const existing = await fs.readFile(filePath, "utf-8");
-      exists = true;
       if (existing.length > 0) {
         const separator = existing.endsWith("\n") ? "" : "\n";
         combinedContent = `${existing}${separator}${body.content}`;
@@ -1302,30 +1635,7 @@ export async function start(
     }
 
     const author = getAuthor(request);
-    const { stat, title } = await writeNoteAtomic(ws.id, name, combinedContent);
-
-    const meta = await getNotesMeta(ws.id);
-    if (!exists) {
-      meta[name] = { createdBy: author, contributors: [] };
-    } else {
-      if (!meta[name]) {
-        meta[name] = { contributors: [] };
-      }
-      if (author !== meta[name].createdBy && !meta[name].contributors.includes(author)) {
-        meta[name].contributors.push(author);
-      }
-    }
-    await saveNotesMeta(ws.id, meta);
-
-    const summary: NoteSummary = {
-      workspaceId: ws.id,
-      name,
-      title,
-      updatedAt: stat.mtimeMs,
-      createdBy: meta[name].createdBy,
-      contributors: meta[name].contributors,
-    };
-
+    const summary = await saveNote(ws.id, name, combinedContent, author);
     broadcast({ kind: "note_changed", workspaceId: ws.id, note: summary, by: author });
     return summary;
   });
@@ -1399,6 +1709,7 @@ export async function shutdown(): Promise<void> {
     }
   }
   activeTurns.clear();
+  turnQueues.clear();
   try {
     closeWatcher();
   } catch {}

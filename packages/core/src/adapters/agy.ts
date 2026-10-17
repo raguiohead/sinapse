@@ -4,6 +4,7 @@ import type { Adapter, AdapterRunOptions, ContextUsage, Provider, TurnEvent, Tur
 import { randomUUID } from "node:crypto";
 import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { estimateContextWindow } from "../context.js";
+import { rolePreamble, withPreamble } from "../prompt.js";
 
 export class AgyAdapter implements Adapter {
   readonly provider: Provider = "agy";
@@ -15,8 +16,12 @@ export class AgyAdapter implements Adapter {
     const events: TurnEvent[] = [];
 
     const model = options.model ?? "gemini-3.8-flash-high";
+    // AGY has no system-prompt flag: the role goes in front of the first prompt and the conversation keeps it.
+    const role = options.role?.trim();
+    const prompt =
+      !options.sessionId && role ? withPreamble(options.prompt, [rolePreamble(role)]) : options.prompt;
     // "-p=<prompt>" keeps a prompt that starts with "-" from being parsed as a flag.
-    const args = [`-p=${options.prompt}`, "--output-format", "stream-json", "--model", model];
+    const args = [`-p=${prompt}`, "--output-format", "stream-json", "--model", model];
     if (options.sessionId) {
       args.push("--conversation", options.sessionId);
     }

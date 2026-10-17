@@ -5,6 +5,7 @@ import type {
   NoteSummary,
   Note,
   AgentState,
+  HandoffResponse,
   Workspace,
 } from "@sinapse/core";
 import type {
@@ -73,6 +74,8 @@ export interface SinapseBridge {
     stop: (workspaceId: string, agent: string) => Promise<any>;
     /** Removes the worker; a running turn is interrupted first. Emits agent_deleted on the bus. */
     delete: (workspaceId: string, agent: string) => Promise<void>;
+    /** Starts the summary turn in the background (note handoff-<nome>); the session resets when it ends. Rejects when busy or sessionless. */
+    handoff: (workspaceId: string, agent: string) => Promise<HandoffResponse>;
   };
   models: {
     list: () => Promise<ModelCatalog>;

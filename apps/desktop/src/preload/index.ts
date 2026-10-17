@@ -6,6 +6,7 @@ import type {
   NoteSummary,
   Note,
   AgentState,
+  HandoffResponse,
   Workspace,
 } from "@sinapse/core";
 import {
@@ -167,6 +168,9 @@ const api = {
     },
     delete: (workspaceId: string, agent: string): Promise<void> => {
       return ipcRenderer.invoke(IPC.WORKER_DELETE, workspaceId, agent);
+    },
+    handoff: (workspaceId: string, agent: string): Promise<HandoffResponse> => {
+      return ipcRenderer.invoke(IPC.WORKER_HANDOFF, workspaceId, agent);
     },
   },
   models: {

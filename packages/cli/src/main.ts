@@ -6,14 +6,20 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import type {
   AgentState,
+  AskResponse,
   Autonomy,
+  CheckResponse,
   ContextUsage,
+  HandoffResponse,
   ModelCatalog,
   ModelOption,
   Note,
   NoteSummary,
   Provider,
+  StopResponse,
   TurnEvent,
+  WaitResponse,
+  WaitResult,
   Workspace,
 } from "@sinapse/core";
 import {
@@ -209,6 +215,8 @@ async function resolveWorkspace(flags: Record<string, any>): Promise<Workspace> 
 }
 
 const FLAG_PATTERN = /^--?[A-Za-z]/;
+/** Flags that never take a value, so `wait --any a b` keeps "a" as a worker name. */
+const BOOLEAN_FLAGS = new Set(["async", "queue", "any", "full", "help", "h"]);
 
 function parseArgs(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
@@ -219,7 +227,9 @@ function parseArgs(argv: string[]) {
     if (FLAG_PATTERN.test(arg)) {
       const key = arg.replace(/^--?/, "");
       const next = argv[i + 1];
-      if (next !== undefined && !FLAG_PATTERN.test(next)) {
+      if (BOOLEAN_FLAGS.has(key)) {
+        flags[key] = true;
+      } else if (next !== undefined && !FLAG_PATTERN.test(next)) {
         flags[key] = next;
         i++;
       } else {
@@ -339,6 +349,59 @@ async function handleResponseError(res: Response): Promise<never> {
   process.exit(1);
 }
 
+/** Each long-poll stays under the daemon's 60s cap; the loop runs until the condition holds or `timeoutSec` passes. */
+const WAIT_CHUNK_MS = 55_000;
+
+async function waitForWorkers(
+  ws: Workspace,
+  agents: string[],
+  options: { any?: boolean; timeoutSec?: number } = {}
+): Promise<WaitResponse> {
+  const deadline = options.timeoutSec !== undefined ? Date.now() + options.timeoutSec * 1000 : Infinity;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    const res = await apiRequest(routes.wait(ws.id), {
+      method: "POST",
+      body: JSON.stringify({
+        agents,
+        any: Boolean(options.any),
+        timeoutMs: Math.max(0, Math.min(WAIT_CHUNK_MS, remaining)),
+      }),
+    });
+    if (!res.ok) await handleResponseError(res);
+    const data = (await res.json()) as WaitResponse;
+    if (data.done || Date.now() >= deadline) return data;
+  }
+}
+
+function parseTimeoutSec(flags: Record<string, string | boolean>): number | undefined {
+  const raw = flags.timeout ?? flags.t;
+  if (raw === undefined) return undefined;
+  const value = typeof raw === "string" ? Number(raw) : NaN;
+  if (!Number.isFinite(value) || value < 0) {
+    console.error("Erro: --timeout deve ser um número de segundos (>= 0).");
+    process.exit(1);
+  }
+  return value;
+}
+
+function printWaitResult(r: WaitResult) {
+  console.log(`=== ${r.name} ===`);
+  console.log(`Status: ${r.status}${r.busy ? " (ainda ocupado)" : ""}`);
+  console.log(`Contexto: ${formatContext(r.usage)}`);
+  if (r.queued > 0) {
+    console.log(`Fila: ${r.queued} prompt(s)`);
+  }
+  if (r.lastError) {
+    console.log(`Erro: ${r.lastError}`);
+  }
+  if (!r.busy && r.text) {
+    console.log("");
+    console.log(r.text.replace(/\s+$/, ""));
+  }
+  console.log("");
+}
+
 function printHelp() {
   console.log(`Sinapse - Orquestrador Pessoal Multiagente
 
@@ -350,8 +413,11 @@ Uso:
   sinapse list [--workspace <ws>]                            Lista workers do workspace
   sinapse spawn <nome> --provider <p> [--cwd <dir>] --role <r> [--autonomy edit] [--model <m>] [--workspace <ws>]
   sinapse ask <nome> "<prompt>" [--async] [--workspace <ws>] Envia prompt ao worker
-  sinapse check <nome> [--workspace <ws>]                    Consulta status e eventos do worker
-  sinapse stop <nome> [--workspace <ws>]                     Interrompe o turno ativo do worker
+  sinapse ask <nome> "<prompt>" --queue [--workspace <ws>]   Enfileira se o worker estiver ocupado (implica --async)
+  sinapse wait <n1> [n2 ...] [--any] [--timeout <seg>]       Espera os workers terminarem e imprime as respostas
+  sinapse check <nome> [--full] [--workspace <ws>]           Consulta status e eventos (--full: resposta completa)
+  sinapse stop <nome> [--workspace <ws>]                     Interrompe o turno ativo e esvazia a fila
+  sinapse handoff <nome> [--note <nota>] [--workspace <ws>]  Resume o trabalho numa nota e zera a sessão do worker
   sinapse rm <nome> [--workspace <ws>]                       Remove o worker
   sinapse models [claude|agy]                                Lista catálogo de modelos
   sinapse model <nome> <modelo|padrao> [--workspace <ws>]    Altera o modelo de um worker
@@ -510,23 +576,28 @@ async function main() {
       const name = positional[1];
       const prompt = positional[2];
       if (!name || !prompt) {
-        console.error("Erro: Nome e prompt são obrigatórios. Uso: sinapse ask <name> \"prompt\" [--async]");
+        console.error("Erro: Nome e prompt são obrigatórios. Uso: sinapse ask <name> \"prompt\" [--async|--queue]");
         process.exit(1);
       }
 
       const ws = await resolveWorkspace(flags);
-      const isAsync = Boolean(flags.async);
+      const queue = Boolean(flags.queue);
+      const isAsync = Boolean(flags.async) || queue;
 
       if (isAsync) {
         const res = await apiRequest(routes.agentAsk(ws.id, name), {
           method: "POST",
-          body: JSON.stringify({ prompt, async: true }),
+          body: JSON.stringify({ prompt, async: true, ...(queue ? { queue: true } : {}) }),
         });
         if (!res.ok) {
           await handleResponseError(res);
         }
-        const data = (await res.json()) as { turnId: string };
-        console.log(`Turn started: ${data.turnId}`);
+        const data = (await res.json()) as AskResponse;
+        if (data.status === "queued") {
+          console.log(`Worker ocupado: prompt enfileirado (posição ${data.position ?? "?"}). Turn ID: ${data.turnId}`);
+        } else {
+          console.log(`Turn started: ${data.turnId}`);
+        }
       } else {
         const res = await apiRequest(routes.agentAsk(ws.id, name), {
           method: "POST",
@@ -586,16 +657,7 @@ async function main() {
         await handleResponseError(res);
       }
 
-      const data = (await res.json()) as {
-        agentId: string;
-        name: string;
-        status: string;
-        model?: string;
-        usage?: ContextUsage;
-        turnId?: string;
-        events?: TurnEvent[];
-        lastError?: string;
-      };
+      const data = (await res.json()) as CheckResponse;
 
       console.log(`Agent: ${data.name} (id: ${data.agentId})`);
       console.log(`Modelo: ${data.usage?.model ?? data.model ?? "padrão"}`);
@@ -604,10 +666,20 @@ async function main() {
       if (data.turnId) {
         console.log(`Turn ID: ${data.turnId}`);
       }
+      if (data.queued > 0) {
+        console.log(`Fila: ${data.queued} prompt(s) aguardando`);
+      }
+      if (data.handoffNote) {
+        console.log(`Handoff pendente: o próximo turno começa lendo a nota "${data.handoffNote}"`);
+      }
       if (data.lastError) {
         console.log(`Last Error: ${data.lastError}`);
       }
-      if (data.events && data.events.length > 0) {
+      if (flags.full) {
+        const label = data.status === "thinking" ? "Resposta parcial (turno em andamento)" : "Última resposta";
+        console.log(`\n${label}:`);
+        console.log(data.text ? data.text.replace(/\s+$/, "") : "(sem texto)");
+      } else if (data.events && data.events.length > 0) {
         console.log(`\nRecent events (${data.events.length}):`);
         for (const ev of data.events.slice(-10)) {
           const time = new Date(ev.timestamp).toLocaleTimeString();
@@ -634,7 +706,81 @@ async function main() {
         await handleResponseError(res);
       }
 
-      console.log(`Agent "${name}" stopped.`);
+      const data = (await res.json()) as StopResponse;
+      console.log(
+        data.interrupted
+          ? `Worker "${name}": turno atual interrompido.`
+          : `Worker "${name}": nenhum turno em andamento.`
+      );
+      console.log(
+        data.clearedQueue > 0
+          ? `Fila esvaziada: ${data.clearedQueue} prompt(s) descartado(s).`
+          : "Fila: vazia (nada descartado)."
+      );
+      break;
+    }
+
+    case "wait": {
+      const names = positional.slice(1);
+      if (names.length === 0) {
+        console.error("Erro: informe ao menos um worker. Uso: sinapse wait <n1> [n2 ...] [--any] [--timeout <seg>]");
+        process.exit(1);
+      }
+      const timeoutSec = parseTimeoutSec(flags);
+      const ws = await resolveWorkspace(flags);
+      const data = await waitForWorkers(ws, names, { any: Boolean(flags.any), timeoutSec });
+
+      for (const r of data.results) {
+        printWaitResult(r);
+      }
+      if (!data.done) {
+        console.error(`Tempo esgotado (${timeoutSec}s): ainda há worker ocupado.`);
+        process.exit(2);
+      }
+      if (data.results.some((r) => !r.busy && r.status === "error")) {
+        process.exit(1);
+      }
+      break;
+    }
+
+    case "handoff": {
+      const name = positional[1];
+      if (!name) {
+        console.error("Erro: Nome do worker é obrigatório. Uso: sinapse handoff <nome> [--note <nota>]");
+        process.exit(1);
+      }
+      const note = typeof flags.note === "string" ? flags.note : undefined;
+      const timeoutSec = parseTimeoutSec(flags);
+      const ws = await resolveWorkspace(flags);
+
+      const res = await apiRequest(routes.agentHandoff(ws.id, name), {
+        method: "POST",
+        body: JSON.stringify(note ? { note } : {}),
+      });
+      if (!res.ok) {
+        await handleResponseError(res);
+      }
+      const started = (await res.json()) as HandoffResponse;
+      console.log(`Gerando handoff de "${name}" (turn ${started.turnId})...`);
+
+      const waited = await waitForWorkers(ws, [name], { timeoutSec });
+      if (!waited.done) {
+        console.error(`Tempo esgotado (${timeoutSec}s): o handoff ainda está rodando; confira com sinapse check ${name}.`);
+        process.exit(2);
+      }
+
+      const checkRes = await apiRequest(routes.agentCheck(ws.id, name));
+      if (!checkRes.ok) {
+        await handleResponseError(checkRes);
+      }
+      const check = (await checkRes.json()) as CheckResponse;
+      const outcome = check.lastHandoff?.turnId === started.turnId ? check.lastHandoff : undefined;
+      if (!outcome?.ok) {
+        console.error(`Handoff falhou: ${outcome?.error ?? check.lastError ?? "motivo desconhecido"}`);
+        process.exit(1);
+      }
+      console.log(`Handoff salvo na nota "${outcome.note}" (sinapse note read ${outcome.note}).`);
+      console.log(`Sessão de "${name}" zerada; o próximo turno começa lendo essa nota.`);
       break;
     }
 

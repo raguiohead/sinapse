@@ -981,6 +981,28 @@ body,
   white-space: nowrap;
 }
 
+.context-meter-handoff {
+  flex-shrink: 0;
+  border: 1px solid var(--thinking);
+  background: transparent;
+  color: var(--thinking);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+
+.context-meter-handoff:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.context-meter-handoff:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ==========================================================================
    Brain Node Card
    ========================================================================== */

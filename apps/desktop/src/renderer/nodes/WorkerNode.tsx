@@ -13,6 +13,9 @@ export interface WorkerNodeData {
   status?: AgentStatus;
   model?: string;
   usage?: ContextUsage;
+  /** Branch/path of the worker's git worktree, when it has one. */
+  worktreeBranch?: string;
+  worktreePath?: string;
   log?: string;
   lastPrompt?: string;
   deleteError?: string;
@@ -106,7 +109,13 @@ export function WorkerNode({ data }: NodeProps) {
 
     setDeleteError(null);
     try {
-      await window.sinapse?.workers?.delete(workspaceId, agentId);
+      const result = await window.sinapse?.workers?.delete(workspaceId, agentId);
+      if (result?.worktree?.action === "kept") {
+        window.alert(
+          `Worker removido, mas a worktree e a branch ${result.worktree.branch} foram mantidas ` +
+            `(${result.worktree.reason ?? "motivo desconhecido"}):\n${result.worktree.path}`
+        );
+      }
     } catch (err: any) {
       console.error("Erro ao excluir worker:", err);
       setDeleteError(err?.message || "Falha ao excluir worker");
@@ -261,6 +270,14 @@ export function WorkerNode({ data }: NodeProps) {
                   ✕
                 </button>
               </div>
+            )}
+            {nodeData.worktreeBranch && (
+              <span
+                className="worker-branch-badge"
+                title={`Worktree isolada: ${nodeData.worktreePath ?? ""}`}
+              >
+                ⎇ {nodeData.worktreeBranch}
+              </span>
             )}
           </div>
 

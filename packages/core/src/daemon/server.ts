@@ -7,11 +7,14 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
-import { findCliBinDir, sinapseDir } from "../paths.js";
+import { findCliBinDir, sinapseDir, worktreesDir } from "../paths.js";
+import { createWorktree, GitError, removeWorktree } from "../git.js";
+import { loadSquadCatalog } from "../squads.js";
 import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { randomUUID } from "node:crypto";
 import type {
   AgentConfig,
+  AgentDeleteResult,
   AgentState,
   AskResponse,
   Author,
@@ -28,12 +31,15 @@ import type {
   OrchestratorConfig,
   Provider,
   StopResponse,
+  SquadApplyResult,
+  SquadCatalog,
   TurnEvent,
   TurnRecord,
   TurnResult,
   WaitResponse,
   WaitResult,
   Workspace,
+  WorktreeInfo,
 } from "../types.js";
 import { AUTHOR_HEADER, ENV, USER_AUTHOR } from "../routes.js";
 import { ClaudeAdapter } from "../adapters/claude.js";
@@ -951,6 +957,67 @@ function waitResult(agentId: string, name: string): WaitResult {
   };
 }
 
+type SpawnResult = { ok: true; agent: AgentState } | { ok: false; status: number; error: string };
+
+async function spawnAgent(
+  ws: Workspace,
+  input: Partial<AgentConfig>,
+  author: Author,
+  isolate: boolean
+): Promise<SpawnResult> {
+  if (input.provider !== "claude" && input.provider !== "agy" && input.provider !== "codex") {
+    return { ok: false, status: 400, error: `Invalid provider: ${input.provider}` };
+  }
+  const modelVal = validateModel(input.model);
+  if (!modelVal.valid) {
+    return { ok: false, status: 400, error: "Invalid model format" };
+  }
+  const name = input.name as string;
+  if (Object.values(state.agents).some((a) => a.workspaceId === ws.id && a.name === name)) {
+    return {
+      ok: false,
+      status: 409,
+      error: `Agent with name "${name}" already exists in workspace "${ws.name}"`,
+    };
+  }
+
+  let cwd = input.cwd && typeof input.cwd === "string" && input.cwd.trim()
+    ? path.resolve(input.cwd.trim())
+    : ws.folder;
+
+  let worktree: WorktreeInfo | undefined;
+  if (isolate) {
+    try {
+      const created = await createWorktree(cwd, name, worktreesDir(ws.id));
+      worktree = created.info;
+      cwd = created.cwd;
+    } catch (err: any) {
+      const status = err instanceof GitError ? 409 : 500;
+      return { ok: false, status, error: err?.message ?? String(err) };
+    }
+  }
+
+  const agentId = nanoid(8);
+  const newAgent: AgentState = {
+    id: agentId,
+    workspaceId: ws.id,
+    name,
+    provider: input.provider,
+    cwd,
+    role: input.role as string,
+    autonomy: input.autonomy as Autonomy,
+    status: "idle",
+    createdBy: author,
+    ...(modelVal.model ? { model: modelVal.model } : {}),
+    ...(worktree ? { worktree } : {}),
+  };
+
+  state.agents[agentId] = newAgent;
+  await saveState();
+  broadcast({ kind: "agent_spawned", workspaceId: ws.id, agent: newAgent });
+  return { ok: true, agent: newAgent };
+}
+
 export async function start(
   options: { handleSignals?: boolean } = {}
 ): Promise<{ port: number; token: string }> {
@@ -1231,7 +1298,7 @@ export async function start(
       return reply.status(404).send({ error: "Workspace não encontrado" });
     }
 
-    const body = request.body as Partial<AgentConfig> | undefined;
+    const body = request.body as (Partial<AgentConfig> & { worktree?: unknown }) | undefined;
     if (
       !body ||
       !body.name ||
@@ -1244,48 +1311,53 @@ export async function start(
       });
     }
 
-    if (body.provider !== "claude" && body.provider !== "agy" && body.provider !== "codex") {
-      return reply.status(400).send({ error: `Invalid provider: ${body.provider}` });
+    const result = await spawnAgent(ws, body, getAuthor(request), body.worktree === true);
+    if (!result.ok) {
+      return reply.status(result.status).send({ error: result.error });
     }
+    return reply.status(201).send(result.agent);
+  });
 
-    const modelVal = validateModel(body.model);
-    if (!modelVal.valid) {
-      return reply.status(400).send({ error: "Invalid model format" });
+  fastify.get("/squads", async (): Promise<SquadCatalog> => loadSquadCatalog());
+
+  fastify.post("/workspaces/:ws/squads/apply", async (request, reply) => {
+    const { ws: wsParam } = request.params as { ws: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
     }
-
-    const existing = Object.values(state.agents).find(
-      (a) => a.workspaceId === ws.id && a.name === body.name
-    );
-    if (existing) {
-      return reply.status(409).send({
-        error: `Agent with name "${body.name}" already exists in workspace "${ws.name}"`,
+    const body = request.body as { preset?: unknown; prefix?: unknown; worktree?: unknown } | undefined;
+    if (!body || typeof body.preset !== "string" || !body.preset.trim()) {
+      return reply.status(400).send({ error: "preset é obrigatório" });
+    }
+    const catalog = await loadSquadCatalog();
+    const preset = catalog.presets.find((p) => p.name === body.preset);
+    if (!preset) {
+      return reply.status(404).send({
+        error: `Preset "${body.preset}" não encontrado (disponíveis: ${catalog.presets.map((p) => p.name).join(", ")})`,
       });
     }
-
-    const cwd = body.cwd && typeof body.cwd === "string" && body.cwd.trim()
-      ? path.resolve(body.cwd.trim())
-      : ws.folder;
+    let prefix = preset.name;
+    if (body.prefix !== undefined && body.prefix !== null && body.prefix !== "") {
+      if (typeof body.prefix !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(body.prefix)) {
+        return reply.status(400).send({ error: 'prefix inválido (use letras, números, ".", "_" e "-")' });
+      }
+      prefix = body.prefix;
+    }
 
     const author = getAuthor(request);
-    const agentId = nanoid(8);
-    const newAgent: AgentState = {
-      id: agentId,
-      workspaceId: ws.id,
-      name: body.name,
-      provider: body.provider,
-      cwd,
-      role: body.role,
-      autonomy: body.autonomy,
-      status: "idle",
-      createdBy: author,
-      ...(modelVal.model ? { model: modelVal.model } : {}),
-    };
-
-    state.agents[agentId] = newAgent;
-    await saveState();
-    broadcast({ kind: "agent_spawned", workspaceId: ws.id, agent: newAgent });
-
-    return reply.status(201).send(newAgent);
+    const result: SquadApplyResult = { preset: preset.name, created: [], skipped: [], failed: [] };
+    for (const member of preset.members) {
+      const name = `${prefix}-${member.name}`;
+      if (Object.values(state.agents).some((a) => a.workspaceId === ws.id && a.name === name)) {
+        result.skipped.push({ name, reason: "já existe" });
+        continue;
+      }
+      const spawned = await spawnAgent(ws, { ...member, name }, author, body.worktree === true);
+      if (spawned.ok) result.created.push(spawned.agent);
+      else result.failed.push({ name, error: spawned.error });
+    }
+    return result;
   });
 
   fastify.patch("/workspaces/:ws/agents/:agent", async (request, reply) => {
@@ -1623,6 +1695,18 @@ export async function start(
       activeTurns.delete(agent.id);
     }
 
+    const force = ["1", "true"].includes(String((request.query as Record<string, unknown>)?.force ?? ""));
+    const result: AgentDeleteResult = { ok: true };
+    if (agent.worktree) {
+      const cleanup = await removeWorktree(agent.worktree, force);
+      result.worktree = {
+        action: cleanup.action,
+        path: agent.worktree.path,
+        branch: agent.worktree.branch,
+        ...(cleanup.reason ? { reason: cleanup.reason } : {}),
+      };
+    }
+
     delete state.agents[agent.id];
     agentRecentEvents.delete(agent.id);
     lastHandoffs.delete(agent.id);
@@ -1631,7 +1715,7 @@ export async function start(
     broadcast({ kind: "agent_deleted", workspaceId: ws.id, agentId: agent.id, agentName: agent.name });
     notifyWaiters();
 
-    return { ok: true };
+    return result;
   });
 
   // Notes routes under workspace

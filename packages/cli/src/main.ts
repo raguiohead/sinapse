@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type {
+  AgentDeleteResult,
   AgentState,
   AskResponse,
   Autonomy,
@@ -17,6 +18,8 @@ import type {
   NoteSummary,
   Provider,
   StopResponse,
+  SquadApplyResult,
+  SquadCatalog,
   TurnEvent,
   WaitResponse,
   WaitResult,
@@ -215,8 +218,8 @@ async function resolveWorkspace(flags: Record<string, any>): Promise<Workspace> 
 }
 
 const FLAG_PATTERN = /^--?[A-Za-z]/;
-/** Flags that never take a value, so `wait --any a b` keeps "a" as a worker name. */
-const BOOLEAN_FLAGS = new Set(["async", "queue", "any", "full", "help", "h"]);
+/** Flags that never take a value, so `wait --any a b` and `--force <name>` keep the next word as an argument. */
+const BOOLEAN_FLAGS = new Set(["async", "queue", "any", "full", "help", "h", "worktree", "force"]);
 
 function parseArgs(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
@@ -412,13 +415,17 @@ Uso:
   sinapse workspace rm <nome|id>                             Remove um workspace
   sinapse list [--workspace <ws>]                            Lista workers do workspace
   sinapse spawn <nome> --provider <p> [--cwd <dir>] --role <r> [--autonomy edit] [--model <m>] [--workspace <ws>]
+                [--worktree]                                 Isola o worker numa git worktree (branch sinapse/<nome>)
+  sinapse squad list                                         Lista presets de squad (embutidos + ~/.sinapse/squads.json)
+  sinapse squad apply <preset> [--prefix <p>] [--worktree] [--workspace <ws>]
+                                                             Cria os workers do preset (<prefix>-<membro>)
   sinapse ask <nome> "<prompt>" [--async] [--workspace <ws>] Envia prompt ao worker
   sinapse ask <nome> "<prompt>" --queue [--workspace <ws>]   Enfileira se o worker estiver ocupado (implica --async)
   sinapse wait <n1> [n2 ...] [--any] [--timeout <seg>]       Espera os workers terminarem e imprime as respostas
   sinapse check <nome> [--full] [--workspace <ws>]           Consulta status e eventos (--full: resposta completa)
   sinapse stop <nome> [--workspace <ws>]                     Interrompe o turno ativo e esvazia a fila
   sinapse handoff <nome> [--note <nota>] [--workspace <ws>]  Resume o trabalho numa nota e zera a sessão do worker
-  sinapse rm <nome> [--workspace <ws>]                       Remove o worker
+  sinapse rm <nome> [--force] [--workspace <ws>]             Remove o worker (--force apaga worktree/branch mesmo com trabalho nela)
   sinapse models [claude|agy]                                Lista catálogo de modelos
   sinapse model <nome> <modelo|padrao> [--workspace <ws>]    Altera o modelo de um worker
   sinapse note list [--workspace <ws>]                       Lista notas do workspace
@@ -560,6 +567,7 @@ async function main() {
           role,
           autonomy,
           ...(model ? { model } : {}),
+          ...(flags.worktree ? { worktree: true } : {}),
         }),
       });
 
@@ -569,7 +577,56 @@ async function main() {
 
       const created = (await res.json()) as AgentState;
       console.log(`Agent "${created.name}" spawned (id: ${created.id}, provider: ${created.provider}${created.model ? `, model: ${created.model}` : ""})`);
+      if (created.worktree) {
+        console.log(`Worktree: ${created.worktree.path} (branch ${created.worktree.branch})`);
+      }
       break;
+    }
+
+    case "squad": {
+      const sub = positional[1];
+      if (sub === "list") {
+        const res = await apiRequest(routes.squads());
+        if (!res.ok) await handleResponseError(res);
+        const catalog = (await res.json()) as SquadCatalog;
+        for (const preset of catalog.presets) {
+          console.log(`${preset.name} [${preset.source}]${preset.description ? ` - ${preset.description}` : ""}`);
+          for (const m of preset.members) {
+            console.log(`  ${m.name}  ${m.provider}${m.model ? `/${m.model}` : ""}  ${m.autonomy}  ${m.role}`);
+          }
+        }
+        for (const w of catalog.warnings) console.error(`Aviso: ${w}`);
+        break;
+      }
+      if (sub === "apply") {
+        const preset = positional[2];
+        if (!preset) {
+          console.error("Erro: Nome do preset é obrigatório. Uso: sinapse squad apply <preset> [--prefix <p>] [--worktree]");
+          process.exit(1);
+        }
+        const prefix = typeof flags.prefix === "string" ? flags.prefix : undefined;
+        const ws = await resolveWorkspace(flags);
+        const res = await apiRequest(routes.squadApply(ws.id), {
+          method: "POST",
+          headers: authorHeaders(),
+          body: JSON.stringify({
+            preset,
+            ...(prefix ? { prefix } : {}),
+            ...(flags.worktree ? { worktree: true } : {}),
+          }),
+        });
+        if (!res.ok) await handleResponseError(res);
+        const result = (await res.json()) as SquadApplyResult;
+        for (const a of result.created) {
+          console.log(`Criado: ${a.name} (${a.provider}, ${a.autonomy})${a.worktree ? ` worktree ${a.worktree.path} [${a.worktree.branch}]` : ""}`);
+        }
+        for (const s of result.skipped) console.error(`Aviso: "${s.name}" ignorado (${s.reason}).`);
+        for (const f of result.failed) console.error(`Erro: "${f.name}" não foi criado: ${f.error}`);
+        if (result.failed.length > 0) process.exit(1);
+        break;
+      }
+      console.error("Uso: sinapse squad list | sinapse squad apply <preset> [--prefix <p>] [--worktree]");
+      process.exit(1);
     }
 
     case "ask": {
@@ -791,11 +848,22 @@ async function main() {
         process.exit(1);
       }
       const ws = await resolveWorkspace(flags);
-      const res = await apiRequest(routes.agent(ws.id, name), { method: "DELETE" });
+      const res = await apiRequest(`${routes.agent(ws.id, name)}${flags.force ? "?force=1" : ""}`, {
+        method: "DELETE",
+      });
       if (!res.ok) {
         await handleResponseError(res);
       }
+      const removed = (await res.json()) as AgentDeleteResult;
       console.log(`Worker "${name}" removido.`);
+      if (removed.worktree?.action === "removed") {
+        console.log(`Worktree e branch ${removed.worktree.branch} removidas.`);
+      } else if (removed.worktree) {
+        console.error(
+          `Aviso: worktree e branch mantidas (${removed.worktree.reason ?? "motivo desconhecido"}): ` +
+            `${removed.worktree.path} [${removed.worktree.branch}]. Faça o merge/descarte manualmente ou use "sinapse rm --force".`
+        );
+      }
       break;
     }
 

@@ -16,9 +16,13 @@ import type {
   HandoffResponse,
   Workspace,
   TurnRecord,
+  AgentDeleteResult,
+  SquadApplyResult,
+  SquadCatalog,
 } from "@sinapse/core";
 import {
   IPC,
+  type SquadApplyPayload,
   type DaemonInfo,
   type WorkerAskPayload,
   type WorkerSpawnPayload,
@@ -1126,6 +1130,34 @@ function registerIpcHandlers(): void {
     return (await res.json()) as ModelCatalog;
   });
 
+  // Squads
+  ipcMain.handle(IPC.SQUADS_LIST, async (): Promise<SquadCatalog> => {
+    const res = await daemonFetch(routes.squads());
+    if (!res.ok) {
+      throw new Error(await extractDaemonError(res, `Não foi possível listar os squads: ${res.status}`));
+    }
+    return (await res.json()) as SquadCatalog;
+  });
+
+  ipcMain.handle(IPC.SQUADS_APPLY, async (_event, payload: SquadApplyPayload): Promise<SquadApplyResult> => {
+    const res = await daemonFetch(routes.squadApply(payload.workspaceId), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        [AUTHOR_HEADER]: USER_AUTHOR,
+      },
+      body: JSON.stringify({
+        preset: payload.preset,
+        ...(payload.prefix ? { prefix: payload.prefix } : {}),
+        ...(payload.worktree ? { worktree: true } : {}),
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(await extractDaemonError(res, `Não foi possível aplicar o squad: ${res.status}`));
+    }
+    return (await res.json()) as SquadApplyResult;
+  });
+
   // Workers
   ipcMain.handle(IPC.WORKER_LIST, async (_event, workspaceId: string): Promise<AgentState[]> => {
     const response = await daemonFetch(routes.agents(workspaceId), { method: "GET" });
@@ -1147,6 +1179,9 @@ function registerIpcHandlers(): void {
     }
     if (payload.model) {
       body.model = payload.model;
+    }
+    if (payload.worktree) {
+      body.worktree = true;
     }
 
     const response = await daemonFetch(routes.agents(payload.workspaceId), {
@@ -1209,11 +1244,12 @@ function registerIpcHandlers(): void {
     return await response.json();
   });
 
-  ipcMain.handle(IPC.WORKER_DELETE, async (_event, workspaceId: string, agent: string): Promise<void> => {
+  ipcMain.handle(IPC.WORKER_DELETE, async (_event, workspaceId: string, agent: string): Promise<AgentDeleteResult> => {
     const response = await daemonFetch(routes.agent(workspaceId, agent), { method: "DELETE" });
     if (!response.ok) {
       throw new Error(await extractDaemonError(response, `Não foi possível excluir o worker: ${response.status}`));
     }
+    return (await response.json()) as AgentDeleteResult;
   });
 
   ipcMain.handle(

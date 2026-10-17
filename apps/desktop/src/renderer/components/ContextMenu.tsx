@@ -23,6 +23,9 @@ export interface ContextMenuProps {
   onNewWorker?: () => void;
   onNewNote?: () => void;
   onOpenSettings?: () => void;
+  /** Names of the squad presets offered as "Aplicar squad ▸ <preset>". */
+  squadPresets?: string[];
+  onApplySquad?: (preset: string) => void;
 }
 
 export function ContextMenu({
@@ -33,6 +36,8 @@ export function ContextMenu({
   onNewWorker,
   onNewNote,
   onOpenSettings,
+  squadPresets,
+  onApplySquad,
 }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -84,6 +89,15 @@ export function ContextMenu({
         onNewNote?.();
       },
     },
+    ...(squadPresets ?? []).map(
+      (preset): MenuItem => ({
+        type: "action",
+        label: `Aplicar squad ▸ ${preset}`,
+        action: () => {
+          onApplySquad?.(preset);
+        },
+      })
+    ),
     { type: "separator" },
     {
       type: "action",

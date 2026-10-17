@@ -9,9 +9,13 @@ import type {
   HandoffResponse,
   Workspace,
   TurnRecord,
+  AgentDeleteResult,
+  SquadApplyResult,
+  SquadCatalog,
 } from "@sinapse/core";
 import {
   IPC,
+  type SquadApplyPayload,
   type DaemonInfo,
   type WorkerAskPayload,
   type WorkerSpawnPayload,
@@ -168,7 +172,7 @@ const api = {
     stop: (workspaceId: string, agent: string): Promise<any> => {
       return ipcRenderer.invoke(IPC.WORKER_STOP, workspaceId, agent);
     },
-    delete: (workspaceId: string, agent: string): Promise<void> => {
+    delete: (workspaceId: string, agent: string): Promise<AgentDeleteResult> => {
       return ipcRenderer.invoke(IPC.WORKER_DELETE, workspaceId, agent);
     },
     handoff: (workspaceId: string, agent: string): Promise<HandoffResponse> => {
@@ -189,6 +193,14 @@ const api = {
   models: {
     list: (): Promise<ModelCatalog> => {
       return ipcRenderer.invoke(IPC.MODELS_LIST);
+    },
+  },
+  squads: {
+    list: (): Promise<SquadCatalog> => {
+      return ipcRenderer.invoke(IPC.SQUADS_LIST);
+    },
+    apply: (payload: SquadApplyPayload): Promise<SquadApplyResult> => {
+      return ipcRenderer.invoke(IPC.SQUADS_APPLY, payload);
     },
   },
   notes: {

@@ -31,6 +31,8 @@ export const IPC = {
   LAYOUT_GET: "layout:get",
   LAYOUT_SAVE: "layout:save",
   MODELS_LIST: "models:list",
+  SQUADS_LIST: "squads:list",
+  SQUADS_APPLY: "squads:apply",
   NOTES_LIST: "notes:list",
   NOTE_READ: "note:read",
   NOTE_WRITE: "note:write",
@@ -123,6 +125,15 @@ export interface WorkerSpawnPayload {
   role: string;
   autonomy: Autonomy;
   model?: string;
+  /** Run the worker in its own git worktree (branch sinapse/<name>). */
+  worktree?: boolean;
+}
+
+export interface SquadApplyPayload {
+  workspaceId: string;
+  preset: string;
+  prefix?: string;
+  worktree?: boolean;
 }
 
 export interface WorkerUpdatePayload {

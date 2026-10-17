@@ -22,6 +22,9 @@ Você é o **cérebro**. Os workers rodam turnos headless com sessão persistent
 sinapse workspaces                       # lista workspaces do daemon
 sinapse list                             # lista workers do workspace atual
 sinapse spawn <nome> --provider agy|claude [--cwd <dir>] --role "<papel>" [--autonomy read|edit|full] [--model <modelo>]
+sinapse spawn <nome> ... --worktree      # isola o worker numa git worktree (branch sinapse/<nome>); exige repo git
+sinapse squad list                       # presets de squad (review, tdd, bug-hunt + ~/.sinapse/squads.json)
+sinapse squad apply <preset> [--prefix <p>] [--worktree]   # cria os workers <prefix>-<membro>; pula os existentes
 sinapse ask <nome> "<prompt>"            # bloqueia e imprime a resposta
 sinapse ask <nome> "<prompt>" --async    # devolve um turnId e segue
 sinapse ask <nome> "<prompt>" --queue    # como --async; se ocupado, enfileira em vez de recusar
@@ -29,7 +32,7 @@ sinapse wait <n1> [n2 ...] [--any] [--timeout <seg>]  # bloqueia até terminarem
 sinapse check <nome> [--full]            # status, fila e últimos eventos (--full: resposta completa)
 sinapse stop <nome>                      # cancela o turno atual E descarta a fila
 sinapse handoff <nome> [--note <nota>]   # resumo → nota handoff-<nome>, sessão zerada, próximo turno lê a nota
-sinapse rm <nome>                        # remove o worker (perde a sessão); só se o usuário pedir ou o worker não servir mais
+sinapse rm <nome> [--force]              # remove o worker (perde a sessão); só se o usuário pedir ou o worker não servir mais
 sinapse models [claude|agy]              # lista modelos disponíveis
 sinapse model <nome> <modelo|padrao>     # altera o modelo do worker (padrao limpa)
 sinapse note list                        # lista notas
@@ -39,6 +42,7 @@ sinapse note append <nome> "<texto>"|-       # adiciona ao fim; "-" lê do stdin
 sinapse note rm <nome>                   # remove nota
 ```
 
+- Worktree: use `--worktree` quando vários workers com `edit` mexerem no mesmo repo. A worktree nasce sem `node_modules`/artefatos. O `rm` mantém worktree/branch que tenham trabalho (e avisa o caminho); nunca use `--force` sem o usuário pedir, e nunca faça merge sem ele autorizar.
 - Autonomia padrão: `edit`. Use `read` para análise e revisão. `full` só quando o usuário pedir.
 - Para trabalho em paralelo, dispare vários `ask --async` em workers diferentes e depois `sinapse wait a b c` (todos) ou `sinapse wait a b c --any` (o primeiro que terminar). `wait` sai com código 2 em timeout e 1 se algum worker terminou em erro.
 - Para mandar vários prompts em sequência ao mesmo worker, use `--queue` em cada um; `wait` só volta quando a fila esvaziar e mostra a resposta do último turno.

@@ -8,8 +8,12 @@ import type {
   HandoffResponse,
   Workspace,
   TurnRecord,
+  AgentDeleteResult,
+  SquadApplyResult,
+  SquadCatalog,
 } from "@sinapse/core";
 import type {
+  SquadApplyPayload,
   DaemonInfo,
   WorkerAskPayload,
   WorkerSpawnPayload,
@@ -75,7 +79,7 @@ export interface SinapseBridge {
     ask: (payload: WorkerAskPayload) => Promise<{ turnId: string }>;
     stop: (workspaceId: string, agent: string) => Promise<any>;
     /** Removes the worker; a running turn is interrupted first. Emits agent_deleted on the bus. */
-    delete: (workspaceId: string, agent: string) => Promise<void>;
+    delete: (workspaceId: string, agent: string) => Promise<AgentDeleteResult>;
     /** Starts the summary turn in the background (note handoff-<nome>); the session resets when it ends. Rejects when busy or sessionless. */
     handoff: (workspaceId: string, agent: string) => Promise<HandoffResponse>;
     /** Last finished turns from disk, oldest first (default 10, max 50). */
@@ -88,6 +92,10 @@ export interface SinapseBridge {
   };
   models: {
     list: () => Promise<ModelCatalog>;
+  };
+  squads: {
+    list: () => Promise<SquadCatalog>;
+    apply: (payload: SquadApplyPayload) => Promise<SquadApplyResult>;
   };
   /** Notes written from the canvas are authored by "usuario". */
   notes: {

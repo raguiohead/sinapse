@@ -165,7 +165,7 @@ Execute no terminal PowerShell:
 Cada workspace é um projeto (uma pasta que você escolhe), com o próprio orquestrador, workers e notas.
 
 - **Seletor** (canto superior direito): lista os workspaces, troca entre eles, cria um novo ("＋ Novo workspace": nome, pasta, orquestrador e modelo) e apaga existentes (🗑).
-- **Orquestrador por workspace:** Claude Code ou AGY, com o modelo que você quiser; dá para trocar na seção "Orquestrador" das configurações. Mudar só o modelo do Claude retoma a conversa; mudar de provedor começa uma nova.
+- **Orquestrador por workspace:** Claude Code ou AGY, com o modelo que você quiser; dá para trocar na seção "Orquestrador" das configurações. Mudar só o modelo retoma a conversa; mudar de provedor começa uma nova.
 - **Seu projeto fica intocado:** o orquestrador roda numa pasta do Sinapse (`~/.sinapse/workspaces/<id>/orquestrador`) e acessa o projeto via `--add-dir`. Nada é criado dentro do repositório do projeto. Na primeira vez, o Claude Code ou o AGY pede confiança nessa pasta.
 - **Em segundo plano:** ao trocar de workspace, o anterior continua rodando (orquestrador e turnos dos workers); ao voltar, os cards mostram o que aconteceu nesse meio-tempo.
 - **Apagar:** interrompe e remove os workers do workspace, encerra o orquestrador e apaga as notas e a sessão dele. A pasta do projeto não é tocada. O último workspace não pode ser apagado.
@@ -255,7 +255,7 @@ Tanto no canvas quanto na CLI, é possível selecionar e alternar os modelos dos
 - **Janela de contexto:**
   - O **Claude** reporta o tamanho real de sua janela de contexto diretamente pela CLI (`contextWindow`).
   - O **Codex**, o **AGY** e o **orquestrador** exibem a janela reportada pela CLI (quando disponível) ou uma estimativa marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
-  - O uso de contexto do **orquestrador Claude** é lido a partir do transcript de sessão do Claude Code; o orquestrador AGY mostra só o modelo.
+  - O uso de contexto do **orquestrador** (Claude Code ou AGY) é lido a partir do transcript da sessão ativa (`~/.claude/projects/` para Claude e `~/.gemini/antigravity-cli/brain/` para AGY).
 - **Handoff:** quando um worker passa de 80% da janela, o card mostra um botão "Handoff" (o mesmo que `sinapse handoff <nome>`). O resumo vira a nota `handoff-<nome>`, a sessão recomeça do zero e o primeiro turno seguinte é instruído a ler essa nota.
 
 ### Papel do worker
@@ -354,7 +354,7 @@ sinapse/
 - **Persistência de logs:** O histórico detalhado de eventos de turnos de workers é mantido em memória e não é persistido após o encerramento do daemon.
 - **Fila em memória:** prompts enfileirados com `--queue` se perdem se o daemon reiniciar. `wait` e `check --full` mostram só a resposta do último turno; numa fila com vários prompts, as respostas anteriores ficam apenas no canvas.
 - **Confiança por workspace:** cada orquestrador roda na sua própria pasta, então o Claude Code ou o AGY pede confiança uma vez por workspace novo.
-- **Orquestrador AGY:** ao abrir, o AGY às vezes mostra um aviso de novidades que precisa ser fechado com Esc antes de digitar. Ele não informa o uso de contexto, então o card mostra só o modelo.
+- **Orquestrador AGY:** ao abrir, o AGY às vezes mostra um aviso de novidades que precisa ser fechado com Esc antes de digitar.
 - **Pasta antiga `~/.sinapse/cerebro`:** depois da atualização para workspaces, ela não é mais usada (o orquestrador do Geral começa numa sessão nova). Pode ser apagada.
 - **Janela de contexto estimada:** quando o CLI não informa o limite (AGY e cérebro), o Sinapse estima pelo nome do modelo; a família Claude 5.x é tratada como 1M.
 - **Processos que se desligam do pai:** alguns servidores MCP se separam do processo que os iniciou. No Linux o Sinapse os encontra por uma marca no ambiente e os encerra; no Windows depende do `taskkill /T`, que não alcança processos já desligados da árvore.

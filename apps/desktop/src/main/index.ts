@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import type { IPty } from "node-pty";
 import type {
@@ -47,6 +47,9 @@ const {
   agentEnv,
   sinapseDir,
   estimateContextWindow,
+  DEFAULT_AGY_MODEL,
+  normalizeAgyModelId,
+  buildAgyContextUsage,
   routes,
   AUTHOR_HEADER,
   ORCHESTRATOR_AUTHOR,
@@ -164,7 +167,7 @@ function getBrainInfo(workspaceId: string, ws?: Workspace): BrainInfo {
     workspaceId,
     provider,
     model,
-    usage: provider === "claude" ? brain?.usage : undefined,
+    usage: brain?.usage,
     running: brain?.pty != null,
   };
 }
@@ -246,6 +249,9 @@ async function spawnBrain(ws: Workspace, resumeSessionId?: string | null): Promi
     args.push("--add-dir", ws.folder);
   } else {
     // agy
+    if (resumeSessionId) {
+      args.push("--conversation", resumeSessionId);
+    }
     if (model) {
       args.push("--model", model);
     }
@@ -265,8 +271,16 @@ async function spawnBrain(ws: Workspace, resumeSessionId?: string | null): Promi
     brain.session = randomUUID();
     brain.provider = provider;
     brain.model = model ?? null;
+    brain.sessionId = resumeSessionId ?? null;
     if (!resumeSessionId) {
       brain.scrollback = "";
+      brain.usage = undefined;
+    } else if (brain.usage && model) {
+      brain.usage = {
+        ...brain.usage,
+        windowTokens: estimateContextWindow(model) ?? brain.usage.windowTokens,
+        model,
+      };
     }
 
     const command = provider === "claude" ? "claude" : "agy";
@@ -327,85 +341,379 @@ function isUsageEqual(a?: ContextUsage, b?: ContextUsage): boolean {
   );
 }
 
-function pollBrainUsage(): void {
-  for (const [workspaceId, brain] of brains.entries()) {
-    if (brain.provider !== "claude" || !brain.pty) continue;
+const AGY_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function getAgyConversationMtime(agyDir: string, convId: string): number {
+  let maxMtime = -1;
+  const candidates = [
+    path.join(agyDir, "brain", convId, ".system_generated", "logs", "transcript.jsonl"),
+    path.join(agyDir, "conversations", `${convId}.db-wal`),
+    path.join(agyDir, "conversations", `${convId}.db`),
+    path.join(agyDir, "presence", `${convId}.lock`),
+  ];
+  for (const p of candidates) {
     try {
-      const bDir = brainDir(workspaceId);
-      const dir = path.join(os.homedir(), ".claude", "projects", bDir.replace(/[^a-zA-Z0-9]/g, "-"));
-      if (!fs.existsSync(dir)) continue;
+      const st = fs.statSync(p);
+      if (st.mtimeMs > maxMtime) maxMtime = st.mtimeMs;
+    } catch {}
+  }
+  return maxMtime;
+}
 
-      const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-      if (files.length === 0) continue;
-
-      const minMtime = brain.ptyStartTime - 5000;
-      let newestFile: string | null = null;
-      let newestMtime = -1;
-
-      for (const file of files) {
-        try {
-          const fullPath = path.join(dir, file);
-          const stat = fs.statSync(fullPath);
-          if (stat.mtimeMs >= minMtime && stat.mtimeMs > newestMtime) {
-            newestMtime = stat.mtimeMs;
-            newestFile = fullPath;
-          }
-        } catch {}
-      }
-
-      if (!newestFile) continue;
-      brain.sessionId = path.basename(newestFile, ".jsonl");
-
-      const stat = fs.statSync(newestFile);
-      const size = stat.size;
-      if (size === 0) continue;
-
-      const readSize = Math.min(size, 256 * 1024);
-      const buffer = Buffer.alloc(readSize);
-      const fd = fs.openSync(newestFile, "r");
+function findAgyConversationByProc(agyDir: string, pid: number | undefined, minMtime: number, currentSessionId: string | null): string | null {
+  if (!pid || process.platform !== "linux") return null;
+  try {
+    const fdDir = `/proc/${pid}/fd`;
+    if (!fs.existsSync(fdDir)) return null;
+    const entries = fs.readdirSync(fdDir);
+    const ids = new Set<string>();
+    for (const fd of entries) {
       try {
-        fs.readSync(fd, buffer, 0, readSize, Math.max(0, size - readSize));
-      } finally {
-        fs.closeSync(fd);
-      }
-
-      const text = buffer.toString("utf-8");
-      const lines = text.split("\n");
-
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        try {
-          const parsed = JSON.parse(line);
-          if (parsed.type === "assistant" && parsed.message?.usage) {
-            const usage = parsed.message.usage;
-            const inputTokens = usage.input_tokens || 0;
-            const cacheCreation = usage.cache_creation_input_tokens || 0;
-            const cacheRead = usage.cache_read_input_tokens || 0;
-            const usedTokens = inputTokens + cacheCreation + cacheRead;
-            const model = parsed.message.model;
-            const windowTokens = estimateContextWindow(model);
-            const newUsage: ContextUsage = {
-              usedTokens,
-              windowTokens,
-              windowEstimated: true,
-              model,
-            };
-
-            if (!isUsageEqual(brain.usage, newUsage)) {
-              brain.usage = newUsage;
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send(IPC.BRAIN_USAGE, workspaceId, newUsage);
-              }
-            }
-            break;
-          }
-        } catch {
-          // Skip malformed/partial line
+        const target = fs.readlinkSync(path.join(fdDir, fd));
+        const m = target.match(/\/(?:presence|conversations)\/([0-9a-f-]{36})\.(?:lock|db)$/i);
+        if (m && AGY_UUID_REGEX.test(m[1])) {
+          ids.add(m[1]);
+        }
+      } catch {}
+    }
+    if (ids.size === 0) return null;
+    let bestId: string | null = null;
+    let bestMtime = -1;
+    for (const id of ids) {
+      const mtime = getAgyConversationMtime(agyDir, id);
+      if (mtime >= minMtime || id === currentSessionId) {
+        if (mtime > bestMtime) {
+          bestMtime = mtime;
+          bestId = id;
         }
       }
-    } catch {
-      // Never crash on poll errors
+    }
+    return bestId;
+  } catch {
+    return null;
+  }
+}
+
+function findAgyConversationByFiles(agyDir: string, bDir: string, minMtime: number): string | null {
+  // 1. Check history.jsonl tail for { workspace: bDir, conversationId }
+  try {
+    const historyPath = path.join(agyDir, "history.jsonl");
+    if (fs.existsSync(historyPath)) {
+      const st = fs.statSync(historyPath);
+      if (st.mtimeMs >= minMtime && st.size > 0) {
+        const readSize = Math.min(st.size, 64 * 1024);
+        const buf = Buffer.alloc(readSize);
+        const fd = fs.openSync(historyPath, "r");
+        try {
+          fs.readSync(fd, buf, 0, readSize, Math.max(0, st.size - readSize));
+        } finally {
+          fs.closeSync(fd);
+        }
+        const lines = buf.toString("utf-8").split("\n");
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (
+              parsed.workspace === bDir &&
+              typeof parsed.conversationId === "string" &&
+              AGY_UUID_REGEX.test(parsed.conversationId) &&
+              (!parsed.timestamp || Number(parsed.timestamp) >= minMtime)
+            ) {
+              return parsed.conversationId;
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+
+  // 2. Check conversations/*.db modified since minMtime whose trajectory_metadata_blob contains the workspace URI
+  try {
+    const convDir = path.join(agyDir, "conversations");
+    if (fs.existsSync(convDir)) {
+      const bDirUri = pathToFileURL(bDir).href;
+      const uriBytes = Buffer.from(bDirUri, "utf-8");
+      // In trajectory_metadata_blob protobuf, workspace_uris (field 1, wire type 2 = 0x0a) prefixes the URI with its byte length.
+      const protoNeedle =
+        uriBytes.length < 128
+          ? Buffer.concat([Buffer.from([0x0a, uriBytes.length]), uriBytes])
+          : uriBytes;
+
+      const entries = fs.readdirSync(convDir).filter((f) => f.endsWith(".db"));
+      const recent: { id: string; mtime: number }[] = [];
+      for (const file of entries) {
+        const id = file.slice(0, -3);
+        if (!AGY_UUID_REGEX.test(id)) continue;
+        const mtime = getAgyConversationMtime(agyDir, id);
+        if (mtime >= minMtime) {
+          recent.push({ id, mtime });
+        }
+      }
+      recent.sort((a, b) => b.mtime - a.mtime);
+
+      for (const cand of recent.slice(0, 10)) {
+        const dbPath = path.join(convDir, `${cand.id}.db`);
+        const walPath = path.join(convDir, `${cand.id}.db-wal`);
+        for (const p of [walPath, dbPath]) {
+          try {
+            if (!fs.existsSync(p)) continue;
+            const buf = fs.readFileSync(p);
+            if (buf.includes(protoNeedle)) {
+              return cand.id;
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+function readAgyDefaultModel(agyDir: string): string | undefined {
+  try {
+    const settingsPath = path.join(agyDir, "settings.json");
+    if (!fs.existsSync(settingsPath)) return undefined;
+    const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    if (typeof parsed?.model === "string") {
+      return normalizeAgyModelId(parsed.model);
+    }
+  } catch {}
+  return undefined;
+}
+
+function extractAgyModelFromLines(lines: string[], minTimestampMs?: number): string | undefined {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (
+        parsed.type === "USER_INPUT" &&
+        typeof parsed.content === "string" &&
+        parsed.content.includes("Model Selection")
+      ) {
+        if (minTimestampMs !== undefined && typeof parsed.created_at === "string") {
+          const ts = Date.parse(parsed.created_at);
+          if (Number.isFinite(ts) && ts < minTimestampMs) {
+            continue;
+          }
+        }
+        const m = parsed.content.match(/Model Selection` from [^\n]+? to ([^\n<]+?)\.(?:\s|$)/);
+        if (m) {
+          const normalized = normalizeAgyModelId(m[1]);
+          if (normalized) return normalized;
+        }
+      }
+    } catch {}
+  }
+  return undefined;
+}
+
+function pollClaudeBrainUsage(workspaceId: string, brain: Brain): void {
+  try {
+    const bDir = brainDir(workspaceId);
+    const dir = path.join(os.homedir(), ".claude", "projects", bDir.replace(/[^a-zA-Z0-9]/g, "-"));
+    if (!fs.existsSync(dir)) return;
+
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+    if (files.length === 0) return;
+
+    const minMtime = brain.ptyStartTime - 5000;
+    let newestFile: string | null = null;
+    let newestMtime = -1;
+
+    for (const file of files) {
+      try {
+        const fullPath = path.join(dir, file);
+        const stat = fs.statSync(fullPath);
+        if (stat.mtimeMs >= minMtime && stat.mtimeMs > newestMtime) {
+          newestMtime = stat.mtimeMs;
+          newestFile = fullPath;
+        }
+      } catch {}
+    }
+
+    if (!newestFile) return;
+    brain.sessionId = path.basename(newestFile, ".jsonl");
+
+    const stat = fs.statSync(newestFile);
+    const size = stat.size;
+    if (size === 0) return;
+
+    const readSize = Math.min(size, 256 * 1024);
+    const buffer = Buffer.alloc(readSize);
+    const fd = fs.openSync(newestFile, "r");
+    try {
+      fs.readSync(fd, buffer, 0, readSize, Math.max(0, size - readSize));
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const text = buffer.toString("utf-8");
+    const lines = text.split("\n");
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === "assistant" && parsed.message?.usage) {
+          const usage = parsed.message.usage;
+          const inputTokens = usage.input_tokens || 0;
+          const cacheCreation = usage.cache_creation_input_tokens || 0;
+          const cacheRead = usage.cache_read_input_tokens || 0;
+          const usedTokens = inputTokens + cacheCreation + cacheRead;
+          const model = parsed.message.model;
+          const windowTokens = estimateContextWindow(model);
+          const newUsage: ContextUsage = {
+            usedTokens,
+            windowTokens,
+            windowEstimated: true,
+            model,
+          };
+
+          if (!isUsageEqual(brain.usage, newUsage)) {
+            brain.usage = newUsage;
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send(IPC.BRAIN_USAGE, workspaceId, newUsage);
+            }
+          }
+          break;
+        }
+      } catch {
+        // Skip malformed/partial line
+      }
+    }
+  } catch {
+    // Never crash on poll errors
+  }
+}
+
+const AGY_FILE_SCAN_INTERVAL_MS = 15_000;
+const agyFileScanAt = new Map<string, number>();
+
+function pollAgyBrainUsage(workspaceId: string, brain: Brain): void {
+  try {
+    const agyDir = path.join(os.homedir(), ".gemini", "antigravity-cli");
+    if (!fs.existsSync(agyDir)) return;
+
+    const bDir = brainDir(workspaceId);
+    const minMtime = brain.ptyStartTime - 5000;
+
+    // The file scan reads whole .db files synchronously, so it only runs while the id is unknown, at most every 15s.
+    let discoveredId = findAgyConversationByProc(agyDir, brain.pty?.pid, minMtime, brain.sessionId);
+    if (!discoveredId && !brain.sessionId && Date.now() - (agyFileScanAt.get(workspaceId) ?? 0) >= AGY_FILE_SCAN_INTERVAL_MS) {
+      agyFileScanAt.set(workspaceId, Date.now());
+      discoveredId = findAgyConversationByFiles(agyDir, bDir, minMtime);
+    }
+
+    if (discoveredId) {
+      brain.sessionId = discoveredId;
+    }
+
+    const convId = brain.sessionId;
+    if (!convId) return;
+
+    const logsDir = path.join(agyDir, "brain", convId, ".system_generated", "logs");
+    let transcriptPath = path.join(logsDir, "transcript.jsonl");
+    if (!fs.existsSync(transcriptPath)) {
+      transcriptPath = path.join(logsDir, "transcript_full.jsonl");
+      if (!fs.existsSync(transcriptPath)) return;
+    }
+
+    const stat = fs.statSync(transcriptPath);
+    const size = stat.size;
+    if (size === 0) return;
+
+    const readSize = Math.min(size, 256 * 1024);
+    const buffer = Buffer.alloc(readSize);
+    const fd = fs.openSync(transcriptPath, "r");
+    try {
+      fs.readSync(fd, buffer, 0, readSize, Math.max(0, size - readSize));
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const lines = buffer.toString("utf-8").split("\n");
+    let rawUsage: { input_tokens?: number; cache_read_tokens?: number } | undefined;
+    let hasModelResponse = false;
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === "PLANNER_RESPONSE" || parsed.source === "MODEL") {
+          hasModelResponse = true;
+        }
+        if (
+          typeof parsed.input_tokens === "number" ||
+          typeof parsed.cache_read_tokens === "number"
+        ) {
+          rawUsage = {
+            input_tokens: parsed.input_tokens,
+            cache_read_tokens: parsed.cache_read_tokens,
+          };
+          break;
+        }
+      } catch {
+        // Skip malformed/partial line
+      }
+    }
+
+    if (!rawUsage && hasModelResponse) {
+      rawUsage = { input_tokens: Math.max(1, Math.round(size / 4)) };
+    }
+    if (!rawUsage) return;
+
+    // Resolve the active model:
+    // 1. A model selection recorded in the current PTY run's USER_INPUT steps
+    // 2. Explicit workspace orchestrator model (brain.model)
+    // 3. Any earlier model selection in the conversation transcript (tail or head)
+    // 4. User's AGY settings.json model or DEFAULT_AGY_MODEL
+    let resolvedModel = extractAgyModelFromLines(lines, minMtime) ?? (brain.model || undefined);
+    if (!resolvedModel) {
+      resolvedModel = extractAgyModelFromLines(lines);
+    }
+    if (!resolvedModel && size > readSize) {
+      try {
+        const headSize = Math.min(size, 32 * 1024);
+        const headBuf = Buffer.alloc(headSize);
+        const hfd = fs.openSync(transcriptPath, "r");
+        try {
+          fs.readSync(hfd, headBuf, 0, headSize, 0);
+        } finally {
+          fs.closeSync(hfd);
+        }
+        resolvedModel = extractAgyModelFromLines(headBuf.toString("utf-8").split("\n"));
+      } catch {}
+    }
+    if (!resolvedModel) {
+      resolvedModel = readAgyDefaultModel(agyDir) ?? DEFAULT_AGY_MODEL;
+    }
+
+    const newUsage = buildAgyContextUsage(rawUsage, brain.model ?? undefined, resolvedModel);
+    if (newUsage && !isUsageEqual(brain.usage, newUsage)) {
+      brain.usage = newUsage;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(IPC.BRAIN_USAGE, workspaceId, newUsage);
+      }
+    }
+  } catch {
+    // Never crash on poll errors
+  }
+}
+
+function pollBrainUsage(): void {
+  for (const [workspaceId, brain] of brains.entries()) {
+    if (!brain.pty) continue;
+    if (brain.provider === "claude") {
+      pollClaudeBrainUsage(workspaceId, brain);
+    } else if (brain.provider === "agy") {
+      pollAgyBrainUsage(workspaceId, brain);
     }
   }
 }
@@ -1012,11 +1320,16 @@ function registerIpcHandlers(): void {
     if (payload.orchestrator) {
       const brain = brains.get(payload.workspaceId);
       if (brain && brain.pty) {
-        const sameClaude = brain.provider === "claude" && payload.orchestrator.provider === "claude";
-        const resumeSessionId = sameClaude ? brain.sessionId : null;
+        pollBrainUsage();
+        const sameProvider = brain.provider === payload.orchestrator.provider;
+        const resumeSessionId = sameProvider ? brain.sessionId : null;
         await killBrain(payload.workspaceId);
         await spawnBrain(updated, resumeSessionId);
       } else if (brain) {
+        if (brain.provider !== updated.orchestrator.provider) {
+          brain.sessionId = null;
+          brain.usage = undefined;
+        }
         brain.provider = updated.orchestrator.provider;
         brain.model = updated.orchestrator.model ?? null;
       }
@@ -1100,7 +1413,7 @@ function registerIpcHandlers(): void {
 
     const brain = getOrCreateBrain(ws);
     if (!brain.pty) {
-      await spawnBrain(ws);
+      await spawnBrain(ws, brain.sessionId);
     }
     if (brain.pty && brain.cols && brain.rows) {
       try {

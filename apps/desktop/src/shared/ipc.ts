@@ -99,7 +99,7 @@ export interface WorkspaceCreatePayload {
 export interface WorkspaceUpdatePayload {
   workspaceId: string;
   name?: string;
-  /** Changing it restarts that workspace's orchestrator (Claude → Claude resumes its session; a provider change starts fresh). */
+  /** Changing it restarts that workspace's orchestrator (same provider resumes its session; a provider change starts fresh). */
   orchestrator?: OrchestratorConfig;
 }
 
@@ -138,7 +138,7 @@ export interface BrainInfo {
   provider: "claude" | "agy";
   /** Requested model; null = provider default. */
   model: string | null;
-  /** Claude only (read from its transcript); AGY has no usage. */
+  /** Read from the active session transcript (Claude or AGY). */
   usage?: ContextUsage;
   running: boolean;
 }

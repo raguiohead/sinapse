@@ -67,6 +67,17 @@ export interface TurnEvent {
   data: string;
 }
 
+/** One finished turn as persisted in `<workspace>/agents/<agentId>.jsonl` (one JSON object per line). */
+export interface TurnRecord {
+  turnId: string;
+  prompt: string;
+  startedAt: number;
+  finishedAt: number;
+  status: "done" | "error" | "interrupted";
+  error?: string;
+  events: TurnEvent[];
+}
+
 export interface TurnResult {
   turnId: string;
   agentId: string;

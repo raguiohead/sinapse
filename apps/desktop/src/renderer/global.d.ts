@@ -7,6 +7,7 @@ import type {
   AgentState,
   HandoffResponse,
   Workspace,
+  TurnRecord,
 } from "@sinapse/core";
 import type {
   DaemonInfo,
@@ -21,6 +22,7 @@ import type {
   DaemonDetails,
   WorkspaceCreatePayload,
   WorkspaceUpdatePayload,
+  CanvasLayout,
 } from "../shared/ipc.js";
 
 export interface SinapseBridge {
@@ -76,6 +78,13 @@ export interface SinapseBridge {
     delete: (workspaceId: string, agent: string) => Promise<void>;
     /** Starts the summary turn in the background (note handoff-<nome>); the session resets when it ends. Rejects when busy or sessionless. */
     handoff: (workspaceId: string, agent: string) => Promise<HandoffResponse>;
+    /** Last finished turns from disk, oldest first (default 10, max 50). */
+    history: (workspaceId: string, agent: string, limit?: number) => Promise<TurnRecord[]>;
+  };
+  /** Canvas positions/sizes/viewport per workspace, stored by the main process. */
+  layout: {
+    get: (workspaceId: string) => Promise<CanvasLayout | null>;
+    save: (workspaceId: string, layout: CanvasLayout) => Promise<void>;
   };
   models: {
     list: () => Promise<ModelCatalog>;

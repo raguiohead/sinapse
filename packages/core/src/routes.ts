@@ -20,6 +20,8 @@ export const routes = {
   agentAsk: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/ask`,
   /** GET CheckResponse */
   agentCheck: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/check`,
+  /** GET ?limit= (default 10, max 50) -> TurnRecord[] oldest first, read from disk */
+  agentHistory: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/history`,
   /** POST: cancels the running turn and clears the queue (StopResponse) */
   agentStop: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/stop`,
   /** POST {note?}: summary turn → note, then resets the session (202 HandoffResponse) */

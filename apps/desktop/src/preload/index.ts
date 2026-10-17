@@ -8,6 +8,7 @@ import type {
   AgentState,
   HandoffResponse,
   Workspace,
+  TurnRecord,
 } from "@sinapse/core";
 import {
   IPC,
@@ -23,6 +24,7 @@ import {
   type DaemonDetails,
   type WorkspaceCreatePayload,
   type WorkspaceUpdatePayload,
+  type CanvasLayout,
 } from "../shared/ipc.js";
 
 const api = {
@@ -171,6 +173,17 @@ const api = {
     },
     handoff: (workspaceId: string, agent: string): Promise<HandoffResponse> => {
       return ipcRenderer.invoke(IPC.WORKER_HANDOFF, workspaceId, agent);
+    },
+    history: (workspaceId: string, agent: string, limit?: number): Promise<TurnRecord[]> => {
+      return ipcRenderer.invoke(IPC.WORKER_HISTORY, workspaceId, agent, limit);
+    },
+  },
+  layout: {
+    get: (workspaceId: string): Promise<CanvasLayout | null> => {
+      return ipcRenderer.invoke(IPC.LAYOUT_GET, workspaceId);
+    },
+    save: (workspaceId: string, layout: CanvasLayout): Promise<void> => {
+      return ipcRenderer.invoke(IPC.LAYOUT_SAVE, workspaceId, layout);
     },
   },
   models: {

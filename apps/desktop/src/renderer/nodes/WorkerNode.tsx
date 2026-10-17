@@ -1,6 +1,10 @@
-import { useState, useEffect, useRef, type FormEvent } from "react";
+import { useState, useEffect, useRef, type FormEvent, type KeyboardEvent } from "react";
 import { Handle, Position, NodeResizeControl, type NodeProps } from "@xyflow/react";
-import type { AgentStatus, Provider, ContextUsage } from "@sinapse/core";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import type { AgentStatus, Autonomy, Provider, ContextUsage } from "@sinapse/core";
+import type { ActivityEntry } from "../activity";
+import { DiffDialog } from "../components/DiffDialog";
 import { ModelSelect } from "../components/ModelSelect";
 import { ContextMeter } from "../components/ContextMeter";
 
@@ -10,15 +14,90 @@ export interface WorkerNodeData {
   name: string;
   provider: Provider;
   role?: string;
+  autonomy?: Autonomy;
   status?: AgentStatus;
   model?: string;
   usage?: ContextUsage;
   /** Branch/path of the worker's git worktree, when it has one. */
   worktreeBranch?: string;
   worktreePath?: string;
-  log?: string;
+  log?: ActivityEntry[];
   lastPrompt?: string;
   deleteError?: string;
+}
+
+const AUTONOMY_OPTIONS: { value: Autonomy; title: string }[] = [
+  { value: "read", title: "Somente leitura" },
+  { value: "edit", title: "Pode editar arquivos" },
+  { value: "full", title: "Acesso total (shell sem restrições)" },
+];
+
+function ActivityView({ entries }: { entries: ActivityEntry[] }) {
+  return (
+    <>
+      {entries.map((e, i) => {
+        switch (e.kind) {
+          case "prompt":
+            return (
+              <div key={i} className="activity-prompt">
+                {e.text}
+              </div>
+            );
+          case "text":
+            return (
+              <div key={i} className="activity-text note-markdown-content">
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={{
+                    a: ({ href, children, ...props }) => (
+                      <a
+                        href={href}
+                        onClick={(ev) => {
+                          ev.preventDefault();
+                          if (href) window.sinapse?.app?.openExternal(href);
+                        }}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        {...props}
+                      >
+                        {children}
+                      </a>
+                    ),
+                  }}
+                >
+                  {e.text}
+                </ReactMarkdown>
+              </div>
+            );
+          case "thinking":
+            return (
+              <details key={i} className="activity-block activity-thinking">
+                <summary>💭 pensamento</summary>
+                <pre>{e.text}</pre>
+              </details>
+            );
+          case "error":
+            return (
+              <div key={i} className="activity-error" role="alert">
+                {e.text}
+              </div>
+            );
+          case "tool":
+            return (
+              <details key={i} className={`activity-block activity-tool${e.resultIsError ? " activity-tool-error" : ""}`}>
+                <summary>
+                  <span className="activity-tool-name">⚙ {e.name}</span>
+                  {e.summary && <span className="activity-tool-summary">{e.summary}</span>}
+                  {e.result === undefined && <span className="activity-tool-pending">…</span>}
+                </summary>
+                {e.input && <pre>{e.input}</pre>}
+                {e.result !== undefined && <pre className="activity-tool-result">{e.result || "(sem saída)"}</pre>}
+              </details>
+            );
+        }
+      })}
+    </>
+  );
 }
 
 function getProviderColor(p: string): string {
@@ -75,7 +154,8 @@ export function WorkerNode({ data }: NodeProps) {
   const provider = nodeData.provider || "claude";
   const role = nodeData.role || "Agente worker";
   const status: AgentStatus = nodeData.status || "idle";
-  const log = nodeData.log || "";
+  const log = nodeData.log ?? [];
+  const autonomy: Autonomy = nodeData.autonomy ?? "edit";
 
   const [inputPrompt, setInputPrompt] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -86,7 +166,15 @@ export function WorkerNode({ data }: NodeProps) {
   const [isStartingHandoff, setIsStartingHandoff] = useState(false);
   const [handoffError, setHandoffError] = useState<string | null>(null);
 
+  const [isEditingRole, setIsEditingRole] = useState(false);
+  const [roleDraft, setRoleDraft] = useState("");
+  const [isSavingRole, setIsSavingRole] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [isDiffOpen, setIsDiffOpen] = useState(false);
+
   const outputRef = useRef<HTMLDivElement | null>(null);
+  // False once the user scrolled up; new activity then stops dragging the view down.
+  const stickToBottomRef = useRef(true);
 
   const isThinking = status === "thinking";
   const providerColor = getProviderColor(provider);
@@ -97,10 +185,61 @@ export function WorkerNode({ data }: NodeProps) {
   const currentDeleteError = deleteError ?? nodeData.deleteError;
 
   useEffect(() => {
-    if (outputRef.current) {
+    if (outputRef.current && stickToBottomRef.current) {
       outputRef.current.scrollTop = outputRef.current.scrollHeight;
     }
   }, [log]);
+
+  const handleOutputScroll = () => {
+    const el = outputRef.current;
+    if (el) stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
+  const handleAutonomyChange = async (value: Autonomy) => {
+    setSettingsError(null);
+    try {
+      await window.sinapse?.workers?.update({ workspaceId, agent: agentId, autonomy: value });
+    } catch (err: any) {
+      console.error("Erro ao atualizar autonomia do worker:", err);
+      setSettingsError(err?.message || "Falha ao atualizar autonomia");
+    }
+  };
+
+  const startEditRole = () => {
+    if (isThinking) return;
+    setSettingsError(null);
+    setRoleDraft(nodeData.role ?? "");
+    setIsEditingRole(true);
+  };
+
+  const saveRole = async () => {
+    const next = roleDraft.trim();
+    if (isSavingRole) return;
+    if (!next || next === (nodeData.role ?? "")) {
+      setIsEditingRole(false);
+      return;
+    }
+    setIsSavingRole(true);
+    try {
+      await window.sinapse?.workers?.update({ workspaceId, agent: agentId, role: next });
+      setIsEditingRole(false);
+    } catch (err: any) {
+      console.error("Erro ao atualizar papel do worker:", err);
+      setSettingsError(err?.message || "Falha ao atualizar papel");
+    } finally {
+      setIsSavingRole(false);
+    }
+  };
+
+  const handleRoleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void saveRole();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setIsEditingRole(false);
+    }
+  };
 
   const handleDelete = async () => {
     const message =
@@ -273,6 +412,23 @@ export function WorkerNode({ data }: NodeProps) {
                 </button>
               </div>
             )}
+            <select
+              value={autonomy}
+              onChange={(e) => handleAutonomyChange(e.target.value as Autonomy)}
+              disabled={isThinking}
+              className="worker-autonomy-select nodrag"
+              title={
+                isThinking
+                  ? "Não é possível alterar autonomia enquanto pensa"
+                  : AUTONOMY_OPTIONS.find((o) => o.value === autonomy)?.title
+              }
+            >
+              {AUTONOMY_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.value}
+                </option>
+              ))}
+            </select>
             {nodeData.worktreeBranch && (
               <span
                 className="worker-branch-badge"
@@ -285,6 +441,9 @@ export function WorkerNode({ data }: NodeProps) {
 
           {modelError && (
             <div className="worker-model-error">{modelError}</div>
+          )}
+          {settingsError && (
+            <div className="worker-model-error">{settingsError}</div>
           )}
 
           <div className="worker-status-line">
@@ -328,9 +487,27 @@ export function WorkerNode({ data }: NodeProps) {
         </div>
       )}
 
-      <div className="worker-node-role" title={role}>
-        {role}
-      </div>
+      {isEditingRole ? (
+        <textarea
+          value={roleDraft}
+          onChange={(e) => setRoleDraft(e.target.value)}
+          onKeyDown={handleRoleKeyDown}
+          onBlur={() => setIsEditingRole(false)}
+          disabled={isSavingRole}
+          className="worker-role-input nodrag nowheel"
+          placeholder="Papel do worker (Enter salva, Esc cancela)"
+          rows={3}
+          autoFocus
+        />
+      ) : (
+        <div
+          className={`worker-node-role${isThinking ? "" : " worker-node-role-editable"}`}
+          title={isThinking ? role : `${role}\n\nClique para editar o papel`}
+          onClick={startEditRole}
+        >
+          {role}
+        </div>
+      )}
 
       <ContextMeter
         usage={nodeData.usage}
@@ -345,12 +522,23 @@ export function WorkerNode({ data }: NodeProps) {
         </div>
       )}
 
-      <div className="worker-output-area nodrag nowheel" ref={outputRef}>
-        {log ? (
-          <pre className="worker-output-text">{log}</pre>
+      <div className="worker-output-area nodrag nowheel" ref={outputRef} onScroll={handleOutputScroll}>
+        {log.length > 0 ? (
+          <ActivityView entries={log} />
         ) : (
           <span className="worker-output-placeholder">Sem atividade ainda.</span>
         )}
+      </div>
+
+      <div className="worker-actions-row">
+        <button
+          type="button"
+          className="worker-btn-diff nodrag"
+          onClick={() => setIsDiffOpen(true)}
+          title="Ver alterações git no diretório do worker"
+        >
+          Ver diff
+        </button>
       </div>
 
       <form onSubmit={handleAsk} className="worker-input-form nodrag">
@@ -381,6 +569,15 @@ export function WorkerNode({ data }: NodeProps) {
           </button>
         )}
       </form>
+
+      {isDiffOpen && (
+        <DiffDialog
+          workspaceId={workspaceId}
+          agentId={agentId}
+          workerName={workerName}
+          onClose={() => setIsDiffOpen(false)}
+        />
+      )}
 
       <NodeResizeControl
         position="bottom-right"

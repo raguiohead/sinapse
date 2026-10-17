@@ -154,6 +154,9 @@ Execute no terminal PowerShell:
 - **Menu de contexto:** clique com o botão direito no canvas para criar um worker ou uma nota e para abrir as configurações. O diálogo de novo worker já vem com os padrões definidos nas configurações (provedor, modelo, autonomia e pasta).
 - **Configurações** (⚙ ou `Ctrl+,`): modelo do cérebro e uso de contexto; padrões de novos workers; status do daemon e atalhos para as pastas de dados, do cérebro e de notas; aparência (barra cromática, movimento reduzido e tamanho da fonte do terminal). Cada mudança é salva na hora.
 - **Perguntar / Parar:** cada worker aceita prompts direto pelo card e permite interromper o turno em andamento.
+- **Atividade estruturada:** o card mostra o prompt em destaque, a resposta em Markdown, cada ferramenta como bloco colapsável (comando ou arquivo no título; argumentos e resultado no corpo), o raciocínio (`thinking`) colapsado e os erros em vermelho. Guarda as últimas 300 entradas; o scroll acompanha o fim, a menos que você role para cima.
+- **Autonomia e papel no card:** o seletor `read/edit/full` ao lado do modelo e o clique no papel (Enter salva, Shift+Enter quebra linha, Esc cancela) equivalem ao `PATCH` do daemon; ficam bloqueados enquanto o worker pensa.
+- **Ver diff:** o botão "Ver diff" abre um modal com `git status` e `git diff HEAD` do diretório do worker (arquivos não rastreados só listados; limite de 200 KB). Fora de um repositório git, o modal mostra o erro.
 - **Excluir worker:** pela lixeira no card ou com clique direito no card. Pede confirmação; um turno em andamento é interrompido e tudo o que o worker abriu é encerrado.
 - **Redimensionar:** arraste a alça no canto inferior direito de qualquer card. O terminal do cérebro se reajusta ao novo tamanho.
 - **Notas:** "Editar" ou duplo clique abre um editor fora do canvas, em tamanho normal; `Ctrl+S` salva e Esc cancela.

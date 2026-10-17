@@ -20,6 +20,7 @@ import {
   type WorkerAskPayload,
   type WorkerSpawnPayload,
   type WorkerUpdatePayload,
+  type WorkerDiffResult,
   type NoteWritePayload,
   type BrainInfo,
   type DesktopSettings,
@@ -180,6 +181,9 @@ const api = {
     },
     history: (workspaceId: string, agent: string, limit?: number): Promise<TurnRecord[]> => {
       return ipcRenderer.invoke(IPC.WORKER_HISTORY, workspaceId, agent, limit);
+    },
+    diff: (workspaceId: string, agent: string): Promise<WorkerDiffResult> => {
+      return ipcRenderer.invoke(IPC.WORKER_DIFF, workspaceId, agent);
     },
   },
   layout: {

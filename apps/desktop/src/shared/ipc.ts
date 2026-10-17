@@ -28,6 +28,7 @@ export const IPC = {
   WORKER_DELETE: "worker:delete",
   WORKER_HANDOFF: "worker:handoff",
   WORKER_HISTORY: "worker:history",
+  WORKER_DIFF: "worker:diff",
   LAYOUT_GET: "layout:get",
   LAYOUT_SAVE: "layout:save",
   MODELS_LIST: "models:list",
@@ -139,7 +140,21 @@ export interface SquadApplyPayload {
 export interface WorkerUpdatePayload {
   workspaceId: string;
   agent: string;
-  model: string | null;
+  /** Only the fields present are changed; `model: null` resets to the provider default. */
+  model?: string | null;
+  autonomy?: Autonomy;
+  role?: string;
+}
+
+export interface WorkerDiffResult {
+  ok: boolean;
+  /** Set when !ok (not a git repo, git missing, timeout...). */
+  error?: string;
+  /** `git status --porcelain` output. */
+  status: string;
+  /** `git diff HEAD` output plus a summary of untracked files; may be truncated. */
+  diff: string;
+  truncated: boolean;
 }
 
 export interface NoteWritePayload {

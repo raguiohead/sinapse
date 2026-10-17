@@ -34,6 +34,7 @@ import { NoteNode } from "./nodes/NoteNode";
 import { SynapseEdge, type SynapsePulse, type SynapseVariant } from "./edges/SynapseEdge";
 import { TitleBar } from "./components/TitleBar";
 import { ContextMenu, type ContextMenuItem } from "./components/ContextMenu";
+import { appendPrompt, appendTurnEvent, turnRecordEntries, type ActivityEntry } from "./activity";
 import { NewWorkerDialog } from "./components/NewWorkerDialog";
 import { NewNoteDialog } from "./components/NewNoteDialog";
 import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
@@ -87,16 +88,6 @@ function AutoFit({
     return () => clearTimeout(timer);
   }, [measured, requestId, requestRef, fitView, setViewport]);
   return null;
-}
-
-/** Same shape as the live log built in recordAgentActivity. */
-function turnRecordLog(record: TurnRecord): string {
-  let log = `> ${record.prompt}\n`;
-  for (const e of record.events) {
-    if (e.type === "text") log += e.data;
-    else if (e.type === "tool_use") log += `⚙ ${extractToolName(e.data)}\n`;
-  }
-  return log.slice(-20_000);
 }
 
 const LAYOUT_SAVE_DELAY_MS = 600;
@@ -156,26 +147,10 @@ function computeNotePosition(
   return stackBelow(brainX - 360 - 120, brainY);
 }
 
-function extractToolName(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw);
-    return (
-      parsed.name ||
-      parsed.tool_name ||
-      parsed.tool ||
-      parsed.call?.name ||
-      parsed.call?.tool_name ||
-      "ferramenta"
-    );
-  } catch {
-    return raw.slice(0, 30) || "ferramenta";
-  }
-}
-
 interface WorkspaceCanvasState {
   nodes: Node[];
   edges: Edge[];
-  agentState: Map<string, { status: AgentStatus; log: string; lastPrompt: string }>;
+  agentState: Map<string, { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }>;
 }
 
 function buildEdges(
@@ -352,13 +327,13 @@ export function App() {
 
   // Per-agent state tracking for active workspace: agentId -> { status, log, lastPrompt }
   const agentStateMapRef = useRef<
-    Map<string, { status: AgentStatus; log: string; lastPrompt: string }>
+    Map<string, { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }>
   >(new Map());
 
   // Every worker's activity, across all workspaces. Saved per-workspace canvases hold stale node data, and workers
   // created while their workspace is in the background have no saved state at all; cards are rehydrated from here.
   const agentActivityRef = useRef<
-    Map<string, { status: AgentStatus; log: string; lastPrompt: string }>
+    Map<string, { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }>
   >(new Map());
 
   const recordAgentActivity = (event: DaemonEvent) => {
@@ -368,14 +343,13 @@ export function App() {
       return;
     }
     if (event.kind !== "turn_started" && event.kind !== "turn_event" && event.kind !== "turn_finished") return;
-    const st = store.get(event.agentId) ?? { status: "idle" as AgentStatus, log: "", lastPrompt: "" };
+    const st = store.get(event.agentId) ?? { status: "idle" as AgentStatus, log: [], lastPrompt: "" };
     if (event.kind === "turn_started") {
       st.status = "thinking";
       st.lastPrompt = event.prompt;
-      st.log = (st.log + (st.log ? `\n> ${event.prompt}\n` : `> ${event.prompt}\n`)).slice(-20_000);
+      st.log = appendPrompt(st.log, event.prompt);
     } else if (event.kind === "turn_event") {
-      if (event.event.type === "text") st.log = (st.log + event.event.data).slice(-20_000);
-      else if (event.event.type === "tool_use") st.log = (st.log + `⚙ ${extractToolName(event.event.data)}\n`).slice(-20_000);
+      st.log = appendTurnEvent(st.log, event.event);
     } else {
       st.status = event.status;
     }
@@ -576,7 +550,7 @@ export function App() {
         const newNodes: Node[] = [brainNode];
         const newAgentState = new Map<
           string,
-          { status: AgentStatus; log: string; lastPrompt: string }
+          { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }
         >();
 
         const thinkingSet = new Set<string>();
@@ -587,7 +561,7 @@ export function App() {
               thinkingSet.add(worker.id);
             }
             const lastTurn = lastTurns.get(worker.id);
-            const histLog = lastTurn ? turnRecordLog(lastTurn) : "";
+            const histLog = lastTurn ? turnRecordEntries(lastTurn) : [];
             const histPrompt = lastTurn?.prompt ?? "";
             newAgentState.set(worker.id, {
               status: worker.status || "idle",
@@ -615,6 +589,7 @@ export function App() {
                 name: worker.name,
                 provider: worker.provider,
                 role: worker.role,
+                autonomy: worker.autonomy,
                 status: worker.status || "idle",
                 model: worker.model,
                 usage: worker.usage,
@@ -801,7 +776,7 @@ export function App() {
             if (!agentStateMapRef.current.has(agent.id)) {
               agentStateMapRef.current.set(agent.id, {
                 status: agent.status || "idle",
-                log: "",
+                log: [],
                 lastPrompt: "",
               });
             }
@@ -822,12 +797,13 @@ export function App() {
                     name: agent.name,
                     provider: agent.provider,
                     role: agent.role,
+                    autonomy: agent.autonomy,
                     status: agent.status || "idle",
                     model: agent.model,
                     usage: agent.usage,
                     worktreeBranch: agent.worktree?.branch,
                     worktreePath: agent.worktree?.path,
-                    log: "",
+                    log: [],
                     lastPrompt: "",
                   },
                 },
@@ -887,12 +863,13 @@ export function App() {
                     name: agent.name,
                     provider: agent.provider,
                     role: agent.role,
+                    autonomy: agent.autonomy,
                     status: agent.status || "idle",
                     model: agent.model,
                     usage: agent.usage,
                     worktreeBranch: agent.worktree?.branch,
                     worktreePath: agent.worktree?.path,
-                    log: "",
+                    log: [],
                     lastPrompt: "",
                   },
                 });
@@ -925,6 +902,7 @@ export function App() {
                       data: {
                         ...n.data,
                         role: agent.role,
+                        autonomy: agent.autonomy,
                         model: agent.model,
                         // Authoritative: a handoff clears it.
                         usage: agent.usage,
@@ -944,6 +922,7 @@ export function App() {
                       data: {
                         ...n.data,
                         role: agent.role,
+                        autonomy: agent.autonomy,
                         model: agent.model,
                         usage: agent.usage,
                         status: agent.status || n.data?.status,
@@ -964,13 +943,12 @@ export function App() {
             const nodeId = `worker-${event.agentId}`;
             const st = agentStateMapRef.current.get(event.agentId) || {
               status: "idle",
-              log: "",
+              log: [],
               lastPrompt: "",
             };
             st.status = "thinking";
             st.lastPrompt = event.prompt;
-            const promptHeader = st.log ? `\n> ${event.prompt}\n` : `> ${event.prompt}\n`;
-            st.log = (st.log + promptHeader).slice(-20_000);
+            st.log = appendPrompt(st.log, event.prompt);
             agentStateMapRef.current.set(event.agentId, st);
 
             setNodes((nds) =>
@@ -1008,7 +986,7 @@ export function App() {
             if (cached) {
               const st = cached.agentState.get(event.agentId) || {
                 status: "idle",
-                log: "",
+                log: [],
                 lastPrompt: "",
               };
               st.status = "thinking";
@@ -1030,16 +1008,11 @@ export function App() {
             const nodeId = `worker-${event.agentId}`;
             const st = agentStateMapRef.current.get(event.agentId) || {
               status: "thinking",
-              log: "",
+              log: [],
               lastPrompt: "",
             };
 
-            if (event.event.type === "text") {
-              st.log = (st.log + event.event.data).slice(-20_000);
-            } else if (event.event.type === "tool_use") {
-              const toolName = extractToolName(event.event.data);
-              st.log = (st.log + `⚙ ${toolName}\n`).slice(-20_000);
-            }
+            st.log = appendTurnEvent(st.log, event.event);
             agentStateMapRef.current.set(event.agentId, st);
 
             setNodes((nds) =>
@@ -1060,12 +1033,7 @@ export function App() {
             if (cached) {
               const st = cached.agentState.get(event.agentId);
               if (st) {
-                if (event.event.type === "text") {
-                  st.log = (st.log + event.event.data).slice(-20_000);
-                } else if (event.event.type === "tool_use") {
-                  const toolName = extractToolName(event.event.data);
-                  st.log = (st.log + `⚙ ${toolName}\n`).slice(-20_000);
-                }
+                st.log = appendTurnEvent(st.log, event.event);
               }
             }
           }
@@ -1080,7 +1048,7 @@ export function App() {
             const nodeId = `worker-${event.agentId}`;
             const st = agentStateMapRef.current.get(event.agentId) || {
               status: event.status,
-              log: "",
+              log: [],
               lastPrompt: "",
             };
             st.status = event.status;

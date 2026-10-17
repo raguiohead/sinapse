@@ -18,6 +18,7 @@ import type {
   WorkerAskPayload,
   WorkerSpawnPayload,
   WorkerUpdatePayload,
+  WorkerDiffResult,
   NoteWritePayload,
   BrainInfo,
   DesktopSettings,
@@ -84,6 +85,8 @@ export interface SinapseBridge {
     handoff: (workspaceId: string, agent: string) => Promise<HandoffResponse>;
     /** Last finished turns from disk, oldest first (default 10, max 50). */
     history: (workspaceId: string, agent: string, limit?: number) => Promise<TurnRecord[]>;
+    /** `git status` + `git diff` in the worker's cwd. Never rejects on git problems: see `ok`/`error`. */
+    diff: (workspaceId: string, agent: string) => Promise<WorkerDiffResult>;
   };
   /** Canvas positions/sizes/viewport per workspace, stored by the main process. */
   layout: {

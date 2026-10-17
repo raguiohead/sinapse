@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
+import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -27,6 +28,7 @@ import {
   type WorkerAskPayload,
   type WorkerSpawnPayload,
   type WorkerUpdatePayload,
+  type WorkerDiffResult,
   type NoteWritePayload,
   type BrainInfo,
   type DesktopSettings,
@@ -72,6 +74,47 @@ interface Brain {
 
 const MAX_SCROLLBACK = 256 * 1024; // 256 KB ring buffer
 const brains = new Map<string, Brain>();
+
+const DIFF_MAX_BYTES = 200 * 1024;
+
+function runGit(cwd: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      "git",
+      ["-C", cwd, ...args],
+      { timeout: 10_000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" },
+      (err, stdout, stderr) => {
+        const code = err ? (typeof (err as any).code === "number" ? (err as any).code : 1) : 0;
+        const message = err && !stderr ? (err as Error).message : stderr;
+        resolve({ code, stdout: stdout ?? "", stderr: message ?? "" });
+      }
+    );
+  });
+}
+
+async function gitDiff(cwd: string): Promise<WorkerDiffResult> {
+  const fail = (error: string): WorkerDiffResult => ({ ok: false, error, status: "", diff: "", truncated: false });
+  const status = await runGit(cwd, ["status", "--porcelain"]);
+  if (status.code !== 0) return fail(status.stderr.trim() || "Não é um repositório git");
+
+  // Before the first commit there is no HEAD: plain `git diff` (unstaged only) is the best available.
+  let diffRes = await runGit(cwd, ["diff", "--no-color", "--no-ext-diff", "HEAD"]);
+  if (diffRes.code !== 0) diffRes = await runGit(cwd, ["diff", "--no-color", "--no-ext-diff"]);
+  if (diffRes.code !== 0) return fail(diffRes.stderr.trim() || "Falha ao executar git diff");
+
+  let diff = diffRes.stdout;
+  const untracked = await runGit(cwd, ["ls-files", "--others", "--exclude-standard"]);
+  const files = untracked.stdout.split("\n").filter(Boolean);
+  if (files.length > 0) {
+    const shown = files.slice(0, 100).map((f) => `?? ${f}`);
+    if (files.length > shown.length) shown.push(`… e mais ${files.length - shown.length} arquivo(s)`);
+    diff += `${diff && !diff.endsWith("\n") ? "\n" : ""}\n# Arquivos não rastreados (conteúdo omitido):\n${shown.join("\n")}\n`;
+  }
+
+  const truncated = Buffer.byteLength(diff) > DIFF_MAX_BYTES;
+  if (truncated) diff = Buffer.from(diff).subarray(0, DIFF_MAX_BYTES).toString("utf8");
+  return { ok: true, status: status.stdout, diff, truncated };
+}
 
 function getDefaultSettings(): DesktopSettings {
   return {
@@ -1523,7 +1566,11 @@ function registerIpcHandlers(): void {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: payload.model }),
+      body: JSON.stringify({
+        ...("model" in payload ? { model: payload.model } : {}),
+        ...(payload.autonomy !== undefined ? { autonomy: payload.autonomy } : {}),
+        ...(payload.role !== undefined ? { role: payload.role } : {}),
+      }),
     });
 
     if (!response.ok) {
@@ -1593,6 +1640,24 @@ function registerIpcHandlers(): void {
         throw new Error(await extractDaemonError(response, `Não foi possível ler o histórico: ${response.status}`));
       }
       return (await response.json()) as TurnRecord[];
+    }
+  );
+
+  ipcMain.handle(
+    IPC.WORKER_DIFF,
+    async (_event, workspaceId: string, agent: string): Promise<WorkerDiffResult> => {
+      const empty = { status: "", diff: "", truncated: false };
+      try {
+        const response = await daemonFetch(routes.agents(workspaceId), { method: "GET" });
+        if (!response.ok) {
+          return { ok: false, error: await extractDaemonError(response, `Não foi possível listar os workers: ${response.status}`), ...empty };
+        }
+        const worker = ((await response.json()) as AgentState[]).find((a) => a.id === agent || a.name === agent);
+        if (!worker) return { ok: false, error: "Worker não encontrado", ...empty };
+        return await gitDiff(worker.cwd);
+      } catch (err: any) {
+        return { ok: false, error: err?.message || "Falha ao ler o diff", ...empty };
+      }
     }
   );
 

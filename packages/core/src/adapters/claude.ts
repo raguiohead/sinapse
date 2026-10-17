@@ -111,6 +111,24 @@ export class ClaudeAdapter implements Adapter {
                 yield event;
               }
             }
+          } else if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
+            for (const content of parsed.message.content) {
+              if (content?.type !== "tool_result") continue;
+              const output = Array.isArray(content.content)
+                ? content.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("")
+                : String(content.content ?? "");
+              const event: TurnEvent = {
+                type: "tool_result",
+                timestamp: Date.now(),
+                data: JSON.stringify({
+                  tool_use_id: content.tool_use_id,
+                  is_error: content.is_error === true,
+                  output: output.slice(0, 8000),
+                }),
+              };
+              events.push(event);
+              yield event;
+            }
           } else if (parsed.type === "result") {
             if (parsed.session_id) {
               sessionId = parsed.session_id;

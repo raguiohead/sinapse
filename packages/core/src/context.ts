@@ -9,5 +9,9 @@ export function estimateContextWindow(model: string | undefined): number | undef
   if (id.startsWith("claude")) return 200_000;
   if (id.startsWith("gemini")) return 1_048_576;
   if (id.startsWith("gpt-oss")) return 131_072;
+  if (id.startsWith("gpt-5")) return 400_000;
+  if (id.startsWith("gpt-4.1")) return 1_047_576;
+  if (id.startsWith("gpt-4o") || id.startsWith("gpt-4")) return 128_000;
+  if (id.startsWith("codex") || id.startsWith("o3") || id.startsWith("o4")) return 200_000;
   return undefined;
 }

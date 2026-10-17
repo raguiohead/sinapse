@@ -449,7 +449,7 @@ function loadSettings(): DesktopSettings {
         }
         if (data.workerDefaults && typeof data.workerDefaults === "object") {
           const wd = data.workerDefaults;
-          if (wd.provider === "claude" || wd.provider === "agy") {
+          if (wd.provider === "claude" || wd.provider === "codex" || wd.provider === "agy") {
             current.workerDefaults.provider = wd.provider;
           }
           if (wd.autonomy === "read" || wd.autonomy === "edit" || wd.autonomy === "full") {
@@ -735,8 +735,12 @@ function registerIpcHandlers(): void {
         throw new Error("Configurações do worker inválidas");
       }
       if (patch.workerDefaults.provider !== undefined) {
-        if (patch.workerDefaults.provider !== "claude" && patch.workerDefaults.provider !== "agy") {
-          throw new Error("Provedor inválido: deve ser 'claude' ou 'agy'");
+        if (
+          patch.workerDefaults.provider !== "claude" &&
+          patch.workerDefaults.provider !== "codex" &&
+          patch.workerDefaults.provider !== "agy"
+        ) {
+          throw new Error("Provedor inválido: deve ser 'claude', 'codex' ou 'agy'");
         }
       }
       if (patch.workerDefaults.autonomy !== undefined) {

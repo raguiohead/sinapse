@@ -5,7 +5,7 @@ export type SynapseVariant = "default" | "author" | "contributor" | "creator";
 
 export interface SynapseEdgeData {
   pulse?: SynapsePulse;
-  provider?: "claude" | "agy" | string;
+  provider?: "claude" | "codex" | "agy" | string;
   variant?: SynapseVariant;
 }
 
@@ -38,7 +38,12 @@ export function SynapseEdge({
   });
 
   const safeId = id.replace(/[^a-zA-Z0-9-_]/g, "_");
-  const providerColor = provider === "agy" ? "var(--agy)" : "var(--claude)";
+  const providerColor =
+    provider === "agy"
+      ? "var(--agy)"
+      : provider === "codex"
+      ? "var(--codex)"
+      : "var(--claude)";
   const isBack = pulse === "back";
   const isOut = pulse === "out";
   const isActive = isOut || isBack;

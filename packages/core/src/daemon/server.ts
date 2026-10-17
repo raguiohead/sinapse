@@ -24,6 +24,7 @@ import type {
   OrchestratorConfig,
   Provider,
   TurnEvent,
+  TurnRecord,
   TurnResult,
   Workspace,
 } from "../types.js";
@@ -62,6 +63,95 @@ function getWorkspaceDir(id: string): string {
 
 function getWorkspaceNotesDir(id: string): string {
   return path.join(getWorkspaceDir(id), "notes");
+}
+
+const MAX_HISTORY_TURNS = 50;
+const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
+const MAX_EVENT_DATA_CHARS = 8000;
+
+function getAgentHistoryFile(workspaceId: string, agentId: string): string | undefined {
+  // agentId comes from state.json; re-validate so a tampered file can't point outside agents/.
+  if (!AUTHOR_REGEX.test(agentId)) return undefined;
+  return path.join(getWorkspaceDir(workspaceId), "agents", `${agentId}.jsonl`);
+}
+
+const historyQueues = new Map<string, Promise<void>>();
+
+function enqueueHistory(agentId: string, job: () => Promise<void>): Promise<void> {
+  const prev = historyQueues.get(agentId) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(job);
+  historyQueues.set(agentId, next);
+  next.catch(() => {}).then(() => {
+    if (historyQueues.get(agentId) === next) historyQueues.delete(agentId);
+  });
+  return next;
+}
+
+async function readHistoryFile(file: string): Promise<TurnRecord[]> {
+  let content: string;
+  try {
+    content = await fs.readFile(file, "utf-8");
+  } catch {
+    return [];
+  }
+  const records: TurnRecord[] = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const rec = JSON.parse(line) as TurnRecord;
+      if (rec && typeof rec.turnId === "string" && Array.isArray(rec.events)) records.push(rec);
+    } catch {
+      // torn line from a crash mid-append: skip it
+    }
+  }
+  return records;
+}
+
+/** Appends one finished turn (crash-safe: a single appendFile) and compacts when over the turn/byte caps. */
+function appendTurnRecord(workspaceId: string, agentId: string, record: TurnRecord): Promise<void> {
+  return enqueueHistory(agentId, async () => {
+    if (!state.agents[agentId]) return; // worker removed while its turn was finishing
+    const file = getAgentHistoryFile(workspaceId, agentId);
+    if (!file) return;
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    const safe: TurnRecord = {
+      ...record,
+      events: record.events.map((e) =>
+        e.data.length > MAX_EVENT_DATA_CHARS ? { ...e, data: e.data.slice(0, MAX_EVENT_DATA_CHARS) + "…" } : e
+      ),
+    };
+    await fs.appendFile(file, JSON.stringify(safe) + "\n", { encoding: "utf-8", mode: 0o600 });
+
+    const records = await readHistoryFile(file);
+    let kept = records.slice(-MAX_HISTORY_TURNS);
+    let bytes = kept.reduce((n, r) => n + JSON.stringify(r).length + 1, 0);
+    while (kept.length > 1 && bytes > MAX_HISTORY_BYTES) {
+      bytes -= JSON.stringify(kept[0]).length + 1;
+      kept = kept.slice(1);
+    }
+    if (kept.length < records.length) {
+      await writePrivate(file, kept.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    }
+  });
+}
+
+async function removeAgentHistory(workspaceId: string, agentId: string): Promise<void> {
+  await enqueueHistory(agentId, async () => {
+    const file = getAgentHistoryFile(workspaceId, agentId);
+    if (file) await fs.rm(file, { force: true });
+  }).catch(() => {});
+}
+
+async function hydrateRecentEvents(): Promise<void> {
+  for (const agent of Object.values(state.agents)) {
+    try {
+      const file = getAgentHistoryFile(agent.workspaceId, agent.id);
+      if (!file) continue;
+      const records = await readHistoryFile(file);
+      const last = records[records.length - 1];
+      if (last) agentRecentEvents.set(agent.id, last.events);
+    } catch {}
+  }
 }
 
 function validateModel(input: unknown): { valid: true; model?: string } | { valid: false } {
@@ -338,6 +428,8 @@ interface ActiveTurnSession {
   adapter: ClaudeAdapter | AgyAdapter;
   events: TurnEvent[];
   stopped: boolean;
+  prompt: string;
+  startedAt: number;
 }
 
 const state: DaemonState = {
@@ -579,6 +671,15 @@ async function executeTurn(
     agent.currentTurnId = undefined;
     agentRecentEvents.set(agent.id, [...session.events]);
     activeTurns.delete(agent.id);
+    await appendTurnRecord(agent.workspaceId, agent.id, {
+      turnId,
+      prompt: session.prompt,
+      startedAt: session.startedAt,
+      finishedAt: Date.now(),
+      status: session.stopped ? "interrupted" : agent.status === "error" ? "error" : "done",
+      ...(agent.lastError && !session.stopped ? { error: agent.lastError } : {}),
+      events: session.events,
+    }).catch((err) => console.error("Falha ao gravar histórico do turno:", err));
     broadcast({
       kind: "turn_finished",
       workspaceId: agent.workspaceId,
@@ -609,6 +710,7 @@ export async function start(
   state.token = loaded.token || nanoid();
 
   await runMigration();
+  await hydrateRecentEvents();
 
   const fastify = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024, forceCloseConnections: true });
 
@@ -832,6 +934,7 @@ export async function start(
       }
       delete state.agents[a.id];
       agentRecentEvents.delete(a.id);
+      await removeAgentHistory(ws.id, a.id);
       broadcast({ kind: "agent_deleted", workspaceId: ws.id, agentId: a.id, agentName: a.name });
     }
 
@@ -1029,6 +1132,8 @@ export async function start(
       adapter,
       events: [],
       stopped: false,
+      prompt: body.prompt,
+      startedAt: Date.now(),
     };
     activeTurns.set(agent.id, session);
     broadcast({
@@ -1086,6 +1191,27 @@ export async function start(
     };
   });
 
+  fastify.get("/workspaces/:ws/agents/:agent/history", async (request, reply) => {
+    const { ws: wsParam, agent: agentParam } = request.params as { ws: string; agent: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
+    }
+    const agent = findAgentInWorkspace(ws, agentParam);
+    if (!agent) {
+      return reply.status(404).send({ error: "Worker não encontrado" });
+    }
+
+    const raw = Number((request.query as { limit?: string }).limit);
+    const limit = Number.isFinite(raw) && raw >= 1 ? Math.min(Math.floor(raw), MAX_HISTORY_TURNS) : 10;
+    const file = getAgentHistoryFile(ws.id, agent.id);
+    if (!file) return [];
+    // Wait for any in-flight append so a just-finished turn is visible.
+    await (historyQueues.get(agent.id) ?? Promise.resolve()).catch(() => {});
+    const records = await readHistoryFile(file);
+    return records.slice(-limit);
+  });
+
   fastify.post("/workspaces/:ws/agents/:agent/stop", async (request, reply) => {
     const { ws: wsParam, agent: agentParam } = request.params as { ws: string; agent: string };
     const ws = findWorkspace(wsParam);
@@ -1136,6 +1262,7 @@ export async function start(
 
     delete state.agents[agent.id];
     agentRecentEvents.delete(agent.id);
+    await removeAgentHistory(agent.workspaceId, agent.id);
     await saveState();
     broadcast({ kind: "agent_deleted", workspaceId: ws.id, agentId: agent.id, agentName: agent.name });
 

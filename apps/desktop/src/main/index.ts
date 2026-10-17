@@ -14,6 +14,7 @@ import type {
   Note,
   AgentState,
   Workspace,
+  TurnRecord,
 } from "@sinapse/core";
 import {
   IPC,
@@ -29,6 +30,7 @@ import {
   type DaemonDetails,
   type WorkspaceCreatePayload,
   type WorkspaceUpdatePayload,
+  type CanvasLayout,
 } from "../shared/ipc.js";
 
 const _require = createRequire(import.meta.url);
@@ -501,6 +503,73 @@ function saveSettings(s: DesktopSettings): void {
   }
 }
 
+const LAYOUT_ID_REGEX = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const MAX_LAYOUT_NODES = 2000;
+
+function getLayoutPath(workspaceId: string): string | undefined {
+  if (typeof workspaceId !== "string" || !LAYOUT_ID_REGEX.test(workspaceId)) return undefined;
+  return path.join(sinapseDir(), "layouts", `${workspaceId}.json`);
+}
+
+const finiteNumber = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+
+/** Re-validates whatever came over IPC or from disk so a bad file can't put NaN positions on the canvas. */
+function sanitizeLayout(raw: unknown): CanvasLayout | null {
+  if (!raw || typeof raw !== "object") return null;
+  const input = raw as { nodes?: unknown; viewport?: unknown };
+  const nodes: CanvasLayout["nodes"] = {};
+  if (input.nodes && typeof input.nodes === "object") {
+    for (const [id, value] of Object.entries(input.nodes as Record<string, unknown>).slice(0, MAX_LAYOUT_NODES)) {
+      const n = value as { x?: unknown; y?: unknown; width?: unknown; height?: unknown } | null;
+      if (!n || !finiteNumber(n.x) || !finiteNumber(n.y)) continue;
+      nodes[id] = {
+        x: n.x,
+        y: n.y,
+        ...(finiteNumber(n.width) && n.width > 0 ? { width: n.width } : {}),
+        ...(finiteNumber(n.height) && n.height > 0 ? { height: n.height } : {}),
+      };
+    }
+  }
+  const vp = input.viewport as { x?: unknown; y?: unknown; zoom?: unknown } | undefined;
+  const viewport =
+    vp && finiteNumber(vp.x) && finiteNumber(vp.y) && finiteNumber(vp.zoom) && vp.zoom > 0
+      ? { x: vp.x, y: vp.y, zoom: vp.zoom }
+      : undefined;
+  return { nodes, ...(viewport ? { viewport } : {}) };
+}
+
+function loadLayout(workspaceId: string): CanvasLayout | null {
+  const file = getLayoutPath(workspaceId);
+  if (!file) return null;
+  try {
+    return sanitizeLayout(JSON.parse(fs.readFileSync(file, "utf-8")));
+  } catch {
+    return null;
+  }
+}
+
+function saveLayout(workspaceId: string, layout: unknown): void {
+  const file = getLayoutPath(workspaceId);
+  const clean = sanitizeLayout(layout);
+  if (!file || !clean) return;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(clean), "utf-8");
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    console.error("Failed to save canvas layout:", err);
+  }
+}
+
+function deleteLayout(workspaceId: string): void {
+  const file = getLayoutPath(workspaceId);
+  if (!file) return;
+  try {
+    fs.rmSync(file, { force: true });
+  } catch {}
+}
+
 function broadcastDaemonStatus(connected: boolean): void {
   isDaemonConnected = connected;
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -965,6 +1034,7 @@ function registerIpcHandlers(): void {
     if (!res.ok) {
       throw new Error(await extractDaemonError(res, "Não foi possível excluir o workspace"));
     }
+    deleteLayout(workspaceId);
 
     if (settings.activeWorkspaceId === workspaceId) {
       try {
@@ -1143,6 +1213,26 @@ function registerIpcHandlers(): void {
     if (!response.ok) {
       throw new Error(await extractDaemonError(response, `Não foi possível excluir o worker: ${response.status}`));
     }
+  });
+
+  ipcMain.handle(
+    IPC.WORKER_HISTORY,
+    async (_event, workspaceId: string, agent: string, limit?: number): Promise<TurnRecord[]> => {
+      const query = typeof limit === "number" && Number.isFinite(limit) ? `?limit=${Math.floor(limit)}` : "";
+      const response = await daemonFetch(routes.agentHistory(workspaceId, agent) + query, { method: "GET" });
+      if (!response.ok) {
+        throw new Error(await extractDaemonError(response, `Não foi possível ler o histórico: ${response.status}`));
+      }
+      return (await response.json()) as TurnRecord[];
+    }
+  );
+
+  ipcMain.handle(IPC.LAYOUT_GET, async (_event, workspaceId: string): Promise<CanvasLayout | null> => {
+    return loadLayout(workspaceId);
+  });
+
+  ipcMain.handle(IPC.LAYOUT_SAVE, async (_event, workspaceId: string, layout: CanvasLayout): Promise<void> => {
+    saveLayout(workspaceId, layout);
   });
 
   // Notes

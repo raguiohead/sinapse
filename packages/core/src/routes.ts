@@ -20,6 +20,8 @@ export const routes = {
   agentAsk: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/ask`,
   /** GET */
   agentCheck: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/check`,
+  /** GET ?limit= (default 10, max 50) -> TurnRecord[] oldest first, read from disk */
+  agentHistory: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/history`,
   /** POST */
   agentStop: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/stop`,
 

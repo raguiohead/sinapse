@@ -11,6 +11,8 @@ import {
   type Connection,
   useNodesInitialized,
   useReactFlow,
+  type NodeChange,
+  type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import type {
@@ -20,10 +22,11 @@ import type {
   AgentState,
   NoteSummary,
   Note,
+  TurnRecord,
 } from "@sinapse/core";
 // The routes subpath is browser-safe; the package root would pull the daemon (Fastify, node:*) into the renderer.
 import { ORCHESTRATOR_AUTHOR, USER_AUTHOR } from "@sinapse/core/routes";
-import type { DesktopSettings } from "../shared/ipc";
+import type { DesktopSettings, CanvasLayout } from "../shared/ipc";
 
 import { BrainNode } from "./nodes/BrainNode";
 import { WorkerNode } from "./nodes/WorkerNode";
@@ -58,22 +61,45 @@ function createInitialBrainNode(workspaceId: string): Node {
   };
 }
 
+/** Set when a workspace canvas is (re)loaded: restore the saved viewport, or fit once when there is none. */
+interface ViewportRequest {
+  viewport?: Viewport;
+}
+
 function AutoFit({
-  workerCount,
-  noteCount,
+  requestRef,
+  requestId,
 }: {
-  workerCount: number;
-  noteCount: number;
+  requestRef: { current: ViewportRequest | null };
+  requestId: number;
 }) {
-  const { fitView } = useReactFlow();
+  const { fitView, setViewport } = useReactFlow();
   const measured = useNodesInitialized();
   useEffect(() => {
-    if (!measured) return;
-    const timer = setTimeout(() => fitView({ padding: 0.15, duration: 400 }), 50);
+    if (!requestRef.current || !measured) return;
+    const timer = setTimeout(() => {
+      const req = requestRef.current;
+      if (!req) return;
+      requestRef.current = null;
+      if (req.viewport) setViewport(req.viewport);
+      else fitView({ padding: 0.15, duration: 400 });
+    }, 50);
     return () => clearTimeout(timer);
-  }, [measured, workerCount, noteCount, fitView]);
+  }, [measured, requestId, requestRef, fitView, setViewport]);
   return null;
 }
+
+/** Same shape as the live log built in recordAgentActivity. */
+function turnRecordLog(record: TurnRecord): string {
+  let log = `> ${record.prompt}\n`;
+  for (const e of record.events) {
+    if (e.type === "text") log += e.data;
+    else if (e.type === "tool_use") log += `⚙ ${extractToolName(e.data)}\n`;
+  }
+  return log.slice(-20_000);
+}
+
+const LAYOUT_SAVE_DELAY_MS = 600;
 
 function nextWorkerPosition(nodes: Node[]): { x: number; y: number } {
   const brain = nodes.find((n) => n.id === "brain");
@@ -253,6 +279,53 @@ export function App() {
   nodesRef.current = nodes;
   const edgesRef = useRef(edges);
   edgesRef.current = edges;
+
+  const workspacesRef = useRef<Workspace[]>([]);
+  workspacesRef.current = workspaces;
+
+  // Canvas layout persistence (positions/sizes/viewport), debounced and stored by the main process.
+  const layoutCacheRef = useRef<Map<string, CanvasLayout>>(new Map());
+  const viewportRef = useRef<Viewport | undefined>(undefined);
+  const layoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const viewportRequestRef = useRef<ViewportRequest | null>(null);
+  const [viewportRequestId, setViewportRequestId] = useState(0);
+
+  const requestViewport = useCallback((viewport: Viewport | undefined) => {
+    viewportRef.current = viewport;
+    viewportRequestRef.current = { viewport };
+    setViewportRequestId((n) => n + 1);
+  }, []);
+
+  const saveLayoutNow = useCallback(() => {
+    if (layoutTimerRef.current) {
+      clearTimeout(layoutTimerRef.current);
+      layoutTimerRef.current = null;
+    }
+    const wsId = activeWorkspaceIdRef.current;
+    const current = nodesRef.current;
+    const brain = current.find((n) => n.id === "brain");
+    // Only persist when the canvas on screen really belongs to the active, still-existing workspace.
+    if (!wsId || !brain || (brain.data as any)?.workspaceId !== wsId) return;
+    if (!workspacesRef.current.some((w) => w.id === wsId)) return;
+    const layout: CanvasLayout = { nodes: {}, ...(viewportRef.current ? { viewport: viewportRef.current } : {}) };
+    for (const n of current) {
+      const width = n.width ?? n.measured?.width;
+      const height = n.height ?? n.measured?.height;
+      layout.nodes[n.id] = {
+        x: n.position.x,
+        y: n.position.y,
+        ...(width ? { width } : {}),
+        ...(height ? { height } : {}),
+      };
+    }
+    layoutCacheRef.current.set(wsId, layout);
+    window.sinapse?.layout?.save(wsId, layout).catch((err: unknown) => console.error("Erro ao salvar layout:", err));
+  }, []);
+
+  const scheduleLayoutSave = useCallback(() => {
+    if (layoutTimerRef.current) clearTimeout(layoutTimerRef.current);
+    layoutTimerRef.current = setTimeout(saveLayoutNow, LAYOUT_SAVE_DELAY_MS);
+  }, [saveLayoutNow]);
 
   // Stored per-workspace canvas state: Map<workspaceId, WorkspaceCanvasState>
   const workspaceCanvasStateMapRef = useRef<Map<string, WorkspaceCanvasState>>(new Map());
@@ -449,11 +522,26 @@ export function App() {
     async (wsId: string) => {
       if (!wsId) return;
       try {
-        const [workerList, summaries, brainInfo] = await Promise.all([
+        const [workerList, summaries, brainInfo, savedLayout] = await Promise.all([
           window.sinapse?.workers?.list(wsId),
           window.sinapse?.notes?.list(wsId),
           window.sinapse?.brain?.getInfo(wsId).catch(() => null),
+          window.sinapse?.layout?.get(wsId).catch(() => null),
         ]);
+
+        // Last finished turn of each worker, from disk, so cards survive an app/daemon restart.
+        const lastTurns = new Map<string, TurnRecord>();
+        if (Array.isArray(workerList)) {
+          await Promise.all(
+            workerList.map(async (w) => {
+              try {
+                const records = await window.sinapse?.workers?.history(wsId, w.id, 1);
+                const last = records?.[records.length - 1];
+                if (last) lastTurns.set(w.id, last);
+              } catch {}
+            })
+          );
+        }
 
         const orchestratorProvider = brainInfo?.provider ?? "claude";
 
@@ -478,6 +566,12 @@ export function App() {
           : [];
 
         const brainNode = createInitialBrainNode(wsId);
+        const brainSaved = savedLayout?.nodes?.["brain"];
+        if (brainSaved) {
+          brainNode.position = { x: brainSaved.x, y: brainSaved.y };
+          if (brainSaved.width) brainNode.width = brainSaved.width;
+          if (brainSaved.height) brainNode.height = brainSaved.height;
+        }
         const newNodes: Node[] = [brainNode];
         const newAgentState = new Map<
           string,
@@ -491,17 +585,29 @@ export function App() {
             if (worker.status === "thinking") {
               thinkingSet.add(worker.id);
             }
+            const lastTurn = lastTurns.get(worker.id);
+            const histLog = lastTurn ? turnRecordLog(lastTurn) : "";
+            const histPrompt = lastTurn?.prompt ?? "";
             newAgentState.set(worker.id, {
               status: worker.status || "idle",
-              log: "",
-              lastPrompt: "",
+              log: histLog,
+              lastPrompt: histPrompt,
             });
+            // Live activity (events received this session) wins over disk; otherwise seed it so new events append.
+            if (lastTurn && !agentActivityRef.current.has(worker.id)) {
+              agentActivityRef.current.set(worker.id, {
+                status: worker.status || "idle",
+                log: histLog,
+                lastPrompt: histPrompt,
+              });
+            }
+            const workerSaved = savedLayout?.nodes?.[`worker-${worker.id}`];
             newNodes.push({
               id: `worker-${worker.id}`,
               type: "worker",
-              position: nextWorkerPosition(newNodes),
-              width: 330,
-              height: 420,
+              position: workerSaved ? { x: workerSaved.x, y: workerSaved.y } : nextWorkerPosition(newNodes),
+              width: workerSaved?.width ?? 330,
+              height: workerSaved?.height ?? 420,
               data: {
                 id: worker.id,
                 workspaceId: wsId,
@@ -511,8 +617,8 @@ export function App() {
                 status: worker.status || "idle",
                 model: worker.model,
                 usage: worker.usage,
-                log: "",
-                lastPrompt: "",
+                log: histLog,
+                lastPrompt: histPrompt,
               },
             });
           }
@@ -522,13 +628,16 @@ export function App() {
         setThinkingCounts((prev) => ({ ...prev, [wsId]: thinkingSet.size }));
 
         for (const note of fullNotes) {
-          const pos = computeNotePosition(note.name, note.createdBy, newNodes);
+          const noteSaved = savedLayout?.nodes?.[`note-${note.name}`];
+          const pos = noteSaved
+            ? { x: noteSaved.x, y: noteSaved.y }
+            : computeNotePosition(note.name, note.createdBy, newNodes);
           newNodes.push({
             id: `note-${note.name}`,
             type: "note",
             position: pos,
-            width: 360,
-            height: 420,
+            width: noteSaved?.width ?? 360,
+            height: noteSaved?.height ?? 420,
             data: {
               workspaceId: wsId,
               name: note.name,
@@ -548,6 +657,8 @@ export function App() {
         );
 
         agentStateMapRef.current = newAgentState;
+        if (savedLayout) layoutCacheRef.current.set(wsId, savedLayout);
+        if (wsId === activeWorkspaceIdRef.current) requestViewport(savedLayout?.viewport);
         setNodes(withAgentActivity(newNodes));
         setEdges(newEdges);
 
@@ -560,13 +671,14 @@ export function App() {
         console.error("Erro ao carregar canvas do workspace:", err);
       }
     },
-    [setNodes, setEdges]
+    [setNodes, setEdges, requestViewport]
   );
 
   // Switch workspace: save current canvas and restore target
   const switchWorkspace = useCallback(
     (targetWsId: string) => {
       const prevWsId = prevActiveWorkspaceIdRef.current;
+      if (prevWsId && prevWsId !== targetWsId) saveLayoutNow();
       if (prevWsId && prevWsId !== targetWsId && nodesRef.current.length > 0) {
         workspaceCanvasStateMapRef.current.set(prevWsId, {
           nodes: nodesRef.current,
@@ -589,11 +701,12 @@ export function App() {
         agentStateMapRef.current = new Map(saved.agentState);
         setNodes(withAgentActivity(saved.nodes));
         setEdges(saved.edges);
+        requestViewport(layoutCacheRef.current.get(targetWsId)?.viewport);
       } else {
         loadWorkspaceCanvas(targetWsId);
       }
     },
-    [loadWorkspaceCanvas, setNodes, setEdges]
+    [loadWorkspaceCanvas, setNodes, setEdges, saveLayoutNow, requestViewport]
   );
 
   // Initial load: settings, workspaces list, active workspace
@@ -1234,6 +1347,26 @@ export function App() {
     [activeWorkspace?.orchestrator?.provider, pulseEdge, setNodes, setEdges, updateThinkingState]
   );
 
+  const handleNodesChange = useCallback(
+    (changes: NodeChange[]) => {
+      onNodesChange(changes);
+      const userMoved = changes.some(
+        (c) =>
+          (c.type === "position" && c.dragging !== true) ||
+          (c.type === "dimensions" && c.resizing === false) ||
+          c.type === "remove"
+      );
+      if (userMoved) scheduleLayoutSave();
+    },
+    [onNodesChange, scheduleLayoutSave]
+  );
+
+  // Nodes added/removed (workers, notes, workspace switch): persist so removed entries disappear from the layout.
+  const nodeIdsKey = nodes.map((n) => n.id).join("|");
+  useEffect(() => {
+    if (nodeIdsKey) scheduleLayoutSave();
+  }, [nodeIdsKey, scheduleLayoutSave]);
+
   // Sync anyThinking to brain node data
   useEffect(() => {
     const anyThinking = nodes.some(
@@ -1313,8 +1446,6 @@ export function App() {
     (n) => n.type === "worker" && n.data?.status === "thinking"
   ).length;
 
-  const workerCount = nodes.filter((n) => n.type === "worker").length;
-  const noteCount = nodes.filter((n) => n.type === "note").length;
 
   return (
     <div className="canvas-container">
@@ -1335,7 +1466,11 @@ export function App() {
         <ReactFlow
           nodes={nodes}
           edges={edges}
-          onNodesChange={onNodesChange}
+          onNodesChange={handleNodesChange}
+          onMoveEnd={(_e, viewport) => {
+            viewportRef.current = viewport;
+            scheduleLayoutSave();
+          }}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           onPaneContextMenu={handlePaneContextMenu}
@@ -1353,7 +1488,7 @@ export function App() {
         >
           <Background color="#151a28" gap={22} size={1.5} />
           <Controls className="flow-controls" />
-          <AutoFit workerCount={workerCount} noteCount={noteCount} />
+          <AutoFit requestRef={viewportRequestRef} requestId={viewportRequestId} />
         </ReactFlow>
       </div>
 

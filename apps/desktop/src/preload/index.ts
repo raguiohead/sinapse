@@ -7,6 +7,7 @@ import type {
   Note,
   AgentState,
   Workspace,
+  TurnRecord,
 } from "@sinapse/core";
 import {
   IPC,
@@ -22,6 +23,7 @@ import {
   type DaemonDetails,
   type WorkspaceCreatePayload,
   type WorkspaceUpdatePayload,
+  type CanvasLayout,
 } from "../shared/ipc.js";
 
 const api = {
@@ -167,6 +169,17 @@ const api = {
     },
     delete: (workspaceId: string, agent: string): Promise<void> => {
       return ipcRenderer.invoke(IPC.WORKER_DELETE, workspaceId, agent);
+    },
+    history: (workspaceId: string, agent: string, limit?: number): Promise<TurnRecord[]> => {
+      return ipcRenderer.invoke(IPC.WORKER_HISTORY, workspaceId, agent, limit);
+    },
+  },
+  layout: {
+    get: (workspaceId: string): Promise<CanvasLayout | null> => {
+      return ipcRenderer.invoke(IPC.LAYOUT_GET, workspaceId);
+    },
+    save: (workspaceId: string, layout: CanvasLayout): Promise<void> => {
+      return ipcRenderer.invoke(IPC.LAYOUT_SAVE, workspaceId, layout);
     },
   },
   models: {

@@ -6,6 +6,7 @@ import type {
   Note,
   AgentState,
   Workspace,
+  TurnRecord,
 } from "@sinapse/core";
 import type {
   DaemonInfo,
@@ -20,6 +21,7 @@ import type {
   DaemonDetails,
   WorkspaceCreatePayload,
   WorkspaceUpdatePayload,
+  CanvasLayout,
 } from "../shared/ipc.js";
 
 export interface SinapseBridge {
@@ -73,6 +75,13 @@ export interface SinapseBridge {
     stop: (workspaceId: string, agent: string) => Promise<any>;
     /** Removes the worker; a running turn is interrupted first. Emits agent_deleted on the bus. */
     delete: (workspaceId: string, agent: string) => Promise<void>;
+    /** Last finished turns from disk, oldest first (default 10, max 50). */
+    history: (workspaceId: string, agent: string, limit?: number) => Promise<TurnRecord[]>;
+  };
+  /** Canvas positions/sizes/viewport per workspace, stored by the main process. */
+  layout: {
+    get: (workspaceId: string) => Promise<CanvasLayout | null>;
+    save: (workspaceId: string, layout: CanvasLayout) => Promise<void>;
   };
   models: {
     list: () => Promise<ModelCatalog>;

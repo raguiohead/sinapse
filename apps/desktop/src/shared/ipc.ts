@@ -26,6 +26,9 @@ export const IPC = {
   WORKER_STOP: "worker:stop",
   WORKER_UPDATE: "worker:update",
   WORKER_DELETE: "worker:delete",
+  WORKER_HISTORY: "worker:history",
+  LAYOUT_GET: "layout:get",
+  LAYOUT_SAVE: "layout:save",
   MODELS_LIST: "models:list",
   NOTES_LIST: "notes:list",
   NOTE_READ: "note:read",
@@ -141,4 +144,23 @@ export interface BrainInfo {
   /** Claude only (read from its transcript); AGY has no usage. */
   usage?: ContextUsage;
   running: boolean;
+}
+
+export interface NodeLayout {
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+}
+
+export interface ViewportLayout {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+/** Persisted per workspace in <sinapseDir>/layouts/<workspaceId>.json. Node ids: "brain", "worker-<id>", "note-<name>". */
+export interface CanvasLayout {
+  nodes: Record<string, NodeLayout>;
+  viewport?: ViewportLayout;
 }

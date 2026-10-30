@@ -388,3 +388,7 @@ sinapse/
 
 - **`sinapse: command not found`**  
   Vincule o pacote da CLI ao seu ambiente global do npm executando `npm link -w @sinapse/cli` na raiz do repositório, garantindo que o diretório de binários globais do npm esteja presente no PATH do sistema.
+
+## Licença
+
+[MIT](LICENSE)

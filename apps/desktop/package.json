@@ -3,6 +3,7 @@
   "productName": "Sinapse",
   "desktopName": "sinapse.desktop",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "main": "out/main/index.js",
   "scripts": {

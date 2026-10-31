@@ -12,9 +12,10 @@ files:
   - package.json
 
 asar: true
+# The `sinapse` CLI shim runs @sinapse/cli as a plain node process, which cannot read inside app.asar:
+# it and every runtime dependency (fastify, nanoid, ...) must live on disk.
 asarUnpack:
-  - "**/node-pty/**"
-  - "**/@sinapse/**"
+  - "**/node_modules/**"
 
 extraResources:
   - from: "../../skill/sinapse"

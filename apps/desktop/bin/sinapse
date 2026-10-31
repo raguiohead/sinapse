@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+set -e
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Procura o ponto de entrada da CLI descompactada no pacote
+if [ -f "$DIR/../app.asar.unpacked/node_modules/@sinapse/cli/dist/main.js" ]; then
+  MAIN="$DIR/../app.asar.unpacked/node_modules/@sinapse/cli/dist/main.js"
+elif [ -f "$DIR/app.asar.unpacked/node_modules/@sinapse/cli/dist/main.js" ]; then
+  MAIN="$DIR/app.asar.unpacked/node_modules/@sinapse/cli/dist/main.js"
+elif [ -f "$DIR/../../packages/cli/dist/main.js" ]; then
+  MAIN="$DIR/../../packages/cli/dist/main.js"
+else
+  echo "Erro: ponto de entrada do Sinapse CLI não encontrado." >&2
+  exit 1
+fi
+
+exec node "$MAIN" "$@"

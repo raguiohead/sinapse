@@ -167,12 +167,24 @@ Você é o orquestrador do workspace ${ws.name}. O projeto está em ${ws.folder}
 `;
 }
 
+function getCliBinDir(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "bin")
+    : path.resolve(app.getAppPath(), "../../node_modules/.bin");
+}
+
+function getSkillSourceDir(): string {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "skill", "sinapse")
+    : path.resolve(app.getAppPath(), "../../skill/sinapse");
+}
+
 function ensureAgySkill(bDir: string): void {
   try {
     const skillsDir = path.join(bDir, ".agent", "skills");
     fs.mkdirSync(skillsDir, { recursive: true });
     const linkPath = path.join(skillsDir, "sinapse");
-    const skillSource = path.resolve(app.getAppPath(), "../../skill/sinapse");
+    const skillSource = getSkillSourceDir();
 
     try {
       const stat = fs.lstatSync(linkPath);
@@ -269,7 +281,7 @@ async function spawnBrain(ws: Workspace, resumeSessionId?: string | null): Promi
   }
 
   const home = os.homedir();
-  const cliBinPath = path.resolve(app.getAppPath(), "../../node_modules/.bin");
+  const cliBinPath = getCliBinDir();
   const localBin = path.join(home, ".local", "bin");
   const userPath = (process.env.PATH || "").split(path.delimiter);
   const extraPaths =

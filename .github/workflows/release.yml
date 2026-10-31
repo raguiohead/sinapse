@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build monorepo
+        run: npm run build
+
+      - name: Build distribution packages
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run dist -w @sinapse/desktop -- --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.os }}
+          path: |
+            apps/desktop/dist/*.AppImage
+            apps/desktop/dist/*.deb
+            apps/desktop/dist/*.exe
+            apps/desktop/dist/*.dmg
+            apps/desktop/dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create Draft Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          pattern: artifacts-*
+          merge-multiple: true
+
+      - name: Publish Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
+          files: |
+            dist-release/*.AppImage
+            dist-release/*.deb
+            dist-release/*.exe
+            dist-release/*.dmg
+            dist-release/*.zip

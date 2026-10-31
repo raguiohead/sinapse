@@ -10,6 +10,7 @@
   "scripts": {
     "build": "npm run build -w @sinapse/core && npm run build -w @sinapse/cli && npm run build -w @sinapse/desktop",
     "start": "npm run build && npm exec -w @sinapse/desktop -- electron . --no-sandbox",
+    "dist": "npm run build && npm run dist -w @sinapse/desktop --",
     "daemon": "node packages/cli/dist/main.js start"
   },
   "allowScripts": {

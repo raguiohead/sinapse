@@ -1,4 +1,4 @@
-appId: com.sinapse.desktop
+appId: com.raguiohead.sinapse
 productName: Sinapse
 electronVersion: 45.1.0
 artifactName: "${productName}-${version}-${arch}.${ext}"
@@ -34,11 +34,11 @@ linux:
   category: Development
   icon: build/icon.png
   synopsis: Orquestrador pessoal de agentes multiagente
-  maintainer: "Sinapse <maintainer@sinapse.local>"
+  maintainer: "raguiohead <guilhermep_alves@hotmail.com>"
 
 deb:
   packageName: sinapse
-  maintainer: "Sinapse <maintainer@sinapse.local>"
+  maintainer: "raguiohead <guilhermep_alves@hotmail.com>"
 
 win:
   target:

@@ -19,10 +19,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: 'npm'
@@ -39,7 +39,7 @@ jobs:
         run: npm run dist -w @sinapse/desktop -- --publish never
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-${{ matrix.os }}
           path: |
@@ -58,14 +58,14 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist-release
           pattern: artifacts-*
           merge-multiple: true
 
       - name: Publish Draft Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           prerelease: ${{ contains(github.ref_name, '-rc') }}

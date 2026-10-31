@@ -1,11 +1,12 @@
 import { getBezierPath, type EdgeProps } from "@xyflow/react";
 
 export type SynapsePulse = "idle" | "out" | "back";
-export type SynapseVariant = "default" | "author" | "contributor" | "creator";
+/** "pin": a note pinned to a worker (note -> worker); deleting the edge unpins it. */
+export type SynapseVariant = "default" | "author" | "contributor" | "creator" | "pin";
 
 export interface SynapseEdgeData {
   pulse?: SynapsePulse;
-  provider?: "claude" | "agy" | string;
+  provider?: "claude" | "codex" | "agy" | string;
   variant?: SynapseVariant;
 }
 
@@ -19,6 +20,7 @@ export function SynapseEdge({
   targetPosition,
   data,
   markerEnd,
+  selected,
 }: EdgeProps) {
   const edgeData = (data ?? {}) as SynapseEdgeData;
   const pulse: SynapsePulse = edgeData.pulse ?? "idle";
@@ -27,6 +29,7 @@ export function SynapseEdge({
 
   const isContributor = variant === "contributor";
   const isCreator = variant === "creator";
+  const isPin = variant === "pin";
 
   const [edgePath] = getBezierPath({
     sourceX,
@@ -38,7 +41,12 @@ export function SynapseEdge({
   });
 
   const safeId = id.replace(/[^a-zA-Z0-9-_]/g, "_");
-  const providerColor = provider === "agy" ? "var(--agy)" : "var(--claude)";
+  const providerColor =
+    provider === "agy"
+      ? "var(--agy)"
+      : provider === "codex"
+      ? "var(--codex)"
+      : "var(--claude)";
   const isBack = pulse === "back";
   const isOut = pulse === "out";
   const isActive = isOut || isBack;
@@ -52,7 +60,7 @@ export function SynapseEdge({
     ? 1.5
     : 2.5;
 
-  const strokeDasharray = isCreator ? "5 4" : undefined;
+  const strokeDasharray = isCreator ? "5 4" : isPin ? "3 5" : undefined;
 
   // Negative begins start each particle mid-flight, so none sits at the SVG origin before moving.
   const delays = [0, -0.6, -1.2];
@@ -86,25 +94,37 @@ export function SynapseEdge({
         </filter>
       </defs>
 
+      {/* Pins are deletable: give the thin dashed line a wider click target. */}
+      {isPin && (
+        <path
+          d={edgePath}
+          fill="none"
+          stroke="transparent"
+          strokeWidth={16}
+          className="react-flow__edge-interaction"
+        />
+      )}
+
       {/* Main Bezier path */}
       <path
         id={`edgepath-${safeId}`}
         d={edgePath}
         className={`synapse-edge-path ${pulse !== "idle" ? "synapse-active" : ""} ${
           isContributor ? "synapse-variant-contributor" : ""
-        } ${isCreator ? "synapse-variant-creator" : ""}`}
+        } ${isCreator ? "synapse-variant-creator" : ""} ${isPin ? "synapse-variant-pin" : ""}`}
         style={{
-          stroke:
-            pulse === "idle"
+          stroke: isPin
+            ? "var(--note-pin)"
+            : pulse === "idle"
               ? "var(--edge-idle)"
               : isBack
               ? providerColor
               : `url(#synapse-grad-${safeId})`,
-          strokeWidth,
+          strokeWidth: isPin ? (selected ? 2.5 : 1.5) : strokeWidth,
           strokeDasharray,
           filter: pulse !== "idle" ? `url(#synapse-glow-${safeId})` : undefined,
           fill: "none",
-          opacity: isContributor ? 0.5 : 1,
+          opacity: isContributor ? 0.5 : isPin && !selected ? 0.7 : 1,
         }}
         markerEnd={markerEnd}
       />

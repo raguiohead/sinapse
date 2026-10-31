@@ -11,6 +11,8 @@ import {
   type Connection,
   useNodesInitialized,
   useReactFlow,
+  type NodeChange,
+  type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import type {
@@ -20,10 +22,11 @@ import type {
   AgentState,
   NoteSummary,
   Note,
+  TurnRecord,
 } from "@sinapse/core";
 // The routes subpath is browser-safe; the package root would pull the daemon (Fastify, node:*) into the renderer.
 import { ORCHESTRATOR_AUTHOR, USER_AUTHOR } from "@sinapse/core/routes";
-import type { DesktopSettings } from "../shared/ipc";
+import type { DesktopSettings, CanvasLayout } from "../shared/ipc";
 
 import { BrainNode } from "./nodes/BrainNode";
 import { WorkerNode } from "./nodes/WorkerNode";
@@ -31,6 +34,7 @@ import { NoteNode } from "./nodes/NoteNode";
 import { SynapseEdge, type SynapsePulse, type SynapseVariant } from "./edges/SynapseEdge";
 import { TitleBar } from "./components/TitleBar";
 import { ContextMenu, type ContextMenuItem } from "./components/ContextMenu";
+import { appendPrompt, appendTurnEvent, turnRecordEntries, type ActivityEntry } from "./activity";
 import { NewWorkerDialog } from "./components/NewWorkerDialog";
 import { NewNoteDialog } from "./components/NewNoteDialog";
 import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
@@ -58,22 +62,35 @@ function createInitialBrainNode(workspaceId: string): Node {
   };
 }
 
+/** Set when a workspace canvas is (re)loaded: restore the saved viewport, or fit once when there is none. */
+interface ViewportRequest {
+  viewport?: Viewport;
+}
+
 function AutoFit({
-  workerCount,
-  noteCount,
+  requestRef,
+  requestId,
 }: {
-  workerCount: number;
-  noteCount: number;
+  requestRef: { current: ViewportRequest | null };
+  requestId: number;
 }) {
-  const { fitView } = useReactFlow();
+  const { fitView, setViewport } = useReactFlow();
   const measured = useNodesInitialized();
   useEffect(() => {
-    if (!measured) return;
-    const timer = setTimeout(() => fitView({ padding: 0.15, duration: 400 }), 50);
+    if (!requestRef.current || !measured) return;
+    const timer = setTimeout(() => {
+      const req = requestRef.current;
+      if (!req) return;
+      requestRef.current = null;
+      if (req.viewport) setViewport(req.viewport);
+      else fitView({ padding: 0.15, duration: 400 });
+    }, 50);
     return () => clearTimeout(timer);
-  }, [measured, workerCount, noteCount, fitView]);
+  }, [measured, requestId, requestRef, fitView, setViewport]);
   return null;
 }
+
+const LAYOUT_SAVE_DELAY_MS = 600;
 
 function nextWorkerPosition(nodes: Node[]): { x: number; y: number } {
   const brain = nodes.find((n) => n.id === "brain");
@@ -130,26 +147,61 @@ function computeNotePosition(
   return stackBelow(brainX - 360 - 120, brainY);
 }
 
-function extractToolName(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw);
-    return (
-      parsed.name ||
-      parsed.tool_name ||
-      parsed.tool ||
-      parsed.call?.name ||
-      parsed.call?.tool_name ||
-      "ferramenta"
-    );
-  } catch {
-    return raw.slice(0, 30) || "ferramenta";
+interface PinEdgeData {
+  pulse: SynapsePulse;
+  variant: SynapseVariant;
+  noteName: string;
+  agentId: string;
+  [key: string]: unknown;
+}
+
+function isPinEdge(edge: Edge): boolean {
+  return (edge.data as Partial<PinEdgeData> | undefined)?.variant === "pin";
+}
+
+function pinEdge(noteName: string, agentId: string): Edge {
+  const source = `note-${noteName}`;
+  const target = `worker-${agentId}`;
+  const data: PinEdgeData = { pulse: "idle", variant: "pin", noteName, agentId };
+  return {
+    id: `edge-pin-${source}-${target}`,
+    source,
+    target,
+    sourceHandle: "note-pin",
+    targetHandle: "worker-target",
+    type: "synapse",
+    data,
+  };
+}
+
+/** Replaces the worker's note -> worker pin edges with one per pinned note that is on the canvas. */
+function withPinEdges(edges: Edge[], nodes: Node[], agentId: string, pinnedNotes: string[] | undefined): Edge[] {
+  const target = `worker-${agentId}`;
+  const next = edges.filter((e) => !(isPinEdge(e) && e.target === target));
+  const noteIds = new Set(nodes.filter((n) => n.type === "note").map((n) => n.id));
+  for (const noteName of pinnedNotes ?? []) {
+    if (noteIds.has(`note-${noteName}`)) next.push(pinEdge(noteName, agentId));
   }
+  return next;
+}
+
+/** Adds the pin edges of the workers pinning `noteName`, for when that note's node (re)appears. */
+function withPinEdgesForNote(edges: Edge[], nodes: Node[], noteName: string): Edge[] {
+  const next = [...edges];
+  for (const n of nodes) {
+    if (n.type !== "worker") continue;
+    const data = n.data as unknown as WorkerNodeData;
+    if (!data.pinnedNotes?.includes(noteName)) continue;
+    const edge = pinEdge(noteName, data.id);
+    if (!next.some((e) => e.id === edge.id)) next.push(edge);
+  }
+  return next;
 }
 
 interface WorkspaceCanvasState {
   nodes: Node[];
   edges: Edge[];
-  agentState: Map<string, { status: AgentStatus; log: string; lastPrompt: string }>;
+  agentState: Map<string, { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }>;
 }
 
 function buildEdges(
@@ -254,6 +306,53 @@ export function App() {
   const edgesRef = useRef(edges);
   edgesRef.current = edges;
 
+  const workspacesRef = useRef<Workspace[]>([]);
+  workspacesRef.current = workspaces;
+
+  // Canvas layout persistence (positions/sizes/viewport), debounced and stored by the main process.
+  const layoutCacheRef = useRef<Map<string, CanvasLayout>>(new Map());
+  const viewportRef = useRef<Viewport | undefined>(undefined);
+  const layoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const viewportRequestRef = useRef<ViewportRequest | null>(null);
+  const [viewportRequestId, setViewportRequestId] = useState(0);
+
+  const requestViewport = useCallback((viewport: Viewport | undefined) => {
+    viewportRef.current = viewport;
+    viewportRequestRef.current = { viewport };
+    setViewportRequestId((n) => n + 1);
+  }, []);
+
+  const saveLayoutNow = useCallback(() => {
+    if (layoutTimerRef.current) {
+      clearTimeout(layoutTimerRef.current);
+      layoutTimerRef.current = null;
+    }
+    const wsId = activeWorkspaceIdRef.current;
+    const current = nodesRef.current;
+    const brain = current.find((n) => n.id === "brain");
+    // Only persist when the canvas on screen really belongs to the active, still-existing workspace.
+    if (!wsId || !brain || (brain.data as any)?.workspaceId !== wsId) return;
+    if (!workspacesRef.current.some((w) => w.id === wsId)) return;
+    const layout: CanvasLayout = { nodes: {}, ...(viewportRef.current ? { viewport: viewportRef.current } : {}) };
+    for (const n of current) {
+      const width = n.width ?? n.measured?.width;
+      const height = n.height ?? n.measured?.height;
+      layout.nodes[n.id] = {
+        x: n.position.x,
+        y: n.position.y,
+        ...(width ? { width } : {}),
+        ...(height ? { height } : {}),
+      };
+    }
+    layoutCacheRef.current.set(wsId, layout);
+    window.sinapse?.layout?.save(wsId, layout).catch((err: unknown) => console.error("Erro ao salvar layout:", err));
+  }, []);
+
+  const scheduleLayoutSave = useCallback(() => {
+    if (layoutTimerRef.current) clearTimeout(layoutTimerRef.current);
+    layoutTimerRef.current = setTimeout(saveLayoutNow, LAYOUT_SAVE_DELAY_MS);
+  }, [saveLayoutNow]);
+
   // Stored per-workspace canvas state: Map<workspaceId, WorkspaceCanvasState>
   const workspaceCanvasStateMapRef = useRef<Map<string, WorkspaceCanvasState>>(new Map());
   const prevActiveWorkspaceIdRef = useRef<string>("");
@@ -271,6 +370,7 @@ export function App() {
     y: number;
     items?: ContextMenuItem[];
   } | null>(null);
+  const [squadPresets, setSquadPresets] = useState<string[]>([]);
   const [isNewWorkerDialogOpen, setIsNewWorkerDialogOpen] = useState(false);
   const [isNewNoteDialogOpen, setIsNewNoteDialogOpen] = useState(false);
   const [isNewWorkspaceDialogOpen, setIsNewWorkspaceDialogOpen] = useState(false);
@@ -278,13 +378,13 @@ export function App() {
 
   // Per-agent state tracking for active workspace: agentId -> { status, log, lastPrompt }
   const agentStateMapRef = useRef<
-    Map<string, { status: AgentStatus; log: string; lastPrompt: string }>
+    Map<string, { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }>
   >(new Map());
 
   // Every worker's activity, across all workspaces. Saved per-workspace canvases hold stale node data, and workers
   // created while their workspace is in the background have no saved state at all; cards are rehydrated from here.
   const agentActivityRef = useRef<
-    Map<string, { status: AgentStatus; log: string; lastPrompt: string }>
+    Map<string, { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }>
   >(new Map());
 
   const recordAgentActivity = (event: DaemonEvent) => {
@@ -294,14 +394,13 @@ export function App() {
       return;
     }
     if (event.kind !== "turn_started" && event.kind !== "turn_event" && event.kind !== "turn_finished") return;
-    const st = store.get(event.agentId) ?? { status: "idle" as AgentStatus, log: "", lastPrompt: "" };
+    const st = store.get(event.agentId) ?? { status: "idle" as AgentStatus, log: [], lastPrompt: "" };
     if (event.kind === "turn_started") {
       st.status = "thinking";
       st.lastPrompt = event.prompt;
-      st.log = (st.log + (st.log ? `\n> ${event.prompt}\n` : `> ${event.prompt}\n`)).slice(-20_000);
+      st.log = appendPrompt(st.log, event.prompt);
     } else if (event.kind === "turn_event") {
-      if (event.event.type === "text") st.log = (st.log + event.event.data).slice(-20_000);
-      else if (event.event.type === "tool_use") st.log = (st.log + `⚙ ${extractToolName(event.event.data)}\n`).slice(-20_000);
+      st.log = appendTurnEvent(st.log, event.event);
     } else {
       st.status = event.status;
     }
@@ -449,11 +548,26 @@ export function App() {
     async (wsId: string) => {
       if (!wsId) return;
       try {
-        const [workerList, summaries, brainInfo] = await Promise.all([
+        const [workerList, summaries, brainInfo, savedLayout] = await Promise.all([
           window.sinapse?.workers?.list(wsId),
           window.sinapse?.notes?.list(wsId),
           window.sinapse?.brain?.getInfo(wsId).catch(() => null),
+          window.sinapse?.layout?.get(wsId).catch(() => null),
         ]);
+
+        // Last finished turn of each worker, from disk, so cards survive an app/daemon restart.
+        const lastTurns = new Map<string, TurnRecord>();
+        if (Array.isArray(workerList)) {
+          await Promise.all(
+            workerList.map(async (w) => {
+              try {
+                const records = await window.sinapse?.workers?.history(wsId, w.id, 1);
+                const last = records?.[records.length - 1];
+                if (last) lastTurns.set(w.id, last);
+              } catch {}
+            })
+          );
+        }
 
         const orchestratorProvider = brainInfo?.provider ?? "claude";
 
@@ -478,10 +592,16 @@ export function App() {
           : [];
 
         const brainNode = createInitialBrainNode(wsId);
+        const brainSaved = savedLayout?.nodes?.["brain"];
+        if (brainSaved) {
+          brainNode.position = { x: brainSaved.x, y: brainSaved.y };
+          if (brainSaved.width) brainNode.width = brainSaved.width;
+          if (brainSaved.height) brainNode.height = brainSaved.height;
+        }
         const newNodes: Node[] = [brainNode];
         const newAgentState = new Map<
           string,
-          { status: AgentStatus; log: string; lastPrompt: string }
+          { status: AgentStatus; log: ActivityEntry[]; lastPrompt: string }
         >();
 
         const thinkingSet = new Set<string>();
@@ -491,28 +611,44 @@ export function App() {
             if (worker.status === "thinking") {
               thinkingSet.add(worker.id);
             }
+            const lastTurn = lastTurns.get(worker.id);
+            const histLog = lastTurn ? turnRecordEntries(lastTurn) : [];
+            const histPrompt = lastTurn?.prompt ?? "";
             newAgentState.set(worker.id, {
               status: worker.status || "idle",
-              log: "",
-              lastPrompt: "",
+              log: histLog,
+              lastPrompt: histPrompt,
             });
+            // Live activity (events received this session) wins over disk; otherwise seed it so new events append.
+            if (lastTurn && !agentActivityRef.current.has(worker.id)) {
+              agentActivityRef.current.set(worker.id, {
+                status: worker.status || "idle",
+                log: histLog,
+                lastPrompt: histPrompt,
+              });
+            }
+            const workerSaved = savedLayout?.nodes?.[`worker-${worker.id}`];
             newNodes.push({
               id: `worker-${worker.id}`,
               type: "worker",
-              position: nextWorkerPosition(newNodes),
-              width: 330,
-              height: 420,
+              position: workerSaved ? { x: workerSaved.x, y: workerSaved.y } : nextWorkerPosition(newNodes),
+              width: workerSaved?.width ?? 330,
+              height: workerSaved?.height ?? 420,
               data: {
                 id: worker.id,
                 workspaceId: wsId,
                 name: worker.name,
                 provider: worker.provider,
                 role: worker.role,
+                autonomy: worker.autonomy,
                 status: worker.status || "idle",
                 model: worker.model,
                 usage: worker.usage,
-                log: "",
-                lastPrompt: "",
+                worktreeBranch: worker.worktree?.branch,
+                worktreePath: worker.worktree?.path,
+                pinnedNotes: worker.pinnedNotes,
+                log: histLog,
+                lastPrompt: histPrompt,
               },
             });
           }
@@ -522,13 +658,16 @@ export function App() {
         setThinkingCounts((prev) => ({ ...prev, [wsId]: thinkingSet.size }));
 
         for (const note of fullNotes) {
-          const pos = computeNotePosition(note.name, note.createdBy, newNodes);
+          const noteSaved = savedLayout?.nodes?.[`note-${note.name}`];
+          const pos = noteSaved
+            ? { x: noteSaved.x, y: noteSaved.y }
+            : computeNotePosition(note.name, note.createdBy, newNodes);
           newNodes.push({
             id: `note-${note.name}`,
             type: "note",
             position: pos,
-            width: 360,
-            height: 420,
+            width: noteSaved?.width ?? 360,
+            height: noteSaved?.height ?? 420,
             data: {
               workspaceId: wsId,
               name: note.name,
@@ -541,13 +680,18 @@ export function App() {
           });
         }
 
-        const newEdges = buildEdges(
+        let newEdges = buildEdges(
           Array.isArray(workerList) ? workerList : [],
           fullNotes,
           orchestratorProvider
         );
+        for (const worker of Array.isArray(workerList) ? workerList : []) {
+          newEdges = withPinEdges(newEdges, newNodes, worker.id, worker.pinnedNotes);
+        }
 
         agentStateMapRef.current = newAgentState;
+        if (savedLayout) layoutCacheRef.current.set(wsId, savedLayout);
+        if (wsId === activeWorkspaceIdRef.current) requestViewport(savedLayout?.viewport);
         setNodes(withAgentActivity(newNodes));
         setEdges(newEdges);
 
@@ -560,13 +704,14 @@ export function App() {
         console.error("Erro ao carregar canvas do workspace:", err);
       }
     },
-    [setNodes, setEdges]
+    [setNodes, setEdges, requestViewport]
   );
 
   // Switch workspace: save current canvas and restore target
   const switchWorkspace = useCallback(
     (targetWsId: string) => {
       const prevWsId = prevActiveWorkspaceIdRef.current;
+      if (prevWsId && prevWsId !== targetWsId) saveLayoutNow();
       if (prevWsId && prevWsId !== targetWsId && nodesRef.current.length > 0) {
         workspaceCanvasStateMapRef.current.set(prevWsId, {
           nodes: nodesRef.current,
@@ -589,11 +734,12 @@ export function App() {
         agentStateMapRef.current = new Map(saved.agentState);
         setNodes(withAgentActivity(saved.nodes));
         setEdges(saved.edges);
+        requestViewport(layoutCacheRef.current.get(targetWsId)?.viewport);
       } else {
         loadWorkspaceCanvas(targetWsId);
       }
     },
-    [loadWorkspaceCanvas, setNodes, setEdges]
+    [loadWorkspaceCanvas, setNodes, setEdges, saveLayoutNow, requestViewport]
   );
 
   // Initial load: settings, workspaces list, active workspace
@@ -685,7 +831,7 @@ export function App() {
             if (!agentStateMapRef.current.has(agent.id)) {
               agentStateMapRef.current.set(agent.id, {
                 status: agent.status || "idle",
-                log: "",
+                log: [],
                 lastPrompt: "",
               });
             }
@@ -706,10 +852,14 @@ export function App() {
                     name: agent.name,
                     provider: agent.provider,
                     role: agent.role,
+                    autonomy: agent.autonomy,
                     status: agent.status || "idle",
                     model: agent.model,
                     usage: agent.usage,
-                    log: "",
+                    worktreeBranch: agent.worktree?.branch,
+                    worktreePath: agent.worktree?.path,
+                    pinnedNotes: agent.pinnedNotes,
+                    log: [],
                     lastPrompt: "",
                   },
                 },
@@ -749,7 +899,7 @@ export function App() {
                   );
                 }
               }
-              return nextEds;
+              return withPinEdges(nextEds, nodesRef.current, agent.id, agent.pinnedNotes);
             });
           } else {
             // Update background workspace cache
@@ -769,10 +919,14 @@ export function App() {
                     name: agent.name,
                     provider: agent.provider,
                     role: agent.role,
+                    autonomy: agent.autonomy,
                     status: agent.status || "idle",
                     model: agent.model,
                     usage: agent.usage,
-                    log: "",
+                    worktreeBranch: agent.worktree?.branch,
+                    worktreePath: agent.worktree?.path,
+                    pinnedNotes: agent.pinnedNotes,
+                    log: [],
                     lastPrompt: "",
                   },
                 });
@@ -783,6 +937,7 @@ export function App() {
                   type: "synapse",
                   data: { pulse: "idle", provider: agent.provider, variant: "default" },
                 });
+                cached.edges = withPinEdges(cached.edges, cached.nodes, agent.id, agent.pinnedNotes);
               }
             }
           }
@@ -805,14 +960,18 @@ export function App() {
                       data: {
                         ...n.data,
                         role: agent.role,
+                        autonomy: agent.autonomy,
                         model: agent.model,
-                        usage: agent.usage ?? n.data?.usage,
+                        // Authoritative: a handoff clears it.
+                        usage: agent.usage,
                         status: agent.status || n.data?.status,
+                        pinnedNotes: agent.pinnedNotes,
                       },
                     }
                   : n
               )
             );
+            setEdges((eds) => withPinEdges(eds, nodesRef.current, agent.id, agent.pinnedNotes));
           } else {
             const cached = workspaceCanvasStateMapRef.current.get(wsId);
             if (cached) {
@@ -823,13 +982,16 @@ export function App() {
                       data: {
                         ...n.data,
                         role: agent.role,
+                        autonomy: agent.autonomy,
                         model: agent.model,
-                        usage: agent.usage ?? n.data?.usage,
+                        usage: agent.usage,
                         status: agent.status || n.data?.status,
+                        pinnedNotes: agent.pinnedNotes,
                       },
                     }
                   : n
               );
+              cached.edges = withPinEdges(cached.edges, cached.nodes, agent.id, agent.pinnedNotes);
             }
           }
           break;
@@ -843,13 +1005,12 @@ export function App() {
             const nodeId = `worker-${event.agentId}`;
             const st = agentStateMapRef.current.get(event.agentId) || {
               status: "idle",
-              log: "",
+              log: [],
               lastPrompt: "",
             };
             st.status = "thinking";
             st.lastPrompt = event.prompt;
-            const promptHeader = st.log ? `\n> ${event.prompt}\n` : `> ${event.prompt}\n`;
-            st.log = (st.log + promptHeader).slice(-20_000);
+            st.log = appendPrompt(st.log, event.prompt);
             agentStateMapRef.current.set(event.agentId, st);
 
             setNodes((nds) =>
@@ -887,7 +1048,7 @@ export function App() {
             if (cached) {
               const st = cached.agentState.get(event.agentId) || {
                 status: "idle",
-                log: "",
+                log: [],
                 lastPrompt: "",
               };
               st.status = "thinking";
@@ -909,16 +1070,11 @@ export function App() {
             const nodeId = `worker-${event.agentId}`;
             const st = agentStateMapRef.current.get(event.agentId) || {
               status: "thinking",
-              log: "",
+              log: [],
               lastPrompt: "",
             };
 
-            if (event.event.type === "text") {
-              st.log = (st.log + event.event.data).slice(-20_000);
-            } else if (event.event.type === "tool_use") {
-              const toolName = extractToolName(event.event.data);
-              st.log = (st.log + `⚙ ${toolName}\n`).slice(-20_000);
-            }
+            st.log = appendTurnEvent(st.log, event.event);
             agentStateMapRef.current.set(event.agentId, st);
 
             setNodes((nds) =>
@@ -939,12 +1095,7 @@ export function App() {
             if (cached) {
               const st = cached.agentState.get(event.agentId);
               if (st) {
-                if (event.event.type === "text") {
-                  st.log = (st.log + event.event.data).slice(-20_000);
-                } else if (event.event.type === "tool_use") {
-                  const toolName = extractToolName(event.event.data);
-                  st.log = (st.log + `⚙ ${toolName}\n`).slice(-20_000);
-                }
+                st.log = appendTurnEvent(st.log, event.event);
               }
             }
           }
@@ -959,7 +1110,7 @@ export function App() {
             const nodeId = `worker-${event.agentId}`;
             const st = agentStateMapRef.current.get(event.agentId) || {
               status: event.status,
-              log: "",
+              log: [],
               lastPrompt: "",
             };
             st.status = event.status;
@@ -1171,7 +1322,7 @@ export function App() {
                     }
                   }
 
-                  return nextEdges;
+                  return withPinEdgesForNote(nextEdges, nodesRef.current, fullNote.name);
                 });
 
                 // Pulse edge from changer to note
@@ -1234,6 +1385,26 @@ export function App() {
     [activeWorkspace?.orchestrator?.provider, pulseEdge, setNodes, setEdges, updateThinkingState]
   );
 
+  const handleNodesChange = useCallback(
+    (changes: NodeChange[]) => {
+      onNodesChange(changes);
+      const userMoved = changes.some(
+        (c) =>
+          (c.type === "position" && c.dragging !== true) ||
+          (c.type === "dimensions" && c.resizing === false) ||
+          c.type === "remove"
+      );
+      if (userMoved) scheduleLayoutSave();
+    },
+    [onNodesChange, scheduleLayoutSave]
+  );
+
+  // Nodes added/removed (workers, notes, workspace switch): persist so removed entries disappear from the layout.
+  const nodeIdsKey = nodes.map((n) => n.id).join("|");
+  useEffect(() => {
+    if (nodeIdsKey) scheduleLayoutSave();
+  }, [nodeIdsKey, scheduleLayoutSave]);
+
   // Sync anyThinking to brain node data
   useEffect(() => {
     const anyThinking = nodes.some(
@@ -1290,6 +1461,21 @@ export function App() {
 
   const onConnect = useCallback(
     (connection: Connection) => {
+      const sourceNode = nodesRef.current.find((n) => n.id === connection.source);
+      const targetNode = nodesRef.current.find((n) => n.id === connection.target);
+      if (sourceNode?.type === "note" && targetNode?.type === "worker") {
+        // Note -> worker pins the note; the edge is drawn from the agent_updated that follows.
+        const noteName = String((sourceNode.data as any)?.name ?? "");
+        const worker = targetNode.data as unknown as WorkerNodeData;
+        const current = worker.pinnedNotes ?? [];
+        if (!noteName || current.includes(noteName)) return;
+        window.sinapse?.workers
+          ?.update({ workspaceId: activeWorkspaceIdRef.current, agent: worker.id, pinnedNotes: [...current, noteName] })
+          .catch((err: any) =>
+            window.alert(`Não foi possível fixar a nota "${noteName}" em "${worker.name}": ${err?.message ?? err}`)
+          );
+        return;
+      }
       setEdges((eds) =>
         addEdge(
           {
@@ -1304,17 +1490,74 @@ export function App() {
     [setEdges]
   );
 
+  // Delete/Backspace only removes selected pin edges; nodes and the other edges are managed by the daemon.
+  const handleBeforeDelete = useCallback(
+    async ({ edges: candidates }: { nodes: Node[]; edges: Edge[] }) => ({
+      nodes: [],
+      edges: candidates.filter((e) => isPinEdge(e) && e.selected),
+    }),
+    []
+  );
+
+  const onEdgesDelete = useCallback(
+    (deleted: Edge[]) => {
+      const removed = new Map<string, Set<string>>();
+      for (const e of deleted) {
+        if (!isPinEdge(e)) continue;
+        const { agentId, noteName } = e.data as PinEdgeData;
+        const names = removed.get(agentId) ?? new Set<string>();
+        names.add(noteName);
+        removed.set(agentId, names);
+      }
+      for (const [agentId, names] of removed) {
+        const workerNode = nodesRef.current.find((n) => n.id === `worker-${agentId}`);
+        if (!workerNode) continue;
+        const worker = workerNode.data as unknown as WorkerNodeData;
+        const current = worker.pinnedNotes ?? [];
+        window.sinapse?.workers
+          ?.update({
+            workspaceId: activeWorkspaceIdRef.current,
+            agent: agentId,
+            pinnedNotes: current.filter((n) => !names.has(n)),
+          })
+          .catch((err: any) => {
+            window.alert(`Não foi possível desafixar a nota de "${worker.name}": ${err?.message ?? err}`);
+            setEdges((eds) => withPinEdges(eds, nodesRef.current, agentId, current));
+          });
+      }
+    },
+    [setEdges]
+  );
+
   const handlePaneContextMenu = useCallback((e: React.MouseEvent | MouseEvent) => {
     e.preventDefault();
     setContextMenu({ x: e.clientX, y: e.clientY });
+    window.sinapse?.squads
+      ?.list()
+      .then((catalog) => setSquadPresets(catalog.presets.map((p) => p.name)))
+      .catch(() => setSquadPresets([]));
+  }, []);
+
+  const handleApplySquad = useCallback(async (preset: string) => {
+    const workspaceId = activeWorkspaceIdRef.current;
+    if (!workspaceId) return;
+    try {
+      const result = await window.sinapse?.squads?.apply({ workspaceId, preset });
+      if (!result) return;
+      const notes = [
+        ...result.skipped.map((s) => `"${s.name}" ignorado (${s.reason})`),
+        ...result.failed.map((f) => `"${f.name}" falhou: ${f.error}`),
+      ];
+      if (notes.length > 0) window.alert(`Squad "${preset}":\n${notes.join("\n")}`);
+    } catch (err: any) {
+      window.alert(`Não foi possível aplicar o squad "${preset}": ${err?.message ?? err}`);
+    }
   }, []);
 
   const activeThinkingCount = nodes.filter(
     (n) => n.type === "worker" && n.data?.status === "thinking"
   ).length;
 
-  const workerCount = nodes.filter((n) => n.type === "worker").length;
-  const noteCount = nodes.filter((n) => n.type === "note").length;
 
   return (
     <div className="canvas-container">
@@ -1335,16 +1578,22 @@ export function App() {
         <ReactFlow
           nodes={nodes}
           edges={edges}
-          onNodesChange={onNodesChange}
+          onNodesChange={handleNodesChange}
+          onMoveEnd={(_e, viewport) => {
+            viewportRef.current = viewport;
+            scheduleLayoutSave();
+          }}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onBeforeDelete={handleBeforeDelete}
+          onEdgesDelete={onEdgesDelete}
           onPaneContextMenu={handlePaneContextMenu}
           onNodeContextMenu={handleNodeContextMenu}
           onPaneClick={() => setContextMenu(null)}
           onMoveStart={() => setContextMenu(null)}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
-          deleteKeyCode={null}
+          deleteKeyCode={["Delete", "Backspace"]}
           proOptions={{ hideAttribution: true }}
           fitView
           fitViewOptions={{ padding: 0.2 }}
@@ -1353,7 +1602,7 @@ export function App() {
         >
           <Background color="#151a28" gap={22} size={1.5} />
           <Controls className="flow-controls" />
-          <AutoFit workerCount={workerCount} noteCount={noteCount} />
+          <AutoFit requestRef={viewportRequestRef} requestId={viewportRequestId} />
         </ReactFlow>
       </div>
 
@@ -1367,6 +1616,8 @@ export function App() {
           onNewWorker={() => setIsNewWorkerDialogOpen(true)}
           onNewNote={() => setIsNewNoteDialogOpen(true)}
           onOpenSettings={() => setIsSettingsOpen(true)}
+          squadPresets={squadPresets}
+          onApplySquad={handleApplySquad}
         />
       )}
 

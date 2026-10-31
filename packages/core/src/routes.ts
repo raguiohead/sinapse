@@ -12,16 +12,27 @@ export const routes = {
   /** PATCH {name?, orchestrator?} | DELETE (stops its turns, removes its agents and Sinapse data; never the project folder) */
   workspace: (ws: string) => `/workspaces/${seg(ws)}`,
 
-  /** GET list | POST spawn (AgentConfig without workspaceId) */
+  /** GET -> SquadCatalog (built-in presets + ~/.sinapse/squads.json) */
+  squads: () => "/squads",
+  /** POST {preset, prefix?, worktree?} -> SquadApplyResult */
+  squadApply: (ws: string) => `/workspaces/${seg(ws)}/squads/apply`,
+
+  /** GET list | POST spawn (AgentConfig without workspaceId, plus worktree?: boolean; pinnedNotes must exist) */
   agents: (ws: string) => `/workspaces/${seg(ws)}/agents`,
-  /** PATCH {model?, role?, autonomy?} | DELETE */
+  /** PATCH {model?, role?, autonomy?, pinnedNotes?} (pinnedNotes alone is accepted while thinking) | DELETE [?force=1] -> AgentDeleteResult (a worktree with uncommitted work or new commits is kept unless forced) */
   agent: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}`,
-  /** POST {prompt, async?} */
+  /** POST {prompt, async?, queue?}; queue implies async and enqueues when busy (202 AskResponse) instead of 409 */
   agentAsk: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/ask`,
-  /** GET */
+  /** GET CheckResponse */
   agentCheck: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/check`,
-  /** POST */
+  /** GET ?limit= (default 10, max 50) -> TurnRecord[] oldest first, read from disk */
+  agentHistory: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/history`,
+  /** POST: cancels the running turn and clears the queue (StopResponse) */
   agentStop: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/stop`,
+  /** POST {note?}: summary turn → note, then resets the session (202 HandoffResponse) */
+  agentHandoff: (ws: string, agent: string) => `/workspaces/${seg(ws)}/agents/${seg(agent)}/handoff`,
+  /** POST {agents, any?, timeoutMs?}: long-poll until the workers are no longer busy (WaitResponse; timeoutMs capped at 60s) */
+  wait: (ws: string) => `/workspaces/${seg(ws)}/wait`,
 
   /** GET list */
   notes: (ws: string) => `/workspaces/${seg(ws)}/notes`,

@@ -1,4 +1,4 @@
-import type { ContextUsage, OrchestratorConfig } from "@sinapse/core";
+import type { ContextUsage, OrchestratorConfig, Provider } from "@sinapse/core";
 
 export const IPC = {
   // Orchestrator ("brain") terminals — one per workspace, all calls carry the workspaceId.
@@ -26,7 +26,14 @@ export const IPC = {
   WORKER_STOP: "worker:stop",
   WORKER_UPDATE: "worker:update",
   WORKER_DELETE: "worker:delete",
+  WORKER_HANDOFF: "worker:handoff",
+  WORKER_HISTORY: "worker:history",
+  WORKER_DIFF: "worker:diff",
+  LAYOUT_GET: "layout:get",
+  LAYOUT_SAVE: "layout:save",
   MODELS_LIST: "models:list",
+  SQUADS_LIST: "squads:list",
+  SQUADS_APPLY: "squads:apply",
   NOTES_LIST: "notes:list",
   NOTE_READ: "note:read",
   NOTE_WRITE: "note:write",
@@ -48,7 +55,7 @@ export type Autonomy = "read" | "edit" | "full";
 
 /** New workers default to the active workspace's folder; there is no global default folder. */
 export interface WorkerDefaults {
-  provider: "claude" | "agy";
+  provider: Provider;
   /** Undefined = provider default. */
   model?: string;
   autonomy: Autonomy;
@@ -99,7 +106,7 @@ export interface WorkspaceCreatePayload {
 export interface WorkspaceUpdatePayload {
   workspaceId: string;
   name?: string;
-  /** Changing it restarts that workspace's orchestrator (Claude → Claude resumes its session; a provider change starts fresh). */
+  /** Changing it restarts that workspace's orchestrator (same provider resumes its session; a provider change starts fresh). */
   orchestrator?: OrchestratorConfig;
 }
 
@@ -113,18 +120,43 @@ export interface WorkerAskPayload {
 export interface WorkerSpawnPayload {
   workspaceId: string;
   name: string;
-  provider: "claude" | "agy";
+  provider: Provider;
   /** Defaults to the workspace folder when omitted. */
   cwd?: string;
   role: string;
   autonomy: Autonomy;
   model?: string;
+  /** Run the worker in its own git worktree (branch sinapse/<name>). */
+  worktree?: boolean;
+}
+
+export interface SquadApplyPayload {
+  workspaceId: string;
+  preset: string;
+  prefix?: string;
+  worktree?: boolean;
 }
 
 export interface WorkerUpdatePayload {
   workspaceId: string;
   agent: string;
-  model: string | null;
+  /** Only the fields present are changed; `model: null` resets to the provider default. */
+  model?: string | null;
+  autonomy?: Autonomy;
+  role?: string;
+  /** Replaces the worker's pinned notes. Omitted = unchanged. */
+  pinnedNotes?: string[];
+}
+
+export interface WorkerDiffResult {
+  ok: boolean;
+  /** Set when !ok (not a git repo, git missing, timeout...). */
+  error?: string;
+  /** `git status --porcelain` output. */
+  status: string;
+  /** `git diff HEAD` output plus a summary of untracked files; may be truncated. */
+  diff: string;
+  truncated: boolean;
 }
 
 export interface NoteWritePayload {
@@ -138,7 +170,26 @@ export interface BrainInfo {
   provider: "claude" | "agy";
   /** Requested model; null = provider default. */
   model: string | null;
-  /** Claude only (read from its transcript); AGY has no usage. */
+  /** Read from the active session transcript (Claude or AGY). */
   usage?: ContextUsage;
   running: boolean;
+}
+
+export interface NodeLayout {
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+}
+
+export interface ViewportLayout {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+/** Persisted per workspace in <sinapseDir>/layouts/<workspaceId>.json. Node ids: "brain", "worker-<id>", "note-<name>". */
+export interface CanvasLayout {
+  nodes: Record<string, NodeLayout>;
+  viewport?: ViewportLayout;
 }

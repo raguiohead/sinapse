@@ -7,30 +7,47 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { pathToFileURL } from "node:url";
-import { findCliBinDir, sinapseDir } from "../paths.js";
+import { findCliBinDir, sinapseDir, worktreesDir } from "../paths.js";
+import { createWorktree, GitError, removeWorktree } from "../git.js";
+import { loadSquadCatalog } from "../squads.js";
 import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { randomUUID } from "node:crypto";
 import type {
+  Adapter,
   AgentConfig,
+  AgentDeleteResult,
   AgentState,
+  AskResponse,
   Author,
   Autonomy,
+  CheckResponse,
   DaemonEvent,
   DaemonState,
+  HandoffOutcome,
+  HandoffResponse,
   ModelCatalog,
   ModelOption,
   Note,
   NoteSummary,
   OrchestratorConfig,
   Provider,
+  StopResponse,
+  SquadApplyResult,
+  SquadCatalog,
   TurnEvent,
+  TurnRecord,
   TurnResult,
+  WaitResponse,
+  WaitResult,
   Workspace,
+  WorktreeInfo,
 } from "../types.js";
 import { AUTHOR_HEADER, ENV, USER_AUTHOR } from "../routes.js";
 import { ClaudeAdapter } from "../adapters/claude.js";
 import { AgyAdapter } from "../adapters/agy.js";
+import { CodexAdapter } from "../adapters/codex.js";
 import { estimateContextWindow } from "../context.js";
+import { handoffPreamble, pinnedNotesPreamble, withPreamble, type PinnedNoteInput } from "../prompt.js";
 
 const WS_ID_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const NOTE_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -64,6 +81,95 @@ function getWorkspaceNotesDir(id: string): string {
   return path.join(getWorkspaceDir(id), "notes");
 }
 
+const MAX_HISTORY_TURNS = 50;
+const MAX_HISTORY_BYTES = 4 * 1024 * 1024;
+const MAX_EVENT_DATA_CHARS = 8000;
+
+function getAgentHistoryFile(workspaceId: string, agentId: string): string | undefined {
+  // agentId comes from state.json; re-validate so a tampered file can't point outside agents/.
+  if (!AUTHOR_REGEX.test(agentId)) return undefined;
+  return path.join(getWorkspaceDir(workspaceId), "agents", `${agentId}.jsonl`);
+}
+
+const historyQueues = new Map<string, Promise<void>>();
+
+function enqueueHistory(agentId: string, job: () => Promise<void>): Promise<void> {
+  const prev = historyQueues.get(agentId) ?? Promise.resolve();
+  const next = prev.catch(() => {}).then(job);
+  historyQueues.set(agentId, next);
+  next.catch(() => {}).then(() => {
+    if (historyQueues.get(agentId) === next) historyQueues.delete(agentId);
+  });
+  return next;
+}
+
+async function readHistoryFile(file: string): Promise<TurnRecord[]> {
+  let content: string;
+  try {
+    content = await fs.readFile(file, "utf-8");
+  } catch {
+    return [];
+  }
+  const records: TurnRecord[] = [];
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const rec = JSON.parse(line) as TurnRecord;
+      if (rec && typeof rec.turnId === "string" && Array.isArray(rec.events)) records.push(rec);
+    } catch {
+      // torn line from a crash mid-append: skip it
+    }
+  }
+  return records;
+}
+
+/** Appends one finished turn (crash-safe: a single appendFile) and compacts when over the turn/byte caps. */
+function appendTurnRecord(workspaceId: string, agentId: string, record: TurnRecord): Promise<void> {
+  return enqueueHistory(agentId, async () => {
+    if (!state.agents[agentId]) return; // worker removed while its turn was finishing
+    const file = getAgentHistoryFile(workspaceId, agentId);
+    if (!file) return;
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+    const safe: TurnRecord = {
+      ...record,
+      events: record.events.map((e) =>
+        e.data.length > MAX_EVENT_DATA_CHARS ? { ...e, data: e.data.slice(0, MAX_EVENT_DATA_CHARS) + "…" } : e
+      ),
+    };
+    await fs.appendFile(file, JSON.stringify(safe) + "\n", { encoding: "utf-8", mode: 0o600 });
+
+    const records = await readHistoryFile(file);
+    let kept = records.slice(-MAX_HISTORY_TURNS);
+    let bytes = kept.reduce((n, r) => n + JSON.stringify(r).length + 1, 0);
+    while (kept.length > 1 && bytes > MAX_HISTORY_BYTES) {
+      bytes -= JSON.stringify(kept[0]).length + 1;
+      kept = kept.slice(1);
+    }
+    if (kept.length < records.length) {
+      await writePrivate(file, kept.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    }
+  });
+}
+
+async function removeAgentHistory(workspaceId: string, agentId: string): Promise<void> {
+  await enqueueHistory(agentId, async () => {
+    const file = getAgentHistoryFile(workspaceId, agentId);
+    if (file) await fs.rm(file, { force: true });
+  }).catch(() => {});
+}
+
+async function hydrateRecentEvents(): Promise<void> {
+  for (const agent of Object.values(state.agents)) {
+    try {
+      const file = getAgentHistoryFile(agent.workspaceId, agent.id);
+      if (!file) continue;
+      const records = await readHistoryFile(file);
+      const last = records[records.length - 1];
+      if (last) agentRecentEvents.set(agent.id, last.events);
+    } catch {}
+  }
+}
+
 function validateModel(input: unknown): { valid: true; model?: string } | { valid: false } {
   if (input === undefined || input === null) {
     return { valid: true, model: undefined };
@@ -83,6 +189,96 @@ function validateModel(input: unknown): { valid: true; model?: string } | { vali
 
 function isValidNoteName(name: string): boolean {
   return NOTE_NAME_REGEX.test(name);
+}
+
+const MAX_PINNED_NOTES = 10;
+
+/** Validates a pinnedNotes list (null = none): trimmed, deduplicated, at most MAX_PINNED_NOTES. */
+function normalizePinnedNotes(input: unknown): { ok: true; notes: string[] } | { ok: false; error: string } {
+  if (input === null) return { ok: true, notes: [] };
+  if (!Array.isArray(input)) {
+    return { ok: false, error: "pinnedNotes deve ser uma lista de nomes de nota" };
+  }
+  const notes: string[] = [];
+  for (const raw of input) {
+    const name = typeof raw === "string" ? raw.trim() : "";
+    if (!isValidNoteName(name)) {
+      return { ok: false, error: `Nome de nota inválido: ${String(raw)} (use minúsculas, números, - e _)` };
+    }
+    if (!notes.includes(name)) notes.push(name);
+  }
+  if (notes.length > MAX_PINNED_NOTES) {
+    return { ok: false, error: `No máximo ${MAX_PINNED_NOTES} notas fixadas por worker` };
+  }
+  return { ok: true, notes };
+}
+
+async function missingNotes(workspaceId: string, names: string[]): Promise<string[]> {
+  const notesDir = getWorkspaceNotesDir(workspaceId);
+  const missing: string[] = [];
+  for (const name of names) {
+    const exists = await fs.stat(path.join(notesDir, `${name}.md`)).then(() => true).catch(() => false);
+    if (!exists) missing.push(name);
+  }
+  return missing;
+}
+
+/** Sets the agent's pinned notes, dropping the injection records of the notes no longer pinned. */
+function setPinnedNotes(agent: AgentState, notes: string[]): void {
+  if (notes.length === 0) {
+    delete agent.pinnedNotes;
+    delete agent.pinnedNoteSeen;
+    return;
+  }
+  agent.pinnedNotes = notes;
+  if (agent.pinnedNoteSeen) {
+    agent.pinnedNoteSeen = Object.fromEntries(
+      Object.entries(agent.pinnedNoteSeen).filter(([name]) => notes.includes(name))
+    );
+  }
+}
+
+/**
+ * Pinned-notes preamble for the next turn: full content on a fresh session or when the note changed since it was
+ * last injected, a reminder otherwise. `seen` is what pinnedNoteSeen becomes if the turn succeeds. Never throws.
+ */
+async function pinnedNotesForTurn(
+  agent: AgentState,
+  fresh: boolean
+): Promise<{ text?: string; seen: Record<string, number> } | undefined> {
+  const pinned = agent.pinnedNotes ?? [];
+  if (pinned.length === 0) return undefined;
+  try {
+    const previous: Record<string, number> = fresh ? {} : agent.pinnedNoteSeen ?? {};
+    const notesDir = getWorkspaceNotesDir(agent.workspaceId);
+    const inputs: PinnedNoteInput[] = [];
+    const mtimes: Record<string, number> = {};
+    for (const name of pinned) {
+      if (!isValidNoteName(name)) continue;
+      const filePath = path.join(notesDir, `${name}.md`);
+      try {
+        const stat = await fs.stat(filePath);
+        mtimes[name] = stat.mtimeMs;
+        if (previous[name] === stat.mtimeMs) {
+          inputs.push({ name });
+        } else {
+          inputs.push({ name, content: await fs.readFile(filePath, "utf-8") });
+        }
+      } catch {
+        // The pinned note no longer exists: skip it.
+      }
+    }
+    const { text, delivered } = pinnedNotesPreamble(inputs);
+    const seen: Record<string, number> = {};
+    for (const input of inputs) {
+      // Notes left out by the total cap stay unseen, so a later turn delivers them.
+      if (input.content === undefined || delivered.includes(input.name)) seen[input.name] = mtimes[input.name];
+    }
+    return { text, seen };
+  } catch (err) {
+    console.error("Falha ao montar as notas fixadas:", err);
+    return undefined;
+  }
 }
 
 function extractTitle(name: string, content: string): string {
@@ -193,11 +389,56 @@ async function writeNoteAtomic(
   };
 }
 
+/** Writes the note and records `author` as its creator (new note) or a contributor (existing note). */
+async function saveNote(
+  workspaceId: string,
+  name: string,
+  content: string,
+  author: Author
+): Promise<NoteSummary> {
+  const filePath = path.join(getWorkspaceNotesDir(workspaceId), `${name}.md`);
+  const exists = await fs.stat(filePath).then(() => true).catch(() => false);
+  const { stat, title } = await writeNoteAtomic(workspaceId, name, content);
+
+  const meta = await getNotesMeta(workspaceId);
+  if (!exists) {
+    meta[name] = { createdBy: author, contributors: [] };
+  } else {
+    if (!meta[name]) {
+      meta[name] = { contributors: [] };
+    }
+    if (author !== meta[name].createdBy && !meta[name].contributors.includes(author)) {
+      meta[name].contributors.push(author);
+    }
+  }
+  await saveNotesMeta(workspaceId, meta);
+
+  return {
+    workspaceId,
+    name,
+    title,
+    updatedAt: stat.mtimeMs,
+    createdBy: meta[name].createdBy,
+    contributors: meta[name].contributors,
+  };
+}
+
 const CLAUDE_MODELS: ModelOption[] = [
   { id: "fable", label: "Fable (mais recente)" },
   { id: "opus", label: "Opus" },
   { id: "sonnet", label: "Sonnet" },
   { id: "haiku", label: "Haiku" },
+];
+
+const CODEX_MODELS: ModelOption[] = [
+  { id: "gpt-5.3-codex", label: "GPT-5.3 Codex (mais recente)" },
+  { id: "gpt-5.2-codex", label: "GPT-5.2 Codex" },
+  { id: "gpt-5.1-codex-max", label: "GPT-5.1 Codex Max" },
+  { id: "gpt-5.1-codex-mini", label: "GPT-5.1 Codex Mini" },
+  { id: "gpt-5-codex", label: "GPT-5 Codex" },
+  { id: "o3", label: "o3" },
+  { id: "o4-mini", label: "o4-mini" },
+  { id: "codex-mini-latest", label: "Codex Mini" },
 ];
 
 const FALLBACK_AGY_MODELS: ModelOption[] = [
@@ -335,10 +576,39 @@ function setupNotesWatcher(): () => void {
 
 interface ActiveTurnSession {
   turnId: string;
-  adapter: ClaudeAdapter | AgyAdapter;
+  adapter: Adapter;
   events: TurnEvent[];
   stopped: boolean;
+  /** Don't start the next queued prompt when this turn ends (a handoff resets the session first). */
+  holdQueue: boolean;
+  prompt: string;
+  startedAt: number;
 }
+
+interface QueuedTurn {
+  turnId: string;
+  prompt: string;
+}
+
+const HANDOFF_PROMPT_SECTIONS = [
+  "## Objetivo",
+  "## Estado atual",
+  "## Decisões (e por quê)",
+  "## Arquivos relevantes (caminhos absolutos e o que mudou em cada um)",
+  "## Pendências e próximos passos",
+];
+
+function handoffPrompt(agentName: string): string {
+  return `O Sinapse vai encerrar esta sessão e abrir uma nova para você, porque o contexto está cheio. Escreva agora um handoff para o seu eu futuro, que não verá esta conversa.
+
+Responda SOMENTE com o markdown abaixo, sem usar ferramentas e sem escrever arquivos. Seja específico e completo; prefira listas.
+
+# Handoff — ${agentName}
+${HANDOFF_PROMPT_SECTIONS.join("\n")}`;
+}
+
+/** Wait (long-poll) requests are capped so no HTTP client timeout fires; the CLI re-issues them until its own deadline. */
+const WAIT_MAX_MS = 60_000;
 
 const state: DaemonState = {
   workspaces: {},
@@ -349,10 +619,48 @@ const state: DaemonState = {
 
 const activeTurns = new Map<string, ActiveTurnSession>();
 const agentRecentEvents = new Map<string, TurnEvent[]>();
+/** Prompts asked with queue: true while the worker was busy; in memory only (lost when the daemon restarts). */
+const turnQueues = new Map<string, QueuedTurn[]>();
+const handoffsInProgress = new Set<string>();
+const lastHandoffs = new Map<string, HandoffOutcome>();
+/** Re-evaluated by pending wait requests whenever a turn ends, a queue changes or a handoff finishes. */
+const turnWaiters = new Set<() => void>();
 const subscribers = new Set<(event: DaemonEvent) => void>();
 
 function broadcast(event: DaemonEvent): void {
   for (const send of subscribers) send(event);
+}
+
+function notifyWaiters(): void {
+  for (const check of [...turnWaiters]) check();
+}
+
+function queueLength(agentId: string): number {
+  return turnQueues.get(agentId)?.length ?? 0;
+}
+
+function clearQueue(agentId: string): number {
+  const cleared = queueLength(agentId);
+  turnQueues.delete(agentId);
+  return cleared;
+}
+
+/** Thinking, with prompts waiting, or between the handoff turn and the session reset. */
+function isBusy(agent: AgentState): boolean {
+  return agent.status === "thinking" || handoffsInProgress.has(agent.id) || queueLength(agent.id) > 0;
+}
+
+/** Claude emits whole text blocks (one per message); AGY emits deltas. */
+function turnText(agent: AgentState, events: TurnEvent[]): string {
+  const separator = agent.provider === "agy" ? "" : "\n\n";
+  return events
+    .filter((e) => e.type === "text")
+    .map((e) => e.data)
+    .join(separator);
+}
+
+function isCurrentAgent(agent: AgentState): boolean {
+  return state.agents[agent.id] === agent;
 }
 
 function findWorkspace(idOrName: string): Workspace | undefined {
@@ -493,10 +801,12 @@ async function writeDaemonFile(port: number, token: string): Promise<void> {
   await writePrivate(getDaemonFile(), JSON.stringify({ port, token, pid: process.pid }, null, 2));
 }
 
-function createAdapter(provider: Provider): ClaudeAdapter | AgyAdapter {
+function createAdapter(provider: Provider): Adapter {
   switch (provider) {
     case "claude":
       return new ClaudeAdapter();
+    case "codex":
+      return new CodexAdapter();
     case "agy":
       return new AgyAdapter();
     default:
@@ -510,17 +820,28 @@ async function executeTurn(
   prompt: string,
   session: ActiveTurnSession,
   onEvent?: (event: TurnEvent) => void
-): Promise<void> {
+): Promise<TurnResult | undefined> {
   const adapter = session.adapter;
   let turnResult: TurnResult | undefined;
 
   try {
+    const fresh = !agent.sessionId;
+    // Only handoffs hold the queue; their summary turn doesn't need the pinned notes.
+    const pins = session.holdQueue ? undefined : await pinnedNotesForTurn(agent, fresh);
+    if (session.stopped) return undefined;
+    // After a handoff the session is fresh: the first turn starts by reading the handoff note.
+    const fullPrompt = withPreamble(prompt, [
+      agent.handoffNote && fresh ? handoffPreamble(agent.handoffNote) : undefined,
+      pins?.text,
+    ]);
+
     const gen = adapter.runTurn({
-      prompt,
+      prompt: fullPrompt,
       cwd: agent.cwd,
       sessionId: agent.sessionId,
       autonomy: agent.autonomy,
       model: agent.model,
+      role: agent.role,
       env: {
         [ENV.workspace]: agent.workspaceId,
         [ENV.agentId]: agent.id,
@@ -555,6 +876,16 @@ async function executeTurn(
       agent.status = "done";
       if (turnResult?.sessionId) {
         agent.sessionId = turnResult.sessionId;
+        delete agent.handoffNote;
+      }
+      if (pins) {
+        // Notes pinned or unpinned during the turn: the new ones get injected next time.
+        const pinned = agent.pinnedNotes ?? [];
+        agent.pinnedNoteSeen = Object.fromEntries(
+          Object.entries(pins.seen).filter(([name]) => pinned.includes(name))
+        );
+      } else if (!agent.pinnedNotes?.length) {
+        delete agent.pinnedNoteSeen;
       }
       if (turnResult?.usage) {
         agent.usage = turnResult.usage;
@@ -576,9 +907,22 @@ async function executeTurn(
       }
     }
   } finally {
-    agent.currentTurnId = undefined;
-    agentRecentEvents.set(agent.id, [...session.events]);
-    activeTurns.delete(agent.id);
+    // A stopped turn was already detached by stop/delete, and a newer turn may own the slot by now.
+    const isCurrent = activeTurns.get(agent.id) === session;
+    if (isCurrent) {
+      agent.currentTurnId = undefined;
+      agentRecentEvents.set(agent.id, [...session.events]);
+      activeTurns.delete(agent.id);
+    }
+    await appendTurnRecord(agent.workspaceId, agent.id, {
+      turnId,
+      prompt: session.prompt,
+      startedAt: session.startedAt,
+      finishedAt: Date.now(),
+      status: session.stopped ? "interrupted" : agent.status === "error" ? "error" : "done",
+      ...(agent.lastError && !session.stopped ? { error: agent.lastError } : {}),
+      events: session.events,
+    }).catch((err) => console.error("Falha ao gravar histórico do turno:", err));
     broadcast({
       kind: "turn_finished",
       workspaceId: agent.workspaceId,
@@ -590,8 +934,223 @@ async function executeTurn(
       error: agent.lastError,
       usage: turnResult?.usage,
     });
+    if (isCurrent && !session.holdQueue) {
+      drainQueue(agent);
+    }
+    notifyWaiters();
     await saveState();
   }
+  return turnResult;
+}
+
+/** Marks the agent busy, announces the turn and runs it. Throws (before any state change) for unsupported providers. */
+function startTurn(
+  agent: AgentState,
+  prompt: string,
+  options: { turnId?: string; onEvent?: (event: TurnEvent) => void; holdQueue?: boolean } = {}
+): { turnId: string; done: Promise<TurnResult | undefined> } {
+  const adapter = createAdapter(agent.provider);
+  const turnId = options.turnId ?? nanoid();
+  agent.status = "thinking";
+  agent.currentTurnId = turnId;
+  agent.lastError = undefined;
+
+  const session: ActiveTurnSession = {
+    turnId,
+    adapter,
+    events: [],
+    stopped: false,
+    holdQueue: options.holdQueue ?? false,
+    prompt,
+    startedAt: Date.now(),
+  };
+  activeTurns.set(agent.id, session);
+  saveState().catch(console.error);
+  broadcast({
+    kind: "turn_started",
+    workspaceId: agent.workspaceId,
+    agentId: agent.id,
+    agentName: agent.name,
+    turnId,
+    prompt,
+  });
+
+  return { turnId, done: executeTurn(agent, turnId, prompt, session, options.onEvent) };
+}
+
+/** Starts the next queued prompt, if the agent still exists and is free. */
+function drainQueue(agent: AgentState): void {
+  if (!isCurrentAgent(agent) || activeTurns.has(agent.id) || handoffsInProgress.has(agent.id)) {
+    return;
+  }
+  const queue = turnQueues.get(agent.id);
+  const next = queue?.shift();
+  if (queue && queue.length === 0) {
+    turnQueues.delete(agent.id);
+  }
+  if (!next) return;
+
+  try {
+    startTurn(agent, next.prompt, { turnId: next.turnId }).done.catch(console.error);
+  } catch (err: any) {
+    // The provider can't run turns at all, so the rest of the queue would fail the same way.
+    const dropped = clearQueue(agent.id);
+    agent.status = "error";
+    agent.lastError = `Fila descartada (${dropped + 1} prompt(s)): ${err?.message || String(err)}`;
+    broadcast({ kind: "agent_updated", workspaceId: agent.workspaceId, agent });
+    saveState().catch(console.error);
+  }
+}
+
+/** Second half of a handoff: saves the summary as a note and resets the session, then releases the queue. */
+async function finishHandoff(
+  agent: AgentState,
+  turnId: string,
+  note: string,
+  done: Promise<TurnResult | undefined>
+): Promise<void> {
+  let outcome: HandoffOutcome = { turnId, note, ok: false, finishedAt: 0 };
+  try {
+    const result = await done;
+    if (!isCurrentAgent(agent)) return;
+    if (agent.status !== "done") {
+      // executeTurn already recorded the error or the interruption.
+      outcome.error = agent.lastError ?? `turno terminou com status ${agent.status}`;
+      return;
+    }
+
+    const text = result?.text?.trim() || turnText(agent, agentRecentEvents.get(agent.id) ?? []).trim();
+    if (!text) {
+      throw new Error("o worker não devolveu o resumo");
+    }
+    const content = `${text.startsWith("# ") ? text : `# Handoff — ${agent.name}\n\n${text}`}\n`;
+    if (Buffer.byteLength(content, "utf-8") > 1024 * 1024) {
+      throw new Error("o resumo excede o limite de 1 MB de uma nota");
+    }
+
+    const summary = await saveNote(agent.workspaceId, note, content, agent.id);
+    broadcast({ kind: "note_changed", workspaceId: agent.workspaceId, note: summary, by: agent.id });
+
+    // Keeps name, role, model, autonomy and cwd; only the conversation goes away.
+    delete agent.sessionId;
+    delete agent.usage;
+    delete agent.pinnedNoteSeen;
+    agent.handoffNote = note;
+    outcome = { ...outcome, ok: true };
+  } catch (err: any) {
+    outcome.error = err?.message || String(err);
+    if (isCurrentAgent(agent)) {
+      agent.status = "error";
+      agent.lastError = `Handoff falhou: ${outcome.error}`;
+    }
+  } finally {
+    handoffsInProgress.delete(agent.id);
+    if (isCurrentAgent(agent)) {
+      lastHandoffs.set(agent.id, { ...outcome, finishedAt: Date.now() });
+      broadcast({ kind: "agent_updated", workspaceId: agent.workspaceId, agent });
+      drainQueue(agent);
+    }
+    notifyWaiters();
+    await saveState().catch(console.error);
+  }
+}
+
+function handoffNoteName(agent: AgentState): string {
+  const slug = slugifyWorkspaceName(agent.name) || agent.id.toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  return `handoff-${slug}`.slice(0, 64).replace(/[-_]+$/, "");
+}
+
+function waitResult(agentId: string, name: string): WaitResult {
+  const agent = state.agents[agentId];
+  if (!agent) {
+    return { agentId, name, status: "removed", busy: false, queued: 0, text: "" };
+  }
+  const busy = isBusy(agent);
+  return {
+    agentId,
+    name: agent.name,
+    status: agent.status,
+    busy,
+    queued: queueLength(agent.id),
+    usage: agent.usage,
+    text: busy ? "" : turnText(agent, agentRecentEvents.get(agent.id) ?? []),
+    lastError: agent.lastError,
+  };
+}
+
+type SpawnResult = { ok: true; agent: AgentState } | { ok: false; status: number; error: string };
+
+async function spawnAgent(
+  ws: Workspace,
+  input: Partial<AgentConfig>,
+  author: Author,
+  isolate: boolean
+): Promise<SpawnResult> {
+  if (input.provider !== "claude" && input.provider !== "agy" && input.provider !== "codex") {
+    return { ok: false, status: 400, error: `Invalid provider: ${input.provider}` };
+  }
+  const modelVal = validateModel(input.model);
+  if (!modelVal.valid) {
+    return { ok: false, status: 400, error: "Invalid model format" };
+  }
+  const name = input.name as string;
+  if (Object.values(state.agents).some((a) => a.workspaceId === ws.id && a.name === name)) {
+    return {
+      ok: false,
+      status: 409,
+      error: `Agent with name "${name}" already exists in workspace "${ws.name}"`,
+    };
+  }
+
+  let pinnedNotes: string[] = [];
+  if (input.pinnedNotes !== undefined) {
+    const pins = normalizePinnedNotes(input.pinnedNotes);
+    if (!pins.ok) {
+      return { ok: false, status: 400, error: pins.error };
+    }
+    const missing = await missingNotes(ws.id, pins.notes);
+    if (missing.length > 0) {
+      return { ok: false, status: 404, error: `Nota não encontrada: ${missing.join(", ")}` };
+    }
+    pinnedNotes = pins.notes;
+  }
+
+  let cwd = input.cwd && typeof input.cwd === "string" && input.cwd.trim()
+    ? path.resolve(input.cwd.trim())
+    : ws.folder;
+
+  let worktree: WorktreeInfo | undefined;
+  if (isolate) {
+    try {
+      const created = await createWorktree(cwd, name, worktreesDir(ws.id));
+      worktree = created.info;
+      cwd = created.cwd;
+    } catch (err: any) {
+      const status = err instanceof GitError ? 409 : 500;
+      return { ok: false, status, error: err?.message ?? String(err) };
+    }
+  }
+
+  const agentId = nanoid(8);
+  const newAgent: AgentState = {
+    id: agentId,
+    workspaceId: ws.id,
+    name,
+    provider: input.provider,
+    cwd,
+    role: input.role as string,
+    autonomy: input.autonomy as Autonomy,
+    status: "idle",
+    createdBy: author,
+    ...(modelVal.model ? { model: modelVal.model } : {}),
+    ...(worktree ? { worktree } : {}),
+    ...(pinnedNotes.length > 0 ? { pinnedNotes } : {}),
+  };
+
+  state.agents[agentId] = newAgent;
+  await saveState();
+  broadcast({ kind: "agent_spawned", workspaceId: ws.id, agent: newAgent });
+  return { ok: true, agent: newAgent };
 }
 
 export async function start(
@@ -609,6 +1168,7 @@ export async function start(
   state.token = loaded.token || nanoid();
 
   await runMigration();
+  await hydrateRecentEvents();
 
   const fastify = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024, forceCloseConnections: true });
 
@@ -669,6 +1229,7 @@ export async function start(
     const agy = await fetchAgyModels();
     return {
       claude: CLAUDE_MODELS,
+      codex: CODEX_MODELS,
       agy,
     };
   });
@@ -822,6 +1383,8 @@ export async function start(
 
     const wsAgents = Object.values(state.agents).filter((a) => a.workspaceId === ws.id);
     for (const a of wsAgents) {
+      clearQueue(a.id);
+      lastHandoffs.delete(a.id);
       const session = activeTurns.get(a.id);
       if (session) {
         session.stopped = true;
@@ -832,6 +1395,7 @@ export async function start(
       }
       delete state.agents[a.id];
       agentRecentEvents.delete(a.id);
+      await removeAgentHistory(ws.id, a.id);
       broadcast({ kind: "agent_deleted", workspaceId: ws.id, agentId: a.id, agentName: a.name });
     }
 
@@ -848,6 +1412,7 @@ export async function start(
 
     await saveState();
     broadcast({ kind: "workspace_deleted", workspaceId: ws.id });
+    notifyWaiters();
 
     return { ok: true };
   });
@@ -869,7 +1434,7 @@ export async function start(
       return reply.status(404).send({ error: "Workspace não encontrado" });
     }
 
-    const body = request.body as Partial<AgentConfig> | undefined;
+    const body = request.body as (Partial<AgentConfig> & { worktree?: unknown }) | undefined;
     if (
       !body ||
       !body.name ||
@@ -882,48 +1447,53 @@ export async function start(
       });
     }
 
-    if (body.provider !== "claude" && body.provider !== "agy" && body.provider !== "codex") {
-      return reply.status(400).send({ error: `Invalid provider: ${body.provider}` });
+    const result = await spawnAgent(ws, body, getAuthor(request), body.worktree === true);
+    if (!result.ok) {
+      return reply.status(result.status).send({ error: result.error });
     }
+    return reply.status(201).send(result.agent);
+  });
 
-    const modelVal = validateModel(body.model);
-    if (!modelVal.valid) {
-      return reply.status(400).send({ error: "Invalid model format" });
+  fastify.get("/squads", async (): Promise<SquadCatalog> => loadSquadCatalog());
+
+  fastify.post("/workspaces/:ws/squads/apply", async (request, reply) => {
+    const { ws: wsParam } = request.params as { ws: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
     }
-
-    const existing = Object.values(state.agents).find(
-      (a) => a.workspaceId === ws.id && a.name === body.name
-    );
-    if (existing) {
-      return reply.status(409).send({
-        error: `Agent with name "${body.name}" already exists in workspace "${ws.name}"`,
+    const body = request.body as { preset?: unknown; prefix?: unknown; worktree?: unknown } | undefined;
+    if (!body || typeof body.preset !== "string" || !body.preset.trim()) {
+      return reply.status(400).send({ error: "preset é obrigatório" });
+    }
+    const catalog = await loadSquadCatalog();
+    const preset = catalog.presets.find((p) => p.name === body.preset);
+    if (!preset) {
+      return reply.status(404).send({
+        error: `Preset "${body.preset}" não encontrado (disponíveis: ${catalog.presets.map((p) => p.name).join(", ")})`,
       });
     }
-
-    const cwd = body.cwd && typeof body.cwd === "string" && body.cwd.trim()
-      ? path.resolve(body.cwd.trim())
-      : ws.folder;
+    let prefix = preset.name;
+    if (body.prefix !== undefined && body.prefix !== null && body.prefix !== "") {
+      if (typeof body.prefix !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(body.prefix)) {
+        return reply.status(400).send({ error: 'prefix inválido (use letras, números, ".", "_" e "-")' });
+      }
+      prefix = body.prefix;
+    }
 
     const author = getAuthor(request);
-    const agentId = nanoid(8);
-    const newAgent: AgentState = {
-      id: agentId,
-      workspaceId: ws.id,
-      name: body.name,
-      provider: body.provider,
-      cwd,
-      role: body.role,
-      autonomy: body.autonomy,
-      status: "idle",
-      createdBy: author,
-      ...(modelVal.model ? { model: modelVal.model } : {}),
-    };
-
-    state.agents[agentId] = newAgent;
-    await saveState();
-    broadcast({ kind: "agent_spawned", workspaceId: ws.id, agent: newAgent });
-
-    return reply.status(201).send(newAgent);
+    const result: SquadApplyResult = { preset: preset.name, created: [], skipped: [], failed: [] };
+    for (const member of preset.members) {
+      const name = `${prefix}-${member.name}`;
+      if (Object.values(state.agents).some((a) => a.workspaceId === ws.id && a.name === name)) {
+        result.skipped.push({ name, reason: "já existe" });
+        continue;
+      }
+      const spawned = await spawnAgent(ws, { ...member, name }, author, body.worktree === true);
+      if (spawned.ok) result.created.push(spawned.agent);
+      else result.failed.push({ name, error: spawned.error });
+    }
+    return result;
   });
 
   fastify.patch("/workspaces/:ws/agents/:agent", async (request, reply) => {
@@ -937,18 +1507,35 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
-    if (agent.status === "thinking") {
-      return reply.status(409).send({ error: "Agent is currently busy (status is thinking)" });
-    }
-
     const body = request.body as {
       model?: string | null;
       role?: string;
       autonomy?: Autonomy;
+      pinnedNotes?: unknown;
     } | undefined;
 
     if (!body || typeof body !== "object") {
       return reply.status(400).send({ error: "Invalid request body" });
+    }
+
+    // Pinned notes only take effect on the next turn, so they can change while the worker thinks.
+    const onlyPins = Object.keys(body).every((key) => key === "pinnedNotes");
+    if (agent.status === "thinking" && !onlyPins) {
+      return reply.status(409).send({ error: "Agent is currently busy (status is thinking)" });
+    }
+
+    let pinnedNotes: string[] | undefined;
+    if (body.pinnedNotes !== undefined) {
+      const pins = normalizePinnedNotes(body.pinnedNotes);
+      if (!pins.ok) {
+        return reply.status(400).send({ error: pins.error });
+      }
+      const added = pins.notes.filter((n) => !agent.pinnedNotes?.includes(n));
+      const missing = await missingNotes(ws.id, added);
+      if (missing.length > 0) {
+        return reply.status(404).send({ error: `Nota não encontrada: ${missing.join(", ")}` });
+      }
+      pinnedNotes = pins.notes;
     }
 
     if (body.role !== undefined) {
@@ -986,6 +1573,10 @@ export async function start(
       }
     }
 
+    if (pinnedNotes) {
+      setPinnedNotes(agent, pinnedNotes);
+    }
+
     await saveState();
     broadcast({ kind: "agent_updated", workspaceId: ws.id, agent });
     return agent;
@@ -1002,47 +1593,40 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
-    const body = request.body as { prompt?: string; async?: boolean } | undefined;
+    const body = request.body as { prompt?: string; async?: boolean; queue?: boolean } | undefined;
     if (!body || typeof body.prompt !== "string" || !body.prompt.trim()) {
       return reply.status(400).send({ error: "Prompt is required" });
     }
+    const prompt = body.prompt;
+    const queue = body.queue === true;
 
-    if (agent.status === "thinking") {
-      return reply.status(409).send({ error: "Agent is currently busy (queue limit of 1)" });
+    if (isBusy(agent)) {
+      if (!queue) {
+        return reply.status(409).send({
+          error: "Agent is currently busy (use queue: true / --queue to enqueue)",
+        });
+      }
+      const turnId = nanoid();
+      const pending = turnQueues.get(agent.id) ?? [];
+      pending.push({ turnId, prompt });
+      turnQueues.set(agent.id, pending);
+      const queued: AskResponse = { turnId, status: "queued", position: pending.length };
+      return reply.status(202).send(queued);
     }
 
-    let adapter: ClaudeAdapter | AgyAdapter;
+    let turn: { turnId: string; done: Promise<TurnResult | undefined> };
     try {
-      adapter = createAdapter(agent.provider);
+      turn = startTurn(agent, prompt, {
+        onEvent: body.async || queue ? undefined : (event) => reply.raw.write(JSON.stringify(event) + "\n"),
+      });
     } catch (err: any) {
       return reply.status(400).send({ error: err.message });
     }
 
-    const turnId = nanoid();
-    agent.status = "thinking";
-    agent.currentTurnId = turnId;
-    agent.lastError = undefined;
-    await saveState();
-
-    const session: ActiveTurnSession = {
-      turnId,
-      adapter,
-      events: [],
-      stopped: false,
-    };
-    activeTurns.set(agent.id, session);
-    broadcast({
-      kind: "turn_started",
-      workspaceId: ws.id,
-      agentId: agent.id,
-      agentName: agent.name,
-      turnId,
-      prompt: body.prompt,
-    });
-
-    if (body.async) {
-      executeTurn(agent, turnId, body.prompt, session).catch(console.error);
-      return reply.status(202).send({ turnId });
+    if (body.async || queue) {
+      turn.done.catch(console.error);
+      const started: AskResponse = { turnId: turn.turnId, status: "started" };
+      return reply.status(202).send(started);
     }
 
     reply.raw.writeHead(200, {
@@ -1052,11 +1636,8 @@ export async function start(
       "Connection": "keep-alive",
     });
 
-    const onEvent = (event: TurnEvent) => {
-      reply.raw.write(JSON.stringify(event) + "\n");
-    };
-
-    await executeTurn(agent, turnId, body.prompt, session, onEvent);
+    // Events only arrive after the adapter's first await, so the head above is always written before them.
+    await turn.done;
     reply.raw.end();
   });
 
@@ -1074,7 +1655,7 @@ export async function start(
     const session = activeTurns.get(agent.id);
     const events = session ? session.events : agentRecentEvents.get(agent.id) ?? [];
 
-    return {
+    const check: CheckResponse = {
       agentId: agent.id,
       name: agent.name,
       status: agent.status,
@@ -1082,8 +1663,136 @@ export async function start(
       usage: agent.usage,
       turnId: agent.currentTurnId,
       events,
+      text: turnText(agent, events),
+      queued: queueLength(agent.id),
       lastError: agent.lastError,
+      handoffNote: agent.handoffNote,
+      lastHandoff: lastHandoffs.get(agent.id),
+      ...(agent.pinnedNotes?.length ? { pinnedNotes: agent.pinnedNotes } : {}),
     };
+    return check;
+  });
+
+  fastify.post("/workspaces/:ws/agents/:agent/handoff", async (request, reply) => {
+    const { ws: wsParam, agent: agentParam } = request.params as { ws: string; agent: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
+    }
+    const agent = findAgentInWorkspace(ws, agentParam);
+    if (!agent) {
+      return reply.status(404).send({ error: "Worker não encontrado" });
+    }
+
+    const body = request.body as { note?: unknown } | undefined;
+    let note = handoffNoteName(agent);
+    if (body && body.note !== undefined && body.note !== null && body.note !== "") {
+      if (typeof body.note !== "string" || !isValidNoteName(body.note.trim())) {
+        return reply.status(400).send({ error: "Nome da nota inválido (use minúsculas, números, - e _)" });
+      }
+      note = body.note.trim();
+    }
+
+    if (isBusy(agent)) {
+      return reply.status(409).send({ error: "Worker ocupado: espere o turno (e a fila) terminar antes do handoff" });
+    }
+    if (!agent.sessionId) {
+      return reply.status(409).send({ error: "Worker não tem sessão para resumir" });
+    }
+
+    let turn: { turnId: string; done: Promise<TurnResult | undefined> };
+    try {
+      turn = startTurn(agent, handoffPrompt(agent.name), { holdQueue: true });
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
+    }
+    handoffsInProgress.add(agent.id);
+    finishHandoff(agent, turn.turnId, note, turn.done).catch(console.error);
+
+    const response: HandoffResponse = { turnId: turn.turnId, note };
+    return reply.status(202).send(response);
+  });
+
+  fastify.post("/workspaces/:ws/wait", async (request, reply) => {
+    const { ws: wsParam } = request.params as { ws: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
+    }
+
+    const body = request.body as { agents?: unknown; any?: unknown; timeoutMs?: unknown } | undefined;
+    if (!body || !Array.isArray(body.agents) || body.agents.length === 0) {
+      return reply.status(400).send({ error: "Informe ao menos um worker em agents" });
+    }
+    const targets: Array<{ id: string; name: string }> = [];
+    for (const ref of body.agents) {
+      if (typeof ref !== "string" || !ref.trim()) {
+        return reply.status(400).send({ error: "agents deve conter ids ou nomes de workers" });
+      }
+      const agent = findAgentInWorkspace(ws, ref.trim());
+      if (!agent) {
+        return reply.status(404).send({ error: `Worker não encontrado: ${ref}` });
+      }
+      if (!targets.some((t) => t.id === agent.id)) {
+        targets.push({ id: agent.id, name: agent.name });
+      }
+    }
+
+    const any = body.any === true;
+    const requested = typeof body.timeoutMs === "number" && Number.isFinite(body.timeoutMs) ? body.timeoutMs : WAIT_MAX_MS;
+    const timeoutMs = Math.min(Math.max(0, requested), WAIT_MAX_MS);
+
+    const settled = (id: string) => {
+      const agent = state.agents[id];
+      return !agent || !isBusy(agent);
+    };
+    const satisfied = () => (any ? targets.some((t) => settled(t.id)) : targets.every((t) => settled(t.id)));
+
+    if (!satisfied() && timeoutMs > 0) {
+      await new Promise<void>((resolve) => {
+        let timer: NodeJS.Timeout | undefined;
+        const finish = () => {
+          if (timer) clearTimeout(timer);
+          turnWaiters.delete(check);
+          reply.raw.off("close", finish);
+          resolve();
+        };
+        const check = () => {
+          if (satisfied()) finish();
+        };
+        timer = setTimeout(finish, timeoutMs);
+        turnWaiters.add(check);
+        // The client gave up (Ctrl+C): stop waiting.
+        reply.raw.once("close", finish);
+      });
+    }
+
+    const response: WaitResponse = {
+      done: satisfied(),
+      results: targets.map((t) => waitResult(t.id, t.name)),
+    };
+    return response;
+  });
+
+  fastify.get("/workspaces/:ws/agents/:agent/history", async (request, reply) => {
+    const { ws: wsParam, agent: agentParam } = request.params as { ws: string; agent: string };
+    const ws = findWorkspace(wsParam);
+    if (!ws) {
+      return reply.status(404).send({ error: "Workspace não encontrado" });
+    }
+    const agent = findAgentInWorkspace(ws, agentParam);
+    if (!agent) {
+      return reply.status(404).send({ error: "Worker não encontrado" });
+    }
+
+    const raw = Number((request.query as { limit?: string }).limit);
+    const limit = Number.isFinite(raw) && raw >= 1 ? Math.min(Math.floor(raw), MAX_HISTORY_TURNS) : 10;
+    const file = getAgentHistoryFile(ws.id, agent.id);
+    if (!file) return [];
+    // Wait for any in-flight append so a just-finished turn is visible.
+    await (historyQueues.get(agent.id) ?? Promise.resolve()).catch(() => {});
+    const records = await readHistoryFile(file);
+    return records.slice(-limit);
   });
 
   fastify.post("/workspaces/:ws/agents/:agent/stop", async (request, reply) => {
@@ -1097,6 +1806,8 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
+    // Clear first so the ending turn doesn't start the next queued prompt.
+    const clearedQueue = clearQueue(agent.id);
     const session = activeTurns.get(agent.id);
     if (session) {
       session.stopped = true;
@@ -1110,8 +1821,15 @@ export async function start(
     agent.status = "interrupted";
     agent.currentTurnId = undefined;
     await saveState();
+    notifyWaiters();
 
-    return { ok: true, status: agent.status };
+    const response: StopResponse = {
+      ok: true,
+      status: agent.status,
+      interrupted: Boolean(session),
+      clearedQueue,
+    };
+    return response;
   });
 
   fastify.delete("/workspaces/:ws/agents/:agent", async (request, reply) => {
@@ -1125,6 +1843,7 @@ export async function start(
       return reply.status(404).send({ error: "Worker não encontrado" });
     }
 
+    clearQueue(agent.id);
     const session = activeTurns.get(agent.id);
     if (session) {
       session.stopped = true;
@@ -1134,12 +1853,27 @@ export async function start(
       activeTurns.delete(agent.id);
     }
 
+    const force = ["1", "true"].includes(String((request.query as Record<string, unknown>)?.force ?? ""));
+    const result: AgentDeleteResult = { ok: true };
+    if (agent.worktree) {
+      const cleanup = await removeWorktree(agent.worktree, force);
+      result.worktree = {
+        action: cleanup.action,
+        path: agent.worktree.path,
+        branch: agent.worktree.branch,
+        ...(cleanup.reason ? { reason: cleanup.reason } : {}),
+      };
+    }
+
     delete state.agents[agent.id];
     agentRecentEvents.delete(agent.id);
+    lastHandoffs.delete(agent.id);
+    await removeAgentHistory(agent.workspaceId, agent.id);
     await saveState();
     broadcast({ kind: "agent_deleted", workspaceId: ws.id, agentId: agent.id, agentName: agent.name });
+    notifyWaiters();
 
-    return { ok: true };
+    return result;
   });
 
   // Notes routes under workspace
@@ -1233,38 +1967,8 @@ export async function start(
       return reply.status(413).send({ error: "Conteúdo excede o limite de 1 MB" });
     }
 
-    const filePath = path.join(getWorkspaceNotesDir(ws.id), `${name}.md`);
-    let exists = false;
-    try {
-      await fs.stat(filePath);
-      exists = true;
-    } catch {}
-
     const author = getAuthor(request);
-    const { stat, title } = await writeNoteAtomic(ws.id, name, body.content);
-
-    const meta = await getNotesMeta(ws.id);
-    if (!exists) {
-      meta[name] = { createdBy: author, contributors: [] };
-    } else {
-      if (!meta[name]) {
-        meta[name] = { contributors: [] };
-      }
-      if (author !== meta[name].createdBy && !meta[name].contributors.includes(author)) {
-        meta[name].contributors.push(author);
-      }
-    }
-    await saveNotesMeta(ws.id, meta);
-
-    const summary: NoteSummary = {
-      workspaceId: ws.id,
-      name,
-      title,
-      updatedAt: stat.mtimeMs,
-      createdBy: meta[name].createdBy,
-      contributors: meta[name].contributors,
-    };
-
+    const summary = await saveNote(ws.id, name, body.content, author);
     broadcast({ kind: "note_changed", workspaceId: ws.id, note: summary, by: author });
     return summary;
   });
@@ -1285,10 +1989,8 @@ export async function start(
 
     const filePath = path.join(getWorkspaceNotesDir(ws.id), `${name}.md`);
     let combinedContent = body.content;
-    let exists = false;
     try {
       const existing = await fs.readFile(filePath, "utf-8");
-      exists = true;
       if (existing.length > 0) {
         const separator = existing.endsWith("\n") ? "" : "\n";
         combinedContent = `${existing}${separator}${body.content}`;
@@ -1302,30 +2004,7 @@ export async function start(
     }
 
     const author = getAuthor(request);
-    const { stat, title } = await writeNoteAtomic(ws.id, name, combinedContent);
-
-    const meta = await getNotesMeta(ws.id);
-    if (!exists) {
-      meta[name] = { createdBy: author, contributors: [] };
-    } else {
-      if (!meta[name]) {
-        meta[name] = { contributors: [] };
-      }
-      if (author !== meta[name].createdBy && !meta[name].contributors.includes(author)) {
-        meta[name].contributors.push(author);
-      }
-    }
-    await saveNotesMeta(ws.id, meta);
-
-    const summary: NoteSummary = {
-      workspaceId: ws.id,
-      name,
-      title,
-      updatedAt: stat.mtimeMs,
-      createdBy: meta[name].createdBy,
-      contributors: meta[name].contributors,
-    };
-
+    const summary = await saveNote(ws.id, name, combinedContent, author);
     broadcast({ kind: "note_changed", workspaceId: ws.id, note: summary, by: author });
     return summary;
   });
@@ -1353,6 +2032,17 @@ export async function start(
     if (meta[name]) {
       delete meta[name];
       await saveNotesMeta(ws.id, meta);
+    }
+
+    const pinnedBy = Object.values(state.agents).filter(
+      (a) => a.workspaceId === ws.id && a.pinnedNotes?.includes(name)
+    );
+    for (const a of pinnedBy) {
+      setPinnedNotes(a, (a.pinnedNotes ?? []).filter((n) => n !== name));
+      broadcast({ kind: "agent_updated", workspaceId: ws.id, agent: a });
+    }
+    if (pinnedBy.length > 0) {
+      await saveState();
     }
 
     broadcast({ kind: "note_deleted", workspaceId: ws.id, name });
@@ -1399,6 +2089,7 @@ export async function shutdown(): Promise<void> {
     }
   }
   activeTurns.clear();
+  turnQueues.clear();
   try {
     closeWatcher();
   } catch {}

@@ -4,6 +4,7 @@ import type { Adapter, AdapterRunOptions, ContextUsage, Provider, TurnEvent, Tur
 import { randomUUID } from "node:crypto";
 import { agentEnv, killTree, sweepEnvMarker, TURN_MARKER } from "../process.js";
 import { estimateContextWindow } from "../context.js";
+import { rolePreamble } from "../prompt.js";
 
 export class ClaudeAdapter implements Adapter {
   readonly provider: Provider = "claude";
@@ -20,6 +21,9 @@ export class ClaudeAdapter implements Adapter {
     }
     if (options.sessionId) {
       args.push("--resume", options.sessionId);
+    }
+    if (options.role?.trim()) {
+      args.push("--append-system-prompt", rolePreamble(options.role.trim()));
     }
     if (options.autonomy === "read") {
       args.push("--permission-mode", "plan");
@@ -106,6 +110,24 @@ export class ClaudeAdapter implements Adapter {
                 events.push(event);
                 yield event;
               }
+            }
+          } else if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
+            for (const content of parsed.message.content) {
+              if (content?.type !== "tool_result") continue;
+              const output = Array.isArray(content.content)
+                ? content.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("")
+                : String(content.content ?? "");
+              const event: TurnEvent = {
+                type: "tool_result",
+                timestamp: Date.now(),
+                data: JSON.stringify({
+                  tool_use_id: content.tool_use_id,
+                  is_error: content.is_error === true,
+                  output: output.slice(0, 8000),
+                }),
+              };
+              events.push(event);
+              yield event;
             }
           } else if (parsed.type === "result") {
             if (parsed.session_id) {

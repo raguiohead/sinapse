@@ -5,13 +5,20 @@ import type {
   NoteSummary,
   Note,
   AgentState,
+  HandoffResponse,
   Workspace,
+  TurnRecord,
+  AgentDeleteResult,
+  SquadApplyResult,
+  SquadCatalog,
 } from "@sinapse/core";
 import type {
+  SquadApplyPayload,
   DaemonInfo,
   WorkerAskPayload,
   WorkerSpawnPayload,
   WorkerUpdatePayload,
+  WorkerDiffResult,
   NoteWritePayload,
   BrainInfo,
   DesktopSettings,
@@ -20,6 +27,7 @@ import type {
   DaemonDetails,
   WorkspaceCreatePayload,
   WorkspaceUpdatePayload,
+  CanvasLayout,
 } from "../shared/ipc.js";
 
 export interface SinapseBridge {
@@ -72,10 +80,25 @@ export interface SinapseBridge {
     ask: (payload: WorkerAskPayload) => Promise<{ turnId: string }>;
     stop: (workspaceId: string, agent: string) => Promise<any>;
     /** Removes the worker; a running turn is interrupted first. Emits agent_deleted on the bus. */
-    delete: (workspaceId: string, agent: string) => Promise<void>;
+    delete: (workspaceId: string, agent: string) => Promise<AgentDeleteResult>;
+    /** Starts the summary turn in the background (note handoff-<nome>); the session resets when it ends. Rejects when busy or sessionless. */
+    handoff: (workspaceId: string, agent: string) => Promise<HandoffResponse>;
+    /** Last finished turns from disk, oldest first (default 10, max 50). */
+    history: (workspaceId: string, agent: string, limit?: number) => Promise<TurnRecord[]>;
+    /** `git status` + `git diff` in the worker's cwd. Never rejects on git problems: see `ok`/`error`. */
+    diff: (workspaceId: string, agent: string) => Promise<WorkerDiffResult>;
+  };
+  /** Canvas positions/sizes/viewport per workspace, stored by the main process. */
+  layout: {
+    get: (workspaceId: string) => Promise<CanvasLayout | null>;
+    save: (workspaceId: string, layout: CanvasLayout) => Promise<void>;
   };
   models: {
     list: () => Promise<ModelCatalog>;
+  };
+  squads: {
+    list: () => Promise<SquadCatalog>;
+    apply: (payload: SquadApplyPayload) => Promise<SquadApplyResult>;
   };
   /** Notes written from the canvas are authored by "usuario". */
   notes: {

@@ -13,6 +13,7 @@
   /* Providers */
   --claude: #e8956b; /* terracotta */
   --agy: #6ea8fe;    /* blue */
+  --codex: #c084fc;  /* purple */
 
   /* Status */
   --thinking: #fbbf24;
@@ -23,6 +24,7 @@
 
   /* Edges */
   --edge-idle: #1c2030;
+  --note-pin: #e5d38a; /* note -> worker pins */
 
   /* Fonts */
   --font-ui: "Inter", system-ui, -apple-system, sans-serif;
@@ -981,6 +983,28 @@ body,
   white-space: nowrap;
 }
 
+.context-meter-handoff {
+  flex-shrink: 0;
+  border: 1px solid var(--thinking);
+  background: transparent;
+  color: var(--thinking);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-ui);
+  cursor: pointer;
+}
+
+.context-meter-handoff:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.context-meter-handoff:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 /* ==========================================================================
    Brain Node Card
    ========================================================================== */
@@ -1249,6 +1273,45 @@ body,
   align-items: center;
   gap: 4px;
   margin: 1px 0;
+}
+
+.worker-branch-badge {
+  color: var(--muted);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 2px 6px;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  min-width: 0;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-pin-badge {
+  color: var(--note-pin);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 2px 6px;
+  border: 1px dashed var(--note-pin);
+  border-radius: 4px;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.dialog-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.dialog-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
 }
 
 .worker-model-chip {
@@ -1715,6 +1778,11 @@ body,
   left: 50% !important;
 }
 
+.note-handle-source {
+  right: -6px !important;
+  background: var(--note-pin) !important;
+}
+
 /* Edge variants */
 .synapse-variant-contributor {
   opacity: 0.5;
@@ -1722,6 +1790,11 @@ body,
 
 .synapse-variant-creator {
   stroke-dasharray: 6 4;
+}
+
+.synapse-variant-pin {
+  stroke-linecap: round;
+  cursor: pointer;
 }
 
 /* React Flow Controls Themed */
@@ -2115,4 +2188,233 @@ body,
   flex-direction: row !important;
   align-items: center !important;
   gap: 8px !important;
+}
+
+/* ==========================================================================
+   Worker card: structured activity, autonomy/role editing, diff
+   ========================================================================== */
+.worker-autonomy-select {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+
+.worker-autonomy-select:hover:not(:disabled) {
+  border-color: var(--accent-a);
+  color: var(--text);
+}
+
+.worker-autonomy-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.worker-node-role-editable {
+  cursor: text;
+}
+
+.worker-node-role-editable:hover {
+  color: var(--text);
+}
+
+.worker-role-input {
+  flex-shrink: 0;
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  background: var(--bg);
+  border: 1px solid var(--accent-a);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  outline: none;
+}
+
+.worker-actions-row {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
+}
+
+.worker-btn-diff {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+}
+
+.worker-btn-diff:hover {
+  border-color: var(--accent-a);
+  color: var(--text);
+}
+
+.activity-prompt {
+  margin: 6px 0;
+  padding: 6px 8px;
+  background: rgba(167, 139, 250, 0.1);
+  border-left: 2px solid var(--accent-b);
+  border-radius: 4px;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.activity-prompt:first-child {
+  margin-top: 0;
+}
+
+.activity-text {
+  padding: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-block {
+  margin: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 11px;
+}
+
+.activity-block > summary {
+  cursor: pointer;
+  padding: 3px 8px;
+  color: var(--muted);
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.activity-block > summary:hover {
+  color: var(--text);
+}
+
+.activity-block pre {
+  margin: 0;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 180px;
+  overflow-y: auto;
+  color: var(--text);
+}
+
+.activity-tool-name {
+  font-family: var(--font-mono);
+  color: var(--accent-a);
+  flex-shrink: 0;
+}
+
+.activity-tool-summary {
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.activity-tool-pending {
+  color: var(--thinking);
+}
+
+.activity-tool-error {
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.activity-thinking {
+  font-style: italic;
+}
+
+.activity-thinking pre {
+  color: var(--muted);
+}
+
+.activity-error {
+  margin: 4px 0;
+  padding: 6px 8px;
+  color: var(--error);
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dialog-modal.diff-dialog {
+  width: min(1000px, 94vw);
+  height: min(80vh, 800px);
+  max-width: 94vw;
+  max-height: 80vh;
+  user-select: text;
+}
+
+.diff-status {
+  flex-shrink: 0;
+  margin: 0;
+  max-height: 90px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.diff-body {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.diff-line {
+  padding: 0 12px;
+  white-space: pre;
+}
+
+.diff-line-add {
+  color: var(--done);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.diff-line-del {
+  color: var(--error);
+  background: rgba(248, 113, 113, 0.08);
+}
+
+.diff-line-hunk,
+.diff-line-note {
+  color: var(--muted);
+}
+
+.diff-line-meta {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.diff-empty {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: italic;
 }

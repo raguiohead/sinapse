@@ -34,8 +34,10 @@ export interface AgentConfig {
   cwd: string;
   role: string;
   autonomy: Autonomy;
-  /** Model requested for this agent. Undefined = provider default (account default for Claude, gemini-3.8-flash-high for AGY). */
+  /** Model requested for this agent. Undefined = provider default (account default for Claude/Codex, gemini-3.8-flash-high for AGY). */
   model?: string;
+  /** Workspace notes whose content the daemon injects into this agent's prompts (max 10). */
+  pinnedNotes?: string[];
 }
 
 export interface ContextUsage {
@@ -49,6 +51,60 @@ export interface ContextUsage {
   model?: string;
 }
 
+/** Isolated git worktree of a worker; its cwd lives inside `path`. */
+export interface WorktreeInfo {
+  /** Absolute path of the worktree (<data>/workspaces/<id>/worktrees/<name>). */
+  path: string;
+  /** Branch created for it: "sinapse/<name>". */
+  branch: string;
+  /** Absolute path of the main repo (git toplevel) that owns the worktree. */
+  repo: string;
+  /** Commit the branch was created from; used to tell whether the worker committed anything. */
+  base?: string;
+}
+
+/** DELETE agent response. `worktree` is present only for workers that had one. */
+export interface AgentDeleteResult {
+  ok: true;
+  worktree?: {
+    action: "removed" | "kept";
+    path: string;
+    branch: string;
+    /** Why it was kept. */
+    reason?: string;
+  };
+}
+
+export interface SquadMember {
+  /** Worker name suffix; the worker is "<prefix>-<name>". */
+  name: string;
+  provider: Provider;
+  model?: string;
+  autonomy: Autonomy;
+  role: string;
+}
+
+export interface SquadPreset {
+  name: string;
+  description?: string;
+  members: SquadMember[];
+  source: "embutido" | "usuario";
+}
+
+/** GET /squads response. `warnings` lists invalid entries ignored in ~/.sinapse/squads.json. */
+export interface SquadCatalog {
+  presets: SquadPreset[];
+  warnings: string[];
+}
+
+/** POST squads/apply response. */
+export interface SquadApplyResult {
+  preset: string;
+  created: AgentState[];
+  skipped: { name: string; reason: string }[];
+  failed: { name: string; error: string }[];
+}
+
 export interface AgentState extends AgentConfig {
   id: string;
   status: AgentStatus;
@@ -57,12 +113,28 @@ export interface AgentState extends AgentConfig {
   lastError?: string;
   usage?: ContextUsage;
   createdBy?: Author;
+  /** Set by a handoff: the session was reset and the next turn is told to read this note first. Cleared once that turn succeeds. */
+  handoffNote?: string;
+  worktree?: WorktreeInfo;
+  /** Pinned note name -> mtime of the version already injected into the current session. Cleared with the session. */
+  pinnedNoteSeen?: Record<string, number>;
 }
 
 export interface TurnEvent {
   type: "text" | "tool_use" | "tool_result" | "thinking" | "error" | "done";
   timestamp: number;
   data: string;
+}
+
+/** One finished turn as persisted in `<workspace>/agents/<agentId>.jsonl` (one JSON object per line). */
+export interface TurnRecord {
+  turnId: string;
+  prompt: string;
+  startedAt: number;
+  finishedAt: number;
+  status: "done" | "error" | "interrupted";
+  error?: string;
+  events: TurnEvent[];
 }
 
 export interface TurnResult {
@@ -82,6 +154,8 @@ export interface AdapterRunOptions {
   sessionId?: string;
   autonomy: Autonomy;
   model?: string;
+  /** The agent's role in the team. Claude gets it as an appended system prompt every turn; AGY as a prompt prefix on the first turn. */
+  role?: string;
   timeoutMs?: number;
   /** Extra env for the turn (SINAPSE_WORKSPACE, SINAPSE_AGENT_ID), applied on top of agentEnv(). */
   env?: Record<string, string>;
@@ -93,13 +167,87 @@ export interface Adapter {
   stop(pid: number): Promise<void>;
 }
 
+/** POST ask response for async/queued asks. "queued": the worker was busy and the prompt waits in its in-memory queue. */
+export interface AskResponse {
+  turnId: string;
+  status: "started" | "queued";
+  /** 1-based position in the queue when status is "queued". */
+  position?: number;
+}
+
+/** POST stop response. */
+export interface StopResponse {
+  ok: true;
+  status: AgentStatus;
+  /** True when a running turn was cancelled. */
+  interrupted: boolean;
+  /** Queued prompts that were discarded. */
+  clearedQueue: number;
+}
+
+/** Outcome of the last handoff of a worker (kept in memory by the daemon). */
+export interface HandoffOutcome {
+  turnId: string;
+  note: string;
+  ok: boolean;
+  error?: string;
+  finishedAt: number;
+}
+
+/** POST handoff response: the summary turn runs in the background; follow it with wait/check. */
+export interface HandoffResponse {
+  turnId: string;
+  note: string;
+}
+
+/** GET check response. */
+export interface CheckResponse {
+  agentId: string;
+  name: string;
+  status: AgentStatus;
+  model?: string;
+  usage?: ContextUsage;
+  turnId?: string;
+  /** Events of the running turn, or of the last finished one. */
+  events: TurnEvent[];
+  /** Concatenated "text" events of those same events (partial while thinking). */
+  text: string;
+  /** Prompts waiting in the queue. */
+  queued: number;
+  lastError?: string;
+  handoffNote?: string;
+  lastHandoff?: HandoffOutcome;
+  pinnedNotes?: string[];
+}
+
+/** One worker in a POST wait response. */
+export interface WaitResult {
+  agentId: string;
+  name: string;
+  /** "removed" when the worker was deleted while waiting. */
+  status: AgentStatus | "removed";
+  /** Still thinking, with queued prompts, or finishing a handoff. */
+  busy: boolean;
+  queued: number;
+  usage?: ContextUsage;
+  /** Full text of the last finished turn (empty while busy). */
+  text: string;
+  lastError?: string;
+}
+
+/** POST wait response. `done` = the condition (all, or any with `any`) was met before this request's timeout. */
+export interface WaitResponse {
+  done: boolean;
+  results: WaitResult[];
+}
+
 export interface ModelOption {
   id: string;
   label: string;
 }
 
 /** GET /models response. */
-export type ModelCatalog = Record<"claude" | "agy", ModelOption[]>;
+export type ModelCatalog = Record<Provider, ModelOption[]>;
 
 export interface NoteSummary {
   workspaceId: string;

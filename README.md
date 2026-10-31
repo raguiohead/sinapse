@@ -15,10 +15,10 @@ São quatro peças. O app desktop abre o Claude Code interativo num terminal emb
      CLI `sinapse` ──── HTTP + token ────▶  daemon `sinapsed`  (127.0.0.1)
                                                    │
                                      adapters headless, sessão persistente
-                                          ┌────────┴────────┐
-                                          ▼                 ▼
-                                    worker Claude      worker AGY
-                                     (claude -p)        (agy -p)
+                                  ┌───────────────────┼───────────────────┐
+                                  ▼                   ▼                   ▼
+                            worker Claude       worker Codex         worker AGY
+                             (claude -p)      (codex exec --json)     (agy -p)
 ```
 
 ## Requisitos
@@ -29,11 +29,12 @@ São quatro peças. O app desktop abre o Claude Code interativo num terminal emb
 | Git | Git instalado | Git instalado |
 | Claude Code CLI | `claude` instalado e autenticado | Instalador **NATIVO** (`claude.exe` no PATH, não pacote npm) |
 | AGY CLI | `agy` instalado e autenticado | `agy.exe` no PATH |
+| OpenAI Codex CLI (opcional, para workers `codex`) | `codex` instalado e autenticado no PATH | Executável `codex` no PATH |
 | Compilador C++ (opcional) | `build-essential python3` | Visual Studio Build Tools (Desktop development with C++) |
 
 > [!IMPORTANT]
 > **Por que executáveis nativos no Windows?**
-> O prompt de cada turno é passado como argumento ao CLI do worker. Se esse argumento passasse pelo `cmd.exe` (o que acontece com os atalhos `.cmd` que o npm instala), aspas e caracteres especiais do prompt quebrariam o comando ou seriam interpretados como comandos. Com `claude.exe` e `agy.exe` no PATH, o Sinapse cria o processo diretamente, sem shell, e o Node faz o escape correto dos argumentos.
+> O prompt de cada turno é passado ao CLI do worker (via argumento no `agy` ou `stdin` no `claude`/`codex`). Se a chamada passasse pelo `cmd.exe` (o que acontece com os atalhos `.cmd` que o npm instala), aspas e caracteres especiais quebrariam o comando ou seriam interpretados como comandos. Com os executáveis nativos no PATH, o Sinapse cria o processo diretamente, sem shell, e o Node faz o escape correto dos argumentos.
 >
 > O pacote `node-pty` normalmente já fornece binários pré-compilados. Se o ambiente exigir compilação de código nativo, as ferramentas de compilação acima serão necessárias.
 
@@ -153,10 +154,13 @@ Execute no terminal PowerShell:
 - **Menu de contexto:** clique com o botão direito no canvas para criar um worker ou uma nota e para abrir as configurações. O diálogo de novo worker já vem com os padrões definidos nas configurações (provedor, modelo, autonomia e pasta).
 - **Configurações** (⚙ ou `Ctrl+,`): modelo do cérebro e uso de contexto; padrões de novos workers; status do daemon e atalhos para as pastas de dados, do cérebro e de notas; aparência (barra cromática, movimento reduzido e tamanho da fonte do terminal). Cada mudança é salva na hora.
 - **Perguntar / Parar:** cada worker aceita prompts direto pelo card e permite interromper o turno em andamento.
+- **Atividade estruturada:** o card mostra o prompt em destaque, a resposta em Markdown, cada ferramenta como bloco colapsável (comando ou arquivo no título; argumentos e resultado no corpo), o raciocínio (`thinking`) colapsado e os erros em vermelho. Guarda as últimas 300 entradas; o scroll acompanha o fim, a menos que você role para cima.
+- **Autonomia e papel no card:** o seletor `read/edit/full` ao lado do modelo e o clique no papel (Enter salva, Shift+Enter quebra linha, Esc cancela) equivalem ao `PATCH` do daemon; ficam bloqueados enquanto o worker pensa.
+- **Ver diff:** o botão "Ver diff" abre um modal com `git status` e `git diff HEAD` do diretório do worker (arquivos não rastreados só listados; limite de 200 KB). Fora de um repositório git, o modal mostra o erro.
 - **Excluir worker:** pela lixeira no card ou com clique direito no card. Pede confirmação; um turno em andamento é interrompido e tudo o que o worker abriu é encerrado.
 - **Redimensionar:** arraste a alça no canto inferior direito de qualquer card. O terminal do cérebro se reajusta ao novo tamanho.
 - **Notas:** "Editar" ou duplo clique abre um editor fora do canvas, em tamanho normal; `Ctrl+S` salva e Esc cancela.
-- **Arestas:** partículas vão do cérebro ao worker quando um turno começa e voltam na cor do provedor quando ele termina.
+- **Arestas:** partículas vão do cérebro ao worker quando um turno começa e voltam na cor do provedor quando ele termina. Arrastar da alça direita de uma nota até um worker fixa a nota nele (veja [Notas fixadas](#notas-fixadas)).
 - Workers criados pelo cérebro no terminal entram no canvas sozinhos, e a câmera se reajusta.
 
 ### Workspaces
@@ -164,7 +168,7 @@ Execute no terminal PowerShell:
 Cada workspace é um projeto (uma pasta que você escolhe), com o próprio orquestrador, workers e notas.
 
 - **Seletor** (canto superior direito): lista os workspaces, troca entre eles, cria um novo ("＋ Novo workspace": nome, pasta, orquestrador e modelo) e apaga existentes (🗑).
-- **Orquestrador por workspace:** Claude Code ou AGY, com o modelo que você quiser; dá para trocar na seção "Orquestrador" das configurações. Mudar só o modelo do Claude retoma a conversa; mudar de provedor começa uma nova.
+- **Orquestrador por workspace:** Claude Code ou AGY, com o modelo que você quiser; dá para trocar na seção "Orquestrador" das configurações. Mudar só o modelo retoma a conversa; mudar de provedor começa uma nova.
 - **Seu projeto fica intocado:** o orquestrador roda numa pasta do Sinapse (`~/.sinapse/workspaces/<id>/orquestrador`) e acessa o projeto via `--add-dir`. Nada é criado dentro do repositório do projeto. Na primeira vez, o Claude Code ou o AGY pede confiança nessa pasta.
 - **Em segundo plano:** ao trocar de workspace, o anterior continua rodando (orquestrador e turnos dos workers); ao voltar, os cards mostram o que aconteceu nesse meio-tempo.
 - **Apagar:** interrompe e remove os workers do workspace, encerra o orquestrador e apaga as notas e a sessão dele. A pasta do projeto não é tocada. O último workspace não pode ser apagado.
@@ -187,31 +191,81 @@ A CLI `sinapse` gerencia os workers e se comunica com o daemon `sinapsed`. Os co
 | `sinapse workspaces` | Lista os workspaces, com pasta, orquestrador e número de workers. |
 | `sinapse workspace create <nome> --folder <dir> [--orchestrator claude\|agy] [--model <m>]` | Cria um workspace. |
 | `sinapse workspace rm <nome\|id>` | Apaga um workspace (a pasta do projeto não é tocada). |
-| `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia e diretório de trabalho. |
-| `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
+| `sinapse list` | Lista todos os workers cadastrados, provedor, modelo, uso de contexto, status, autonomia, notas fixadas e diretório de trabalho. |
+| `sinapse spawn <nome> --provider <p> [--cwd <dir>] --role "<r>" [--autonomy edit] [--model <m>]` | Cria um novo worker (`--provider claude\|codex\|agy`, `--role`, `--autonomy read\|edit\|full`, `--model <m>`). Sem `--cwd`, ele roda na pasta do projeto. |
+| `sinapse spawn <nome> ... --worktree` | Isola o worker numa git worktree própria (veja [Isolamento por git worktree](#isolamento-por-git-worktree)). |
+| `sinapse squad list` | Lista os presets de squad (embutidos e de `~/.sinapse/squads.json`). |
+| `sinapse squad apply <preset> [--prefix <p>] [--worktree]` | Cria os workers do preset, nomeados `<prefix>-<membro>` (prefixo padrão: nome do preset). Workers que já existem são pulados com aviso. |
 | `sinapse ask <nome> "<prompt>"` | Envia prompt ao worker de modo síncrono, exibindo a saída em tempo real no terminal. |
 | `sinapse ask <nome> "<prompt>" --async` | Envia prompt de modo assíncrono, retornando imediatamente o `turnId` gerado. |
-| `sinapse check <nome>` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução e últimos eventos registrados. |
-| `sinapse stop <nome>` | Interrompe imediatamente o turno em execução no worker selecionado. |
-| `sinapse rm <nome>` | Remove o worker. Um turno em andamento é interrompido antes, e a sessão do worker deixa de ser usada. |
-| `sinapse models [claude\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude e AGY. |
+| `sinapse ask <nome> "<prompt>" --queue` | Como `--async`, mas se o worker estiver ocupado o prompt entra numa fila (em memória) e roda quando o turno atual terminar. Sem `--queue`, um worker ocupado recusa o prompt. |
+| `sinapse wait <n1> [n2 ...] [--any] [--timeout <seg>]` | Bloqueia até todos os workers (ou o primeiro, com `--any`) terminarem o turno e a fila. Imprime, para cada um, o status, o contexto e o texto completo da última resposta. Sai com código 2 em timeout e 1 se algum worker terminou em erro. |
+| `sinapse check <nome> [--full]` | Consulta o status atual do worker, modelo, contexto, ID do turno em execução, tamanho da fila e últimos eventos registrados. Com `--full`, imprime o texto completo da última resposta no lugar dos eventos. |
+| `sinapse stop <nome>` | Interrompe o turno em execução e descarta os prompts da fila (a saída informa quantos). |
+| `sinapse handoff <nome> [--note <nota>]` | Pede ao worker um resumo estruturado (objetivo, estado, decisões, arquivos, pendências), salva na nota `handoff-<nome>` (ou `--note`), zera a sessão e mantém nome, papel, modelo, autonomia e pasta. O próximo turno começa lendo a nota. |
+| `sinapse rm <nome> [--force]` | Remove o worker. Um turno em andamento é interrompido antes, e a sessão do worker deixa de ser usada. Se ele tinha worktree, ela e a branch só são apagadas quando estão limpas e sem commits novos; senão ficam mantidas e o caminho é avisado. `--force` apaga mesmo assim. |
+| `sinapse models [claude\|codex\|agy]` | Lista o catálogo de modelos disponíveis para os provedores Claude, Codex e AGY. |
 | `sinapse model <nome> <modelo\|padrao>` | Altera o modelo de um worker existente (`padrao` limpa e volta ao padrão do provedor). |
 | `sinapse note list` | Lista resumos de todas as notas salvas ordenadas por data de modificação. |
 | `sinapse note read <nome>` | Exibe o conteúdo bruto da nota especificada. |
 | `sinapse note write <nome> "<texto>"` | Cria ou sobrescreve uma nota. Use `-` no lugar do texto para ler do stdin. |
 | `sinapse note append <nome> "<texto>"` | Acrescenta ao final da nota (cria se não existir). Use `-` para ler do stdin. |
-| `sinapse note rm <nome>` | Remove permanentemente uma nota. |
+| `sinapse note rm <nome>` | Remove permanentemente uma nota (e a desafixa dos workers). |
+| `sinapse pin <worker> <nota> [nota ...]` | Fixa notas no worker: o conteúdo delas entra no prompt dele (veja [Notas fixadas](#notas-fixadas)). Também: `spawn ... --note <n1,n2>`. |
+| `sinapse unpin <worker> <nota> [nota ...]` | Desafixa notas do worker. |
 | `sinapse start` | Inicia o daemon `sinapsed` em primeiro plano (ou conecta se já estiver ativo). |
+
+### Isolamento por git worktree
+
+`sinapse spawn <nome> --provider claude --worktree` (ou a caixa "Isolar em git worktree" no diálogo de novo worker) faz o daemon rodar `git worktree add -b sinapse/<nome>` em `~/.sinapse/workspaces/<id>/worktrees/<nome>` e usar essa pasta como diretório de trabalho do worker. Assim vários workers com `edit` não pisam nos mesmos arquivos.
+
+- A pasta do workspace (ou `--cwd`) precisa estar num repositório git com ao menos um commit; se não estiver, ou se a branch `sinapse/<nome>` já existir, o spawn falha com mensagem clara.
+- A worktree é um checkout limpo do `HEAD`: **`node_modules`, artefatos de build e arquivos ignorados pelo git não existem nela** (rode `npm install` etc. dentro dela, se precisar). Alterações não commitadas da pasta original também não vão junto.
+- O Sinapse nunca faz merge sozinho: integre a branch `sinapse/<nome>` manualmente.
+- `sinapse rm` remove worktree e branch apenas se a worktree está limpa e a branch não tem commits novos. Caso contrário o worker é removido, a worktree/branch são mantidas e o aviso mostra o caminho. `sinapse rm <nome> --force` apaga tudo, inclusive trabalho não commitado.
+- No canvas, o card do worker mostra a branch num selo discreto.
+
+### Presets de squad
+
+Um squad é um conjunto de workers criado de uma vez. Presets embutidos:
+
+| Preset | Membros |
+|---|---|
+| `review` | `arquiteto` (read) + `revisor` (read) |
+| `tdd` | `implementador` (edit) + `testador` (edit) |
+| `bug-hunt` | `investigador` (read) + `corretor` (edit) |
+
+`sinapse squad apply review --prefix pr42` cria `pr42-arquiteto` e `pr42-revisor`; com `--worktree`, cada um ganha sua worktree. No canvas, clique com o botão direito no fundo e escolha "Aplicar squad ▸ <preset>" (sem worktree).
+
+Presets próprios ficam em `~/.sinapse/squads.json` (um array, ou `{ "presets": [...] }`); um preset com o nome de um embutido o sobrescreve. Entradas inválidas são ignoradas, com aviso em `sinapse squad list`.
+
+```json
+[
+  {
+    "name": "docs",
+    "description": "Redator e revisor de documentação",
+    "members": [
+      { "name": "redator", "provider": "claude", "model": "sonnet", "autonomy": "edit", "role": "Escreve a documentação." },
+      { "name": "revisor", "provider": "agy", "autonomy": "read", "role": "Revisa o texto." }
+    ]
+  }
+]
+```
 
 ### Modelos e janela de contexto
 
 Tanto no canvas quanto na CLI, é possível selecionar e alternar os modelos dos workers:
-- **Seleção no Canvas e na CLI:** utilize `--model <modelo>` no `sinapse spawn` ou consulte os modelos disponíveis via `sinapse models [claude|agy]`. Para alterar o modelo de um worker existente, utilize `sinapse model <nome> <modelo>` (ou `sinapse model <nome> padrao` para remover o modelo customizado). No canvas, o modelo pode ser escolhido na criação e modificado no card do worker.
+- **Seleção no Canvas e na CLI:** utilize `--model <modelo>` no `sinapse spawn` ou consulte os modelos disponíveis via `sinapse models [claude|codex|agy]`. Para alterar o modelo de um worker existente, utilize `sinapse model <nome> <modelo>` (ou `sinapse model <nome> padrao` para remover o modelo customizado). No canvas, o modelo pode ser escolhido na criação e modificado no card do worker.
 - **Orquestrador:** a seção "Orquestrador" das configurações troca o agente e o modelo do workspace ativo (veja Workspaces).
 - **Janela de contexto:**
   - O **Claude** reporta o tamanho real de sua janela de contexto diretamente pela CLI (`contextWindow`).
-  - O **AGY** e o **orquestrador** exibem uma estimativa da janela de contexto marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
-  - O uso de contexto do **orquestrador Claude** é lido a partir do transcript de sessão do Claude Code; o orquestrador AGY mostra só o modelo.
+  - O **Codex**, o **AGY** e o **orquestrador** exibem a janela reportada pela CLI (quando disponível) ou uma estimativa marcada com o prefixo `≈` (ex: `≈21k/1m 2%`).
+  - O uso de contexto do **orquestrador** (Claude Code ou AGY) é lido a partir do transcript da sessão ativa (`~/.claude/projects/` para Claude e `~/.gemini/antigravity-cli/brain/` para AGY).
+- **Handoff:** quando um worker passa de 80% da janela, o card mostra um botão "Handoff" (o mesmo que `sinapse handoff <nome>`). O resumo vira a nota `handoff-<nome>`, a sessão recomeça do zero e o primeiro turno seguinte é instruído a ler essa nota.
+
+### Papel do worker
+
+O `--role` do `spawn` chega ao modelo em todo turno: no Claude como `--append-system-prompt` ("Seu papel neste time: …"); no AGY, que não tem essa opção, como prefixo do primeiro prompt da sessão.
 
 ### Notas
 
@@ -223,6 +277,16 @@ As notas representam a memória compartilhada entre o usuário, o cérebro e os 
   - Recebem atualizações ao vivo via eventos do daemon (`note_changed` e `note_deleted`).
   - Renderizadas em Markdown limpo, sem execução de HTML bruto.
 
+#### Notas fixadas
+
+Uma nota fixada num worker chega até ele sem que ele precise rodar `sinapse note read` (útil para workers em sandbox que não conseguem chamar a CLI):
+
+- **Fixar:** `sinapse pin <worker> <nota>`, `sinapse spawn <nome> ... --note spec,decisoes` ou, no canvas, arrastando da alça direita da nota (amarela) até o worker. A aresta fica tracejada na cor das notas e o card mostra o selo 📌 com a quantidade (passe o mouse para ver os nomes).
+- **Desafixar:** `sinapse unpin <worker> <nota>`, ou selecione a aresta tracejada no canvas e aperte Delete/Backspace. Apagar a nota também a desafixa de todos os workers.
+- **O que o worker recebe:** no primeiro turno de cada sessão (worker novo ou logo depois de um handoff), o conteúdo completo das notas fixadas vai antes do prompt. Nos turnos seguintes vai só uma linha lembrando quais notas estão fixadas, a não ser que alguma tenha mudado; nesse caso, a versão nova é reenviada.
+- **Limites:** até 10 notas por worker; no máximo 16 KB por nota e 48 KB no total por turno. O que passar disso é cortado com um aviso indicando `sinapse note read <nome>` para ler o resto. Uma nota fixada que deixou de existir é ignorada.
+- `sinapse list` e `sinapse check` mostram as notas fixadas. Fixar e desafixar funciona mesmo com o worker pensando; vale a partir do próximo turno.
+
 ### Ciclo de vida
 
 - **Uma instância por pasta de dados:** abrir o atalho de novo só traz a janela existente para a frente.
@@ -233,11 +297,11 @@ As notas representam a memória compartilhada entre o usuário, o cérebro e os 
 
 O parâmetro `--autonomy` ajusta as permissões passadas aos executáveis dos adapters:
 
-| Nível | Flag Claude (`claude`) | Flag AGY (`agy`) | Comportamento |
-|---|---|---|---|
-| `read` | `--permission-mode plan` | `--mode plan` | Modo somente leitura/planejamento. Não altera arquivos. |
-| `edit` *(padrão)* | `--permission-mode acceptEdits` | `--mode accept-edits` | Permite criação e edição de arquivos do projeto sem confirmações repetitivas. |
-| `full` | *(sem restrições)* | *(sem restrições)* | Execução total irrestrita (usar apenas sob pedido explícito). |
+| Nível | Flag Claude (`claude`) | Flag Codex (`codex`) | Flag AGY (`agy`) | Comportamento |
+|---|---|---|---|---|
+| `read` | `--permission-mode plan` | `--sandbox read-only` | `--mode plan` | Modo somente leitura/planejamento. Não altera arquivos. |
+| `edit` *(padrão)* | `--permission-mode acceptEdits` | `--sandbox workspace-write` | `--mode accept-edits` | Permite criação e edição de arquivos do projeto sem confirmações repetitivas. |
+| `full` | *(sem restrições)* | `--dangerously-bypass-approvals-and-sandbox` | *(sem restrições)* | Execução total irrestrita (usar apenas sob pedido explícito). |
 
 ### Exemplo de Delegação pelo Cérebro
 
@@ -255,9 +319,9 @@ Quando o Claude Code atua como cérebro usando o skill do Sinapse:
    ```bash
    sinapse ask tester "Implemente a suíte de testes unitários para os adapters em packages/core" --async
    ```
-4. O cérebro continua trabalhando em outra tarefa e acompanha periodicamente o status:
+4. O cérebro continua trabalhando em outra tarefa e, quando precisa do resultado, espera o worker (sem polling) e recebe a resposta completa:
    ```bash
-   sinapse check tester
+   sinapse wait tester --timeout 900
    ```
 
 ## Onde ficam os dados
@@ -267,6 +331,8 @@ Todos os dados de runtime do Sinapse ficam armazenados no diretório do usuário
 - `~/.sinapse/state.json`: workspaces e agentes (id, workspace, nome, provedor, pasta, status, sessão, modelo, uso de contexto, quem criou).
 - `~/.sinapse/daemon.json`: Informações do daemon em execução (`port`, `token`, `pid`).
 - `~/.sinapse/workspaces/<id>/notes/`: notas do workspace (`<nome>.md`) e `.meta.json` com a autoria.
+- `~/.sinapse/workspaces/<id>/worktrees/<nome>/`: git worktrees dos workers criados com `--worktree`.
+- `~/.sinapse/squads.json`: presets de squad do usuário (opcional).
 - `~/.sinapse/workspaces/<id>/orquestrador/`: pasta onde o orquestrador roda, com o guia (`CLAUDE.md` ou `AGENTS.md`) e, para o AGY, a skill em `.agent/skills/sinapse`.
 - `~/.sinapse/desktop.json`: configurações do app (workspace ativo, padrões de novos workers e aparência).
 - `~/.sinapse/desktop.log`: Log de saída do processo de build e inicialização do Electron Desktop.
@@ -283,7 +349,7 @@ sinapse/
 │       ├── build/             # Ícones (icon.svg, icon.png, icon.ico)
 │       └── src/               # Processo principal (main), preload e renderer
 ├── packages/
-│   ├── core/                  # Daemon Fastify, adapters (claude, agy), gerenciamento de processos
+│   ├── core/                  # Daemon Fastify, adapters (claude, codex, agy), gerenciamento de processos
 │   └── cli/                   # CLI sinapse executável
 ├── scripts/                   # Scripts de inicialização e instalação de atalhos (Linux / Windows)
 │   ├── install-shortcut.sh    # Instalação de atalho e ícone (.desktop) no Linux
@@ -300,10 +366,10 @@ sinapse/
 ## Limitações conhecidas
 
 - **Versão do Electron:** o projeto fixa o Electron 35. A partir do 36 (GTK4), o app fecha ao iniciar em sistemas Linux que também carregam GTK3, com o erro "GTK 2/3 symbols detected".
-- **Adapter Codex:** O adapter para OpenAI Codex ainda não foi implementado.
 - **Persistência de logs:** O histórico detalhado de eventos de turnos de workers é mantido em memória e não é persistido após o encerramento do daemon.
+- **Fila em memória:** prompts enfileirados com `--queue` se perdem se o daemon reiniciar. `wait` e `check --full` mostram só a resposta do último turno; numa fila com vários prompts, as respostas anteriores ficam apenas no canvas.
 - **Confiança por workspace:** cada orquestrador roda na sua própria pasta, então o Claude Code ou o AGY pede confiança uma vez por workspace novo.
-- **Orquestrador AGY:** ao abrir, o AGY às vezes mostra um aviso de novidades que precisa ser fechado com Esc antes de digitar. Ele não informa o uso de contexto, então o card mostra só o modelo.
+- **Orquestrador AGY:** ao abrir, o AGY às vezes mostra um aviso de novidades que precisa ser fechado com Esc antes de digitar.
 - **Pasta antiga `~/.sinapse/cerebro`:** depois da atualização para workspaces, ela não é mais usada (o orquestrador do Geral começa numa sessão nova). Pode ser apagada.
 - **Janela de contexto estimada:** quando o CLI não informa o limite (AGY e cérebro), o Sinapse estima pelo nome do modelo; a família Claude 5.x é tratada como 1M.
 - **Processos que se desligam do pai:** alguns servidores MCP se separam do processo que os iniciou. No Linux o Sinapse os encontra por uma marca no ambiente e os encerra; no Windows depende do `taskkill /T`, que não alcança processos já desligados da árvore.
@@ -322,3 +388,7 @@ sinapse/
 
 - **`sinapse: command not found`**  
   Vincule o pacote da CLI ao seu ambiente global do npm executando `npm link -w @sinapse/cli` na raiz do repositório, garantindo que o diretório de binários globais do npm esteja presente no PATH do sistema.
+
+## Licença
+
+[MIT](LICENSE)

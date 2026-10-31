@@ -92,8 +92,8 @@ export function SettingsScreen({
 
     const unsubInfo = window.sinapse?.brain?.onInfoChanged((info) => {
       if (info.workspaceId === activeWorkspaceId) {
-        setResolvedBrainModel(info.model ?? null);
-        if (info.usage !== undefined) setBrainUsage(info.usage);
+        setResolvedBrainModel(info.usage?.model ?? info.model ?? null);
+        setBrainUsage(info.usage);
       }
     });
 
@@ -198,9 +198,7 @@ export function SettingsScreen({
     if (normalizedNew === currentModel) return;
 
     const confirmMsg =
-      currentProvider === "claude"
-        ? "Trocar o modelo reinicia o terminal deste workspace e retoma a conversa. Continuar?"
-        : "Trocar o modelo reinicia o terminal deste workspace. Continuar?";
+      "Trocar o modelo reinicia o terminal deste workspace e retoma a conversa. Continuar?";
 
     const confirmed = window.confirm(confirmMsg);
     if (!confirmed) return;
@@ -420,19 +418,17 @@ export function SettingsScreen({
                       </div>
                     </div>
 
-                    {currentProvider === "claude" && (
-                      <div className="settings-row">
-                        <div className="settings-field-info">
-                          <span className="settings-label">Janela de contexto</span>
-                          <p className="settings-description">
-                            Consumo de tokens e uso do contexto do orquestrador.
-                          </p>
-                        </div>
-                        <div className="settings-field-control settings-meter-wrapper">
-                          <ContextMeter usage={brainUsage} />
-                        </div>
+                    <div className="settings-row">
+                      <div className="settings-field-info">
+                        <span className="settings-label">Janela de contexto</span>
+                        <p className="settings-description">
+                          Consumo de tokens e uso do contexto do orquestrador.
+                        </p>
                       </div>
-                    )}
+                      <div className="settings-field-control settings-meter-wrapper">
+                        <ContextMeter usage={brainUsage} />
+                      </div>
+                    </div>
                   </>
                 ) : (
                   <div className="settings-text">Nenhum workspace ativo selecionado.</div>
@@ -466,6 +462,21 @@ export function SettingsScreen({
                         }
                       >
                         Claude
+                      </button>
+                      <button
+                        type="button"
+                        className={`segmented-btn ${
+                          settings?.workerDefaults?.provider === "codex"
+                            ? "active"
+                            : ""
+                        }`}
+                        onClick={() =>
+                          savePatch({
+                            workerDefaults: { provider: "codex", model: undefined },
+                          })
+                        }
+                      >
+                        Codex (OpenAI)
                       </button>
                       <button
                         type="button"

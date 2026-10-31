@@ -76,9 +76,7 @@ export function BrainNode({ data }: NodeProps) {
       if (info.workspaceId === activeWorkspaceIdRef.current) {
         setProvider(info.provider || "claude");
         setBrainModel(info.model ?? null);
-        if (info.usage !== undefined) {
-          setBrainUsage(info.usage);
-        }
+        setBrainUsage(info.usage);
       }
     });
 
@@ -225,8 +223,7 @@ export function BrainNode({ data }: NodeProps) {
     };
   }, []);
 
-  const modelChipLabel =
-    (provider === "claude" ? brainUsage?.model : null) ?? brainModel ?? "padrão";
+  const modelChipLabel = brainUsage?.model ?? brainModel ?? "padrão";
 
   return (
     <div className={`brain-node-card ${anyThinking ? "brain-breathing" : ""}`}>
@@ -268,9 +265,7 @@ export function BrainNode({ data }: NodeProps) {
         </div>
 
         <div className="brain-node-controls nodrag">
-          {provider === "claude" && (
-            <ContextMeter usage={brainUsage} className="brain-context-meter" />
-          )}
+          <ContextMeter usage={brainUsage} className="brain-context-meter" />
           <span className="brain-model-chip" title="Modelo do orquestrador">
             {modelChipLabel}
           </span>

@@ -15,4 +15,9 @@ else
   exit 1
 fi
 
+# Packaged app: reuse Electron's binary as node, so no system Node is required.
+if [ -n "${SINAPSE_NODE:-}" ]; then
+  ELECTRON_RUN_AS_NODE=1 exec "$SINAPSE_NODE" "$MAIN" "$@"
+fi
+
 exec node "$MAIN" "$@"

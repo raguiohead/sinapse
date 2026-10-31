@@ -13,4 +13,10 @@ IF EXIST "%DIR%..\app.asar.unpacked\node_modules\@sinapse\cli\dist\main.js" (
   EXIT /B 1
 )
 
-node "%MAIN%" %*
+REM Packaged app: reuse Electron's binary as node, so no system Node is required.
+IF DEFINED SINAPSE_NODE (
+  SET "ELECTRON_RUN_AS_NODE=1"
+  "%SINAPSE_NODE%" "%MAIN%" %*
+) ELSE (
+  node "%MAIN%" %*
+)

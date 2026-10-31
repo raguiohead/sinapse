@@ -59,6 +59,9 @@ const {
   ENV,
 }: typeof import("@sinapse/core") = _require("@sinapse/core");
 
+// The packaged `sinapse` CLI shim runs through Electron's own binary in node mode, so users need no system Node.
+if (app.isPackaged) process.env.SINAPSE_NODE = process.execPath;
+
 interface Brain {
   pty: IPty | null;
   session: string;

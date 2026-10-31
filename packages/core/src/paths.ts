@@ -13,9 +13,14 @@ export function worktreesDir(workspaceId: string): string {
   return path.join(sinapseDir(), "workspaces", workspaceId, "worktrees");
 }
 
-/** Nearest node_modules/.bin containing the `sinapse` CLI, walking up from this package (workspace install). */
+/** Nearest bin directory containing the `sinapse` CLI (resourcesPath in packaged app, or walking up node_modules/.bin in dev). */
 export function findCliBinDir(): string | undefined {
   const binName = process.platform === "win32" ? "sinapse.cmd" : "sinapse";
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  if (resourcesPath) {
+    const candidate = path.join(resourcesPath, "bin");
+    if (fs.existsSync(path.join(candidate, binName))) return candidate;
+  }
   let dir = path.dirname(fileURLToPath(import.meta.url));
   while (true) {
     const candidate = path.join(dir, "node_modules", ".bin");

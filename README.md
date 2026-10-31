@@ -340,6 +340,46 @@ Todos os dados de runtime do Sinapse ficam armazenados no diretório do usuário
 > [!NOTE]
 > **Segurança:** o daemon escuta só em `127.0.0.1`, e todas as rotas exceto `/health` exigem `Authorization: Bearer <token>`. O token é gerado na primeira execução e reaproveitado depois; ele fica em `state.json` e `daemon.json`, gravados com permissão `0600` (só o seu usuário lê; no Windows, a pasta do perfil já é restrita ao usuário). Para trocar o token, apague `~/.sinapse/state.json` com o daemon parado. Lembre que um worker com autonomia `edit` ou `full` pode alterar arquivos na pasta em que roda.
 
+## Releases
+
+### Como gerar instaladores
+
+Para gerar os pacotes de distribuição no seu sistema operacional atual:
+
+```bash
+# Na raiz do monorepo:
+npm run dist
+```
+
+Os pacotes são gerados em `apps/desktop/dist/`:
+- **Linux:** `Sinapse-<versão>-x86_64.AppImage` e `Sinapse-<versão>-amd64.deb`
+- **Windows:** `Sinapse-<versão>-x64.exe` (instalador NSIS)
+- **macOS:** `Sinapse-<versão>-<arch>.dmg` e `Sinapse-<versão>-<arch>.zip` (x64 e arm64)
+
+> [!NOTE]
+> Como o `node-pty` é um módulo nativo C++, instaladores de cada sistema operacional devem ser gerados em sua respectiva plataforma (ou via GitHub Actions).
+
+### Como instalar
+
+- **Linux (AppImage):**
+  ```bash
+  chmod +x Sinapse-*.AppImage
+  ./Sinapse-*.AppImage
+  ```
+- **Linux (.deb):**
+  ```bash
+  sudo dpkg -i Sinapse-*-amd64.deb
+  # ou: sudo apt install ./Sinapse-*-amd64.deb
+  ```
+- **Windows:** execute o instalador `.exe` e siga as instruções na tela.
+- **macOS:** abra o arquivo `.dmg` e arraste o Sinapse para a pasta `Applications`.
+
+> [!WARNING]
+> **Instaladores não assinados (aviso de segurança):**  
+> Os binários distribuídos não possuem assinatura digital comercial. Por isso, os sistemas operacionais exibirão avisos na primeira execução:
+> - **macOS:** o Gatekeeper informará que o app "não pode ser aberto porque o desenvolvedor não pode ser verificado". Para abrir, clique com o botão direito no aplicativo em `Applications`, selecione **Abrir** e confirme no diálogo, ou acesse *Ajustes do Sistema > Privacidade e Segurança* e autorize a execução.
+> - **Windows:** o Microsoft Defender SmartScreen exibirá o aviso "O Windows protegeu o seu computador". Clique em **Mais informações** e depois em **Executar assim mesmo**.
+
 ## Estrutura do repositório
 
 ```text

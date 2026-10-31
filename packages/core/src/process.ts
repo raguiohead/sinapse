@@ -43,6 +43,8 @@ const PARENT_SESSION_VARS = [
 export function agentEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
   for (const name of PARENT_SESSION_VARS) delete env[name];
+  // Set by the packaged CLI shim; inherited, it would turn Electron-based tools into plain node.
+  delete env.ELECTRON_RUN_AS_NODE;
   return env;
 }
 

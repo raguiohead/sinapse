@@ -1,6 +1,9 @@
 {
   "name": "@sinapse/desktop",
   "productName": "Sinapse",
+  "description": "Orquestrador pessoal de agentes multiagente",
+  "author": "Sinapse <maintainer@sinapse.local>",
+  "homepage": "https://github.com/raguiohead/sinapse",
   "desktopName": "sinapse.desktop",
   "version": "0.1.0",
   "license": "MIT",
@@ -9,9 +12,11 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "preview": "electron-vite preview"
+    "preview": "electron-vite preview",
+    "dist": "electron-builder"
   },
   "dependencies": {
+    "@sinapse/cli": "*",
     "@sinapse/core": "*",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
@@ -27,6 +32,7 @@
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.4.0",
     "electron": "^45.1.0",
+    "electron-builder": "^26.18.0",
     "electron-vite": "^3.1.0",
     "typescript": "^5.7.0",
     "vite": "^6.3.0"

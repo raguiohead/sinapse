@@ -35,11 +35,11 @@ linux:
   category: Development
   icon: build/icon.png
   synopsis: Orquestrador pessoal de agentes multiagente
-  maintainer: "raguiohead <guilhermep_alves@hotmail.com>"
+  maintainer: "raguiohead"
 
 deb:
   packageName: sinapse
-  maintainer: "raguiohead <guilhermep_alves@hotmail.com>"
+  maintainer: "raguiohead"
 
 win:
   target:

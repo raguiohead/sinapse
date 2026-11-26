@@ -2,7 +2,7 @@
   "name": "@sinapse/desktop",
   "productName": "Sinapse",
   "description": "Orquestrador pessoal de agentes multiagente",
-  "author": "raguiohead <guilhermep_alves@hotmail.com>",
+  "author": "raguiohead",
   "homepage": "https://github.com/raguiohead/sinapse",
   "desktopName": "sinapse.desktop",
   "version": "0.1.0",
